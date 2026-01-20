@@ -4,315 +4,341 @@
 //! ~100-1000x faster than JSON-RPC for backfills.
 //!
 //! Usage:
-//!   cargo run --release
-//!   cargo run --release -- --backfill
-//!   cargo run --release -- --live
+//!   cargo run --release -- analyze      # Analyze database structure
+//!   cargo run --release -- backfill     # Index from start to tip
+//!   cargo run --release -- live         # Follow chain tip
+//!   cargo run --release -- status       # Show indexer status
 
-use rocksdb::{DB, Options, IteratorMode};
-use std::path::Path;
+mod config;
+mod db;
+mod models;
+mod indexer;
+
+use clap::{Parser, Subcommand};
 use std::time::Instant;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-// Zebra state path (adjust for your setup)
-const ZEBRA_STATE_PATH: &str = "/root/.cache/zebra/state/v27/mainnet";
+use crate::config::Config;
+use crate::db::ZebraState;
 
-// Known Zebra column families (from Zebra source code)
-const COLUMN_FAMILIES: &[&str] = &[
-    "default",
-    "hash_by_height",
-    "height_by_hash",
-    "block_header_by_height",
-    "tx_loc_by_hash",
-    "utxo_by_outpoint",
-    "sprout_nullifiers",
-    "sapling_nullifiers",
-    "orchard_nullifiers",
-    "sprout_anchors",
-    "sapling_anchors",
-    "orchard_anchors",
-    "sprout_note_commitment_tree",
-    "sapling_note_commitment_tree",
-    "orchard_note_commitment_tree",
-    "history_tree",
-    "tip_chain_value_pool",
-];
+/// CipherScan Rust Indexer - High-performance Zcash blockchain indexer
+#[derive(Parser)]
+#[command(name = "cipherscan-indexer")]
+#[command(version = "0.1.0")]
+#[command(about = "Fast Zcash indexer reading directly from Zebra's RocksDB")]
+struct Cli {
+    /// Path to Zebra state directory
+    #[arg(long, env = "ZEBRA_STATE_PATH")]
+    zebra_path: Option<String>,
+    
+    /// PostgreSQL connection URL
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: Option<String>,
+    
+    /// Batch size for database operations
+    #[arg(long, default_value = "1000")]
+    batch_size: usize,
+    
+    #[command(subcommand)]
+    command: Commands,
+}
 
-// PostgreSQL connection (from environment)
-// const DATABASE_URL: &str = "postgres://zcash_user:password@localhost/zcash_explorer_mainnet";
+#[derive(Subcommand)]
+enum Commands {
+    /// Analyze Zebra's RocksDB structure
+    Analyze,
+    
+    /// Run backfill from genesis (or checkpoint) to current tip
+    Backfill {
+        /// Start from specific height (overrides checkpoint)
+        #[arg(long)]
+        from: Option<u32>,
+        
+        /// Stop at specific height
+        #[arg(long)]
+        to: Option<u32>,
+    },
+    
+    /// Run live indexer (follow chain tip)
+    Live,
+    
+    /// Show indexer status
+    Status,
+    
+    /// Decode and show specific block
+    Block {
+        /// Block height to show
+        height: u32,
+    },
+}
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env if present
+    let _ = dotenvy::dotenv();
+    
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("cipherscan_indexer=info".parse()?))
+        .init();
+    
+    let cli = Cli::parse();
+    
+    // Build config
+    let mut config = Config::from_env();
+    if let Some(path) = cli.zebra_path {
+        config.zebra_state_path = path.into();
+    }
+    if let Some(url) = cli.database_url {
+        config.database_url = url;
+    }
+    config.batch_size = cli.batch_size;
+    
     println!("════════════════════════════════════════════════════════════");
     println!("🚀 CipherScan Rust Indexer v0.1.0");
     println!("════════════════════════════════════════════════════════════");
-
-    // Check if Zebra state exists
-    let state_path = Path::new(ZEBRA_STATE_PATH);
-    if !state_path.exists() {
-        eprintln!("❌ Zebra state not found at: {}", ZEBRA_STATE_PATH);
-        eprintln!("   Make sure Zebra is running and synced.");
-        std::process::exit(1);
+    println!("📂 Zebra state: {:?}", config.zebra_state_path);
+    println!("🌐 Network: {}", config.network_name());
+    println!();
+    
+    match cli.command {
+        Commands::Analyze => {
+            analyze_database(&config)?;
+        }
+        Commands::Backfill { from, to } => {
+            run_backfill(&config, from, to).await?;
+        }
+        Commands::Live => {
+            run_live(&config).await?;
+        }
+        Commands::Status => {
+            show_status(&config).await?;
+        }
+        Commands::Block { height } => {
+            show_block(&config, height)?;
+        }
     }
+    
+    Ok(())
+}
 
-    println!("📂 Zebra state path: {}", ZEBRA_STATE_PATH);
-
-    // First, list column families
+/// Analyze database structure (original PoC functionality)
+fn analyze_database(config: &Config) -> Result<(), String> {
+    use rocksdb::{DB, Options, IteratorMode};
+    
+    let path = &config.zebra_state_path;
+    
+    // List column families
     println!("🔍 Listing column families...");
-    match DB::list_cf(&Options::default(), ZEBRA_STATE_PATH) {
-        Ok(cfs) => {
-            println!("   Found {} column families:", cfs.len());
-            for cf in &cfs {
-                println!("      - {}", cf);
-            }
-        }
-        Err(e) => {
-            println!("   Could not list CFs: {}", e);
-        }
+    let cf_names = DB::list_cf(&Options::default(), path)
+        .map_err(|e| format!("Failed to list CFs: {}", e))?;
+    
+    println!("   Found {} column families:", cf_names.len());
+    for cf in &cf_names {
+        println!("      - {}", cf);
     }
-
-    // Open RocksDB with column families
+    
+    // Open with column families
     let mut opts = Options::default();
     opts.set_error_if_exists(false);
     opts.create_if_missing(false);
-    opts.set_max_open_files(256);  // Limit open files to avoid "Too many open files"
-
+    opts.set_max_open_files(config.max_open_files);
+    
     println!("\n🔓 Opening RocksDB with column families (read-only)...");
     let start = Instant::now();
-
-    // Get actual column families from the database
-    let cf_names = match DB::list_cf(&Options::default(), ZEBRA_STATE_PATH) {
-        Ok(cfs) => cfs,
-        Err(_) => COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
-    };
-
-    match DB::open_cf_for_read_only(&opts, ZEBRA_STATE_PATH, &cf_names, false) {
-        Ok(db) => {
-            let elapsed = start.elapsed();
-            println!("✅ RocksDB opened in {:?}", elapsed);
-
-            // Get some stats
-            analyze_database_cf(&db, &cf_names);
-        }
-        Err(e) => {
-            eprintln!("❌ Failed to open RocksDB: {}", e);
-            eprintln!("");
-            eprintln!("Trying without column families...");
-
-            // Fallback: open without CFs
-            match DB::open_for_read_only(&opts, ZEBRA_STATE_PATH, false) {
-                Ok(db) => {
-                    println!("✅ Opened without CFs");
-                    analyze_database(&db);
-                }
-                Err(e2) => {
-                    eprintln!("❌ Also failed: {}", e2);
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-}
-
-/// Analyze database with column families
-fn analyze_database_cf(db: &DB, cf_names: &[String]) {
-    println!("");
-    println!("📊 Analyzing column families...");
+    
+    let db = DB::open_cf_for_read_only(&opts, path, &cf_names, false)
+        .map_err(|e| format!("Failed to open RocksDB: {}", e))?;
+    
+    println!("✅ RocksDB opened in {:?}", start.elapsed());
+    println!("\n📊 Analyzing column families...");
     println!("────────────────────────────────────────────────────────────");
-
-    for cf_name in cf_names {
+    
+    for cf_name in &cf_names {
         if let Some(cf) = db.cf_handle(cf_name.as_str()) {
             let iter = db.iterator_cf(cf, IteratorMode::Start);
             let mut count = 0;
             let mut sample_key: Option<String> = None;
-
+            
             for item in iter {
                 match item {
                     Ok((key, _value)) => {
                         count += 1;
-                        if sample_key.is_none() && key.len() > 0 {
-                            sample_key = Some(hex::encode(&key[..std::cmp::min(32, key.len())]));
+                        if sample_key.is_none() && !key.is_empty() {
+                            sample_key = Some(hex::encode(&key[..std::cmp::min(16, key.len())]));
                         }
                         if count >= 100000 {
-                            break; // Sample first 100k per CF
+                            break;
                         }
                     }
                     Err(_) => break,
                 }
             }
-
+            
             let sample = sample_key.unwrap_or_else(|| "N/A".to_string());
             if count > 0 {
-                println!("   ✅ {:30} → {:>7} entries (sample: {}...)", cf_name, count, &sample[..std::cmp::min(16, sample.len())]);
+                println!("   ✅ {:35} → {:>7} entries (sample: {}...)", 
+                    cf_name, count, &sample[..std::cmp::min(12, sample.len())]);
             } else {
-                println!("   ⬚ {:30} → empty", cf_name);
+                println!("   ⬚ {:35} → empty", cf_name);
             }
-        } else {
-            println!("   ❌ {:30} → not found", cf_name);
         }
     }
-
-    println!("");
-
-    // Decode some entries from hash_by_height
-    decode_blocks(db);
-
-    println!("════════════════════════════════════════════════════════════");
-    println!("✅ Column family analysis complete!");
-    println!("════════════════════════════════════════════════════════════");
-}
-
-/// Decode blocks from hash_by_height column family
-fn decode_blocks(db: &DB) {
-    println!("════════════════════════════════════════════════════════════");
-    println!("🔍 Decoding blocks from hash_by_height...");
-    println!("────────────────────────────────────────────────────────────");
-
+    
+    // Show chain tip
+    println!();
     if let Some(cf) = db.cf_handle("hash_by_height") {
-        println!("   ✅ Got CF handle");
-
-        let iter = db.iterator_cf(cf, IteratorMode::Start);
-        let mut count = 0;
         let mut last_height = 0u32;
-
-        for item in iter {
-            match item {
-                Ok((key, value)) => {
-                    // Debug: show first few raw entries
-                    if count < 3 {
-                        println!("   Raw entry {}: key={} ({} bytes), value={} ({} bytes)",
-                            count,
-                            hex::encode(&key[..std::cmp::min(8, key.len())]),
-                            key.len(),
-                            hex::encode(&value[..std::cmp::min(8, value.len())]),
-                            value.len()
-                        );
-                    }
-
-                    // Key = height (3 bytes, big-endian in Zebra)
-                    // Value = block hash (32 bytes)
-                    if key.len() >= 3 && value.len() >= 32 {
-                        // 3 bytes big-endian to u32
-                        let height = ((key[0] as u32) << 16) | ((key[1] as u32) << 8) | (key[2] as u32);
-
-                        // Reverse the hash for display (Zcash uses reversed byte order)
-                        let mut hash_bytes = value[0..32].to_vec();
-                        hash_bytes.reverse();
-                        let hash = hex::encode(&hash_bytes);
-
-                        // Show first 5 blocks
-                        if count < 8 {
-                            println!("   Block {:>7}: {}", height, hash);
-                        } else if count == 8 {
-                            println!("   ...");
-                        }
-
-                        last_height = height;
-                    }
-
-                    count += 1;
-
-                    // Stop after 1 million to avoid long wait
-                    if count >= 1_000_000 {
-                        println!("   (stopped at 1M entries)");
-                        break;
-                    }
+        for item in db.iterator_cf(cf, IteratorMode::End) {
+            if let Ok((key, _)) = item {
+                if key.len() >= 3 {
+                    last_height = ((key[0] as u32) << 16) | ((key[1] as u32) << 8) | (key[2] as u32);
                 }
-                Err(e) => {
-                    println!("   ❌ Error: {}", e);
-                    break;
-                }
-            }
-        }
-
-        println!("");
-        println!("   📊 Total entries scanned: {}", count);
-        println!("   📈 Last height seen: {}", last_height);
-    } else {
-        println!("   ❌ hash_by_height CF handle not found");
-    }
-    println!("");
-}
-
-/// Analyze the database structure (fallback without CFs)
-fn analyze_database(db: &DB) {
-    println!("");
-    println!("📊 Analyzing database structure...");
-    println!("────────────────────────────────────────────────────────────");
-
-    // Count entries by prefix
-    let mut prefix_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut total_entries = 0;
-    let mut sample_keys: Vec<String> = Vec::new();
-
-    let start = Instant::now();
-    let iter = db.iterator(IteratorMode::Start);
-
-    for item in iter {
-        match item {
-            Ok((key, _value)) => {
-                total_entries += 1;
-
-                // Get first few bytes as prefix identifier
-                if key.len() >= 4 {
-                    let prefix = hex::encode(&key[0..4]);
-                    *prefix_counts.entry(prefix.clone()).or_insert(0) += 1;
-
-                    // Save first few samples of each prefix
-                    if sample_keys.len() < 20 && !sample_keys.iter().any(|s| s.starts_with(&prefix)) {
-                        sample_keys.push(format!("{}: {} bytes", hex::encode(&key[..std::cmp::min(16, key.len())]), key.len()));
-                    }
-                }
-
-                // Progress every 1M entries
-                if total_entries % 1_000_000 == 0 {
-                    let elapsed = start.elapsed();
-                    let rate = total_entries as f64 / elapsed.as_secs_f64();
-                    println!("   Scanned {} entries ({:.0} entries/sec)...", total_entries, rate);
-                }
-
-                // Stop after 10M entries for this test
-                if total_entries >= 10_000_000 {
-                    println!("   (stopped at 10M entries for quick analysis)");
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!("   Error reading entry: {}", e);
                 break;
             }
         }
+        println!("📈 Chain tip height: {}", last_height);
     }
-
-    let elapsed = start.elapsed();
-    let rate = total_entries as f64 / elapsed.as_secs_f64();
-
-    println!("");
-    println!("📈 Results:");
-    println!("   Total entries scanned: {}", total_entries);
-    println!("   Time: {:?}", elapsed);
-    println!("   Rate: {:.0} entries/sec", rate);
-    println!("");
-
-    println!("🔑 Key prefixes found (first 4 bytes → count):");
-    let mut sorted_prefixes: Vec<_> = prefix_counts.iter().collect();
-    sorted_prefixes.sort_by(|a, b| b.1.cmp(a.1));
-
-    for (prefix, count) in sorted_prefixes.iter().take(15) {
-        let percent = (**count as f64 / total_entries as f64) * 100.0;
-        println!("   {} → {:>8} ({:.1}%)", prefix, count, percent);
-    }
-
-    println!("");
-    println!("🔍 Sample keys:");
-    for key in sample_keys.iter().take(10) {
-        println!("   {}", key);
-    }
-
-    println!("");
+    
+    println!("\n════════════════════════════════════════════════════════════");
+    println!("✅ Analysis complete!");
     println!("════════════════════════════════════════════════════════════");
-    println!("✅ Database analysis complete!");
-    println!("");
-    println!("Next steps:");
-    println!("  1. Identify key prefixes (blocks, transactions, UTXOs, etc.)");
-    println!("  2. Implement parsing for each type");
-    println!("  3. Write to PostgreSQL");
+    
+    Ok(())
+}
+
+/// Run backfill indexer
+async fn run_backfill(config: &Config, from: Option<u32>, to: Option<u32>) -> Result<(), String> {
+    let zebra = ZebraState::open(config)?;
+    
+    let tip = zebra.get_tip_height()?;
+    let start_height = from.unwrap_or(0);
+    let end_height = to.unwrap_or(tip);
+    
+    println!("📊 Backfill: {} → {} ({} blocks)", 
+        start_height, end_height, end_height - start_height + 1);
+    println!();
+    
+    let batch_size = config.batch_size;
+    let mut current = start_height;
+    let overall_start = Instant::now();
+    let mut total_blocks = 0u64;
+    
+    while current <= end_height {
+        let batch_end = std::cmp::min(current + batch_size as u32 - 1, end_height);
+        let batch_start = Instant::now();
+        
+        let mut blocks_in_batch = 0u32;
+        
+        for result in zebra.iter_blocks(current, batch_end) {
+            match result {
+                Ok((height, _hash)) => {
+                    blocks_in_batch += 1;
+                    total_blocks += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("Error at {}: {}", current, e);
+                }
+            }
+        }
+        
+        let elapsed = batch_start.elapsed();
+        let rate = blocks_in_batch as f64 / elapsed.as_secs_f64();
+        let total_elapsed = overall_start.elapsed();
+        let overall_rate = total_blocks as f64 / total_elapsed.as_secs_f64();
+        let remaining = (end_height - batch_end) as f64 / overall_rate;
+        let progress = (batch_end - start_height) as f64 / (end_height - start_height) as f64 * 100.0;
+        
+        println!("📦 {} → {} | {:.1}% | {:.0} blk/s | ETA: {:.1}h",
+            current, batch_end, progress, rate, remaining / 3600.0);
+        
+        current = batch_end + 1;
+    }
+    
+    let total_time = overall_start.elapsed();
+    println!();
     println!("════════════════════════════════════════════════════════════");
+    println!("✅ Backfill complete!");
+    println!("   Total blocks: {}", total_blocks);
+    println!("   Total time: {:?}", total_time);
+    println!("   Average rate: {:.0} blocks/sec", total_blocks as f64 / total_time.as_secs_f64());
+    println!("════════════════════════════════════════════════════════════");
+    
+    Ok(())
+}
+
+/// Run live indexer
+async fn run_live(config: &Config) -> Result<(), String> {
+    let zebra = ZebraState::open(config)?;
+    
+    println!("🔄 Starting live indexer (Ctrl+C to stop)...");
+    println!();
+    
+    let mut last_height = zebra.get_tip_height()?;
+    println!("📈 Starting at height: {}", last_height);
+    
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        
+        let current_tip = zebra.get_tip_height()?;
+        
+        if current_tip > last_height {
+            let new_blocks = current_tip - last_height;
+            println!("📦 New blocks: {} → {} (+{})", last_height + 1, current_tip, new_blocks);
+            
+            for result in zebra.iter_blocks(last_height + 1, current_tip) {
+                match result {
+                    Ok((height, hash)) => {
+                        let mut hash_rev = hash;
+                        hash_rev.reverse();
+                        tracing::debug!("Block {}: {}", height, hex::encode(&hash_rev[..8]));
+                    }
+                    Err(e) => {
+                        tracing::error!("Error: {}", e);
+                    }
+                }
+            }
+            
+            last_height = current_tip;
+        }
+    }
+}
+
+/// Show indexer status
+async fn show_status(config: &Config) -> Result<(), String> {
+    let zebra = ZebraState::open(config)?;
+    let stats = zebra.get_stats();
+    
+    println!("📊 Indexer Status");
+    println!("────────────────────────────────────────────────────────────");
+    println!("   Network:     {}", stats.network);
+    println!("   Chain tip:   {}", stats.tip_height);
+    println!("   Block count: {}", stats.block_count);
+    println!();
+    
+    // TODO: Show PostgreSQL status when connected
+    
+    println!("════════════════════════════════════════════════════════════");
+    
+    Ok(())
+}
+
+/// Show a specific block
+fn show_block(config: &Config, height: u32) -> Result<(), String> {
+    let zebra = ZebraState::open(config)?;
+    
+    let hash = zebra.get_block_hash(height)?;
+    let mut hash_rev = hash;
+    hash_rev.reverse();
+    
+    println!("📦 Block {}", height);
+    println!("────────────────────────────────────────────────────────────");
+    println!("   Hash: {}", hex::encode(&hash_rev));
+    println!();
+    
+    // TODO: Show more block details
+    
+    Ok(())
 }

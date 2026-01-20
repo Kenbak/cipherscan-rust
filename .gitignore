@@ -1,0 +1,19 @@
+# Build
+/target/
+**/*.rs.bk
+
+# Cargo lock - keep in repo for binary crates
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# macOS
+.DS_Store

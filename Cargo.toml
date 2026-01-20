@@ -20,12 +20,22 @@ serde_json = "1"
 # Zcash parsing (from Zebra)
 # zebra-chain = "1"  # Uncomment when ready for full parsing
 
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
 # Utils
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Crypto
+sha2 = "0.10"
+bs58 = "0.5"
+
+# Environment
+dotenvy = "0.15"
 
 [profile.release]
 opt-level = 3
