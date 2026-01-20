@@ -487,6 +487,7 @@ async fn verify_transaction(
     };
 
     // Get block from RPC to see transactions
+    // Zebra uses verbosity 1 for decoded txs (not 2 like zcashd)
     let rpc_response = client
         .post(rpc_url)
         .header("Content-Type", "application/json")
@@ -495,7 +496,7 @@ async fn verify_transaction(
             "jsonrpc": "1.0",
             "id": "verify",
             "method": "getblock",
-            "params": [block_hash, 2]  // verbosity 2 = include decoded txs
+            "params": [block_hash, 1]  // verbosity 1 = include decoded txs in Zebra
         }))
         .send()
         .await
@@ -506,11 +507,21 @@ async fn verify_transaction(
         .await
         .map_err(|e| format!("RPC response parse failed: {}", e))?;
 
+    // Check for errors (null means not found or other issue)
     if let Some(error) = rpc_json.get("error") {
-        return Err(format!("RPC error: {:?}", error));
+        if !error.is_null() {
+            println!("   ⚠️  RPC error, trying with verbosity 0...");
+            // Fallback to simpler block info
+            return verify_transaction_simple(zebra, client, rpc_url, auth, height, &block_hash).await;
+        }
     }
 
     let block = &rpc_json["result"];
+    if block.is_null() {
+        println!("   ⚠️  Block data null, trying with verbosity 0...");
+        return verify_transaction_simple(zebra, client, rpc_url, auth, height, &block_hash).await;
+    }
+
     let tx_count = block["tx"].as_array().map(|a| a.len()).unwrap_or(0);
 
     println!("   Block {} has {} transactions", height, tx_count);
@@ -588,6 +599,92 @@ async fn verify_transaction(
         }
     }
 
+    println!("════════════════════════════════════════════════════════════");
+
+    Ok(())
+}
+
+/// Simple transaction verification fallback (verbosity 0)
+async fn verify_transaction_simple(
+    zebra: &ZebraState,
+    client: &reqwest::Client,
+    rpc_url: &str,
+    auth: &str,
+    height: u32,
+    block_hash: &str,
+) -> Result<(), String> {
+    use serde_json::{json, Value};
+
+    // Get block with verbosity 0 (just tx hashes)
+    let rpc_response = client
+        .post(rpc_url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Basic {}", auth))
+        .json(&json!({
+            "jsonrpc": "1.0",
+            "id": "verify",
+            "method": "getblock",
+            "params": [block_hash, 0]
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("RPC request failed: {}", e))?;
+
+    let rpc_json: Value = rpc_response
+        .json()
+        .await
+        .map_err(|e| format!("RPC response parse failed: {}", e))?;
+
+    if let Some(error) = rpc_json.get("error") {
+        if !error.is_null() {
+            return Err(format!("RPC error: {:?}", error));
+        }
+    }
+
+    let block = &rpc_json["result"];
+
+    // With verbosity 0, result is just a hex string of the block
+    if let Some(hex_data) = block.as_str() {
+        println!("   📦 Block data: {} bytes (hex)", hex_data.len() / 2);
+
+        // Try to get first transaction from RocksDB
+        for i in 0..3u16 {
+            match zebra.get_tx_hash_by_loc(height, i) {
+                Ok(hash) => {
+                    let mut rev = hash;
+                    rev.reverse();
+                    println!("   TX {}: {} (from RocksDB)", i, hex::encode(&rev));
+                }
+                Err(_) => break,
+            }
+        }
+    } else if let Some(txs) = block["tx"].as_array() {
+        println!("   Block {} has {} transactions", height, txs.len());
+
+        for (i, tx) in txs.iter().take(3).enumerate() {
+            let txid = tx.as_str().unwrap_or("?");
+            println!("   TX {}: {} (from RPC)", i, &txid[..16.min(txid.len())]);
+
+            // Compare with RocksDB
+            match zebra.get_tx_hash_by_loc(height, i as u16) {
+                Ok(hash) => {
+                    let mut rev = hash;
+                    rev.reverse();
+                    let rocks_txid = hex::encode(&rev);
+                    if rocks_txid == txid {
+                        println!("      ✅ Matches RocksDB");
+                    } else {
+                        println!("      ❌ RocksDB has: {}", &rocks_txid[..16]);
+                    }
+                }
+                Err(e) => {
+                    println!("      ⚠️  RocksDB: {}", e);
+                }
+            }
+        }
+    }
+
+    println!();
     println!("════════════════════════════════════════════════════════════");
 
     Ok(())
