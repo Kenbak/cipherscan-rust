@@ -82,8 +82,12 @@ enum Commands {
         count: u32,
 
         /// Zebra RPC URL
-        #[arg(long, default_value = "http://127.0.0.1:8232")]
+        #[arg(long, env = "ZEBRA_RPC_URL", default_value = "http://127.0.0.1:8232")]
         rpc_url: String,
+
+        /// Cookie file path for auth
+        #[arg(long, env = "ZEBRA_RPC_COOKIE_FILE", default_value = "/root/.cache/zebra/.cookie")]
+        cookie_file: String,
     },
 }
 
@@ -134,8 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Block { height } => {
             show_block(&config, height)?;
         }
-        Commands::Verify { height, count, rpc_url } => {
-            verify_parsing(&config, height, count, &rpc_url).await?;
+        Commands::Verify { height, count, rpc_url, cookie_file } => {
+            verify_parsing(&config, height, count, &rpc_url, &cookie_file).await?;
         }
     }
 
@@ -362,13 +366,21 @@ fn show_block(config: &Config, height: u32) -> Result<(), String> {
 }
 
 /// Verify parsing by comparing RocksDB data with Zebra RPC
-async fn verify_parsing(config: &Config, start_height: u32, count: u32, rpc_url: &str) -> Result<(), String> {
+async fn verify_parsing(config: &Config, start_height: u32, count: u32, rpc_url: &str, cookie_file: &str) -> Result<(), String> {
     use serde_json::{json, Value};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
     println!("🔍 Verifying RocksDB parsing against RPC...");
     println!("   RPC URL: {}", rpc_url);
+    println!("   Cookie file: {}", cookie_file);
     println!("   Heights: {} to {}", start_height, start_height + count - 1);
     println!("────────────────────────────────────────────────────────────");
+
+    // Read cookie for auth
+    let cookie = std::fs::read_to_string(cookie_file)
+        .map_err(|e| format!("Failed to read cookie file: {}", e))?;
+    let auth = BASE64.encode(format!("__cookie__:{}", cookie.trim()));
+    println!("   Auth: __cookie__:{}...", &cookie.trim()[..10.min(cookie.len())]);
     println!();
 
     let zebra = ZebraState::open(config)?;
@@ -395,8 +407,10 @@ async fn verify_parsing(config: &Config, start_height: u32, count: u32, rpc_url:
         // Get hash from RPC
         let rpc_response = client
             .post(rpc_url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Basic {}", auth))
             .json(&json!({
-                "jsonrpc": "2.0",
+                "jsonrpc": "1.0",
                 "id": "verify",
                 "method": "getblockhash",
                 "params": [height]
@@ -442,7 +456,7 @@ async fn verify_parsing(config: &Config, start_height: u32, count: u32, rpc_url:
     // Now verify a transaction if we had matches
     if matches > 0 {
         println!();
-        verify_transaction(&zebra, &client, rpc_url, start_height).await?;
+        verify_transaction(&zebra, &client, rpc_url, &auth, start_height).await?;
     }
 
     Ok(())
@@ -453,6 +467,7 @@ async fn verify_transaction(
     zebra: &ZebraState,
     client: &reqwest::Client,
     rpc_url: &str,
+    auth: &str,
     height: u32,
 ) -> Result<(), String> {
     use serde_json::{json, Value};
@@ -470,8 +485,10 @@ async fn verify_transaction(
     // Get block from RPC to see transactions
     let rpc_response = client
         .post(rpc_url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Basic {}", auth))
         .json(&json!({
-            "jsonrpc": "2.0",
+            "jsonrpc": "1.0",
             "id": "verify",
             "method": "getblock",
             "params": [block_hash, 2]  // verbosity 2 = include decoded txs
