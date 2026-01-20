@@ -377,10 +377,14 @@ async fn verify_parsing(config: &Config, start_height: u32, count: u32, rpc_url:
     println!("────────────────────────────────────────────────────────────");
 
     // Read cookie for auth
-    let cookie = std::fs::read_to_string(cookie_file)
+    // Cookie file format: "__cookie__:password" (Zebra style)
+    let cookie_content = std::fs::read_to_string(cookie_file)
         .map_err(|e| format!("Failed to read cookie file: {}", e))?;
-    let auth = BASE64.encode(format!("__cookie__:{}", cookie.trim()));
-    println!("   Auth: __cookie__:{}...", &cookie.trim()[..10.min(cookie.len())]);
+    let cookie_trimmed = cookie_content.trim();
+
+    // Use cookie content directly (already has __cookie__:password format)
+    let auth = BASE64.encode(cookie_trimmed);
+    println!("   Auth: {}...{}", &cookie_trimmed[..15], &cookie_trimmed[cookie_trimmed.len()-5..]);
     println!();
 
     let zebra = ZebraState::open(config)?;
