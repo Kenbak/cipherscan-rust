@@ -8,16 +8,16 @@ use std::path::PathBuf;
 pub struct Config {
     /// Path to Zebra's RocksDB state
     pub zebra_state_path: PathBuf,
-    
+
     /// PostgreSQL connection URL
     pub database_url: String,
-    
+
     /// Batch size for PostgreSQL inserts
     pub batch_size: usize,
-    
+
     /// Whether we're in mainnet or testnet
     pub network: Network,
-    
+
     /// Maximum RocksDB open files (to avoid ulimit issues)
     pub max_open_files: i32,
 }
@@ -44,24 +44,24 @@ impl Config {
     /// Load configuration from environment variables
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        
+
         // Zebra state path
         if let Ok(path) = env::var("ZEBRA_STATE_PATH") {
             config.zebra_state_path = PathBuf::from(path);
         }
-        
+
         // Database URL
         if let Ok(url) = env::var("DATABASE_URL") {
             config.database_url = url;
         }
-        
+
         // Batch size
         if let Ok(size) = env::var("BATCH_SIZE") {
             if let Ok(n) = size.parse() {
                 config.batch_size = n;
             }
         }
-        
+
         // Network detection (from path or explicit)
         if let Ok(net) = env::var("NETWORK") {
             config.network = match net.to_lowercase().as_str() {
@@ -71,10 +71,10 @@ impl Config {
         } else if config.zebra_state_path.to_string_lossy().contains("testnet") {
             config.network = Network::Testnet;
         }
-        
+
         config
     }
-    
+
     /// Get display name for the network
     pub fn network_name(&self) -> &'static str {
         match self.network {
@@ -87,7 +87,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_default_config() {
         let config = Config::default();

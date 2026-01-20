@@ -19,20 +19,20 @@ impl PostgresWriter {
             .max_connections(10)
             .connect(&config.database_url)
             .await?;
-        
+
         tracing::info!("Connected to PostgreSQL");
-        
+
         Ok(Self {
             pool,
             config: config.clone(),
         })
     }
-    
+
     /// Get the connection pool
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
-    
+
     /// Get the last indexed block height
     pub async fn get_last_indexed_height(&self) -> Result<Option<u32>, sqlx::Error> {
         let result: Option<(i32,)> = sqlx::query_as(
@@ -40,24 +40,24 @@ impl PostgresWriter {
         )
         .fetch_optional(&self.pool)
         .await?;
-        
+
         Ok(result.map(|(h,)| h as u32))
     }
-    
+
     /// Insert a batch of blocks
     pub async fn insert_blocks(&self, blocks: &[Block]) -> Result<u64, sqlx::Error> {
         if blocks.is_empty() {
             return Ok(0);
         }
-        
+
         let mut tx = self.pool.begin().await?;
         let mut count = 0u64;
-        
+
         for block in blocks {
             sqlx::query(
                 r#"
                 INSERT INTO blocks (
-                    height, hash, version, merkle_root, time, 
+                    height, hash, version, merkle_root, time,
                     difficulty, nonce, solution, previous_block_hash,
                     tx_count, size, sapling_commitment_tree_size, orchard_commitment_tree_size
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -81,29 +81,29 @@ impl PostgresWriter {
             .bind(block.orchard_tree_size.map(|s| s as i64))
             .execute(&mut *tx)
             .await?;
-            
+
             count += 1;
         }
-        
+
         tx.commit().await?;
         Ok(count)
     }
-    
+
     /// Insert a batch of transactions
     pub async fn insert_transactions(&self, txs: &[Transaction]) -> Result<u64, sqlx::Error> {
         if txs.is_empty() {
             return Ok(0);
         }
-        
+
         let mut tx = self.pool.begin().await?;
         let mut count = 0u64;
-        
+
         for transaction in txs {
             sqlx::query(
                 r#"
                 INSERT INTO transactions (
                     txid, block_height, block_hash, version, lock_time, expiry_height,
-                    size, vin_count, vout_count, 
+                    size, vin_count, vout_count,
                     sprout_joinsplit_count, sapling_spend_count, sapling_output_count,
                     orchard_action_count, fee, transparent_value_in, transparent_value_out,
                     sapling_value_balance, orchard_value_balance
@@ -131,23 +131,23 @@ impl PostgresWriter {
             .bind(transaction.orchard_value_balance)
             .execute(&mut *tx)
             .await?;
-            
+
             count += 1;
         }
-        
+
         tx.commit().await?;
         Ok(count)
     }
-    
+
     /// Insert a batch of shielded flows
     pub async fn insert_flows(&self, flows: &[ShieldedFlow]) -> Result<u64, sqlx::Error> {
         if flows.is_empty() {
             return Ok(0);
         }
-        
+
         let mut tx = self.pool.begin().await?;
         let mut count = 0u64;
-        
+
         for flow in flows {
             sqlx::query(
                 r#"
@@ -166,14 +166,14 @@ impl PostgresWriter {
             .bind(&flow.transparent_addresses)
             .execute(&mut *tx)
             .await?;
-            
+
             count += 1;
         }
-        
+
         tx.commit().await?;
         Ok(count)
     }
-    
+
     /// Update indexer state (checkpoint)
     pub async fn update_checkpoint(&self, height: u32) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -186,10 +186,10 @@ impl PostgresWriter {
         .bind(height as i64)
         .execute(&self.pool)
         .await?;
-        
+
         Ok(())
     }
-    
+
     /// Get current checkpoint
     pub async fn get_checkpoint(&self) -> Result<Option<u32>, sqlx::Error> {
         let result: Option<(String,)> = sqlx::query_as(
@@ -197,7 +197,7 @@ impl PostgresWriter {
         )
         .fetch_optional(&self.pool)
         .await?;
-        
+
         Ok(result.and_then(|(v,)| v.parse().ok()))
     }
 }

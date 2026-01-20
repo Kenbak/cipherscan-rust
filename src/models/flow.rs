@@ -11,7 +11,7 @@ use crate::models::Transaction;
 pub enum FlowType {
     /// Transparent to shielded
     Shield,
-    /// Shielded to transparent  
+    /// Shielded to transparent
     Deshield,
     /// Between shielded pools (e.g., Sapling → Orchard)
     PoolMigration,
@@ -76,18 +76,18 @@ impl ShieldedFlow {
     /// Analyze a transaction and extract flows
     pub fn from_transaction(tx: &Transaction) -> Vec<ShieldedFlow> {
         let mut flows = Vec::new();
-        
+
         // Skip coinbase
         if tx.is_coinbase() {
             return flows;
         }
-        
+
         // Check for pool migration (shielded → shielded between pools)
-        let is_pool_migration = tx.vin_count == 0 
+        let is_pool_migration = tx.vin_count == 0
             && tx.vout_count == 0
             && tx.has_shielded()
             && (tx.sapling_value_balance != 0 || tx.orchard_value_balance != 0);
-        
+
         if is_pool_migration {
             // Sapling → Orchard migration
             if tx.sapling_value_balance > 0 && tx.orchard_value_balance < 0 {
@@ -113,7 +113,7 @@ impl ShieldedFlow {
             }
             return flows;
         }
-        
+
         // Fully shielded (no transparent, just shielded activity)
         if tx.is_fully_shielded() {
             let pool = tx.dominant_pool().unwrap_or("sapling");
@@ -127,13 +127,13 @@ impl ShieldedFlow {
             });
             return flows;
         }
-        
+
         // Collect transparent addresses
         let addresses: Vec<String> = tx.vin.iter()
             .filter_map(|v| v.address.clone())
             .chain(tx.vout.iter().filter_map(|v| v.address.clone()))
             .collect();
-        
+
         // Shielding (transparent → sapling/orchard)
         if tx.sapling_value_balance < 0 {
             flows.push(ShieldedFlow {
@@ -145,7 +145,7 @@ impl ShieldedFlow {
                 transparent_addresses: addresses.clone(),
             });
         }
-        
+
         if tx.orchard_value_balance < 0 {
             flows.push(ShieldedFlow {
                 txid: tx.txid.clone(),
@@ -156,7 +156,7 @@ impl ShieldedFlow {
                 transparent_addresses: addresses.clone(),
             });
         }
-        
+
         // Deshielding (sapling/orchard → transparent)
         if tx.sapling_value_balance > 0 {
             flows.push(ShieldedFlow {
@@ -168,7 +168,7 @@ impl ShieldedFlow {
                 transparent_addresses: addresses.clone(),
             });
         }
-        
+
         if tx.orchard_value_balance > 0 {
             flows.push(ShieldedFlow {
                 txid: tx.txid.clone(),
@@ -179,7 +179,7 @@ impl ShieldedFlow {
                 transparent_addresses: addresses,
             });
         }
-        
+
         flows
     }
 }
@@ -187,7 +187,7 @@ impl ShieldedFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_flow_type_display() {
         assert_eq!(FlowType::Shield.as_str(), "shield");
