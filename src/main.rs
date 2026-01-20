@@ -545,7 +545,8 @@ async fn verify_transaction(
             let value_balance = tx["valueBalance"].as_f64().unwrap_or(0.0);
             let orchard_balance = tx["orchard"]["valueBalance"].as_f64().unwrap_or(0.0);
 
-            println!("   TX {}: {}", i, &txid[..16]);
+            let txid_short = if txid.len() > 16 { &txid[..16] } else { txid };
+            println!("   TX {}: {}", i, txid_short);
             println!("      Version: v{}", version);
             println!("      Transparent: {} vin, {} vout", vin_count, vout_count);
             println!("      Sprout: {} joinsplits", vjoinsplit);
@@ -563,7 +564,8 @@ async fn verify_transaction(
                     if rocks_txid == txid {
                         println!("      ✅ RocksDB txid matches");
                     } else {
-                        println!("      ❌ RocksDB txid mismatch: {}", &rocks_txid[..16]);
+                        let rocks_short = if rocks_txid.len() > 16 { &rocks_txid[..16] } else { &rocks_txid };
+                        println!("      ❌ RocksDB txid mismatch: {}", rocks_short);
                     }
                 }
                 Err(e) => {
@@ -663,7 +665,8 @@ async fn verify_transaction_simple(
 
         for (i, tx) in txs.iter().take(3).enumerate() {
             let txid = tx.as_str().unwrap_or("?");
-            println!("   TX {}: {} (from RPC)", i, &txid[..16.min(txid.len())]);
+            let txid_short = if txid.len() > 16 { &txid[..16] } else { txid };
+            println!("   TX {}: {} (from RPC)", i, txid_short);
 
             // Compare with RocksDB
             match zebra.get_tx_hash_by_loc(height, i as u16) {
@@ -674,7 +677,8 @@ async fn verify_transaction_simple(
                     if rocks_txid == txid {
                         println!("      ✅ Matches RocksDB");
                     } else {
-                        println!("      ❌ RocksDB has: {}", &rocks_txid[..16]);
+                        let rocks_short = if rocks_txid.len() > 16 { &rocks_txid[..16] } else { &rocks_txid };
+                        println!("      ❌ RocksDB has: {}", rocks_short);
                     }
                 }
                 Err(e) => {
