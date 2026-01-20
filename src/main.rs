@@ -528,44 +528,31 @@ async fn verify_transaction(
     println!();
 
     // Show first few transactions from RPC
+    // Zebra verbosity 1 returns tx as array of txid strings, not objects
     if let Some(txs) = block["tx"].as_array() {
         for (i, tx) in txs.iter().take(3).enumerate() {
-            let txid = tx["txid"].as_str().unwrap_or("?");
-            let version = tx["version"].as_i64().unwrap_or(0);
-            let vin_count = tx["vin"].as_array().map(|a| a.len()).unwrap_or(0);
-            let vout_count = tx["vout"].as_array().map(|a| a.len()).unwrap_or(0);
+            // Zebra returns txid as string directly, zcashd returns object with txid field
+            let rpc_txid = tx.as_str()
+                .or_else(|| tx["txid"].as_str())
+                .unwrap_or("?");
 
-            // Shielded counts
-            let vjoinsplit = tx["vjoinsplit"].as_array().map(|a| a.len()).unwrap_or(0);
-            let vshielded_spend = tx["vShieldedSpend"].as_array().map(|a| a.len()).unwrap_or(0);
-            let vshielded_output = tx["vShieldedOutput"].as_array().map(|a| a.len()).unwrap_or(0);
-            let orchard_actions = tx["orchard"]["actions"].as_array().map(|a| a.len()).unwrap_or(0);
+            let rpc_txid_short = if rpc_txid.len() > 16 { &rpc_txid[..16] } else { rpc_txid };
+            println!("   TX {}: {} (RPC)", i, rpc_txid_short);
 
-            // Value balances
-            let value_balance = tx["valueBalance"].as_f64().unwrap_or(0.0);
-            let orchard_balance = tx["orchard"]["valueBalance"].as_f64().unwrap_or(0.0);
-
-            let txid_short = if txid.len() > 16 { &txid[..16] } else { txid };
-            println!("   TX {}: {}", i, txid_short);
-            println!("      Version: v{}", version);
-            println!("      Transparent: {} vin, {} vout", vin_count, vout_count);
-            println!("      Sprout: {} joinsplits", vjoinsplit);
-            println!("      Sapling: {} spends, {} outputs, balance: {:.8} ZEC",
-                vshielded_spend, vshielded_output, value_balance);
-            println!("      Orchard: {} actions, balance: {:.8} ZEC",
-                orchard_actions, orchard_balance);
-
-            // Try to get from RocksDB
+            // Get txid from RocksDB and compare
             match zebra.get_tx_hash_by_loc(height, i as u16) {
                 Ok(hash) => {
                     let mut rev = hash;
                     rev.reverse();
                     let rocks_txid = hex::encode(&rev);
-                    if rocks_txid == txid {
-                        println!("      ✅ RocksDB txid matches");
+                    let rocks_short = if rocks_txid.len() > 16 { &rocks_txid[..16] } else { &rocks_txid };
+
+                    if rocks_txid == rpc_txid {
+                        println!("      ✅ RocksDB matches: {}", rocks_short);
                     } else {
-                        let rocks_short = if rocks_txid.len() > 16 { &rocks_txid[..16] } else { &rocks_txid };
-                        println!("      ❌ RocksDB txid mismatch: {}", rocks_short);
+                        println!("      ❌ MISMATCH!");
+                        println!("         RPC:     {}", rpc_txid);
+                        println!("         RocksDB: {}", rocks_txid);
                     }
                 }
                 Err(e) => {
@@ -573,27 +560,21 @@ async fn verify_transaction(
                 }
             }
 
-            // Try to get raw tx
+            // Try to get raw tx and show parsed info
             match zebra.get_transaction_by_loc(height, i as u16) {
                 Ok(raw) => {
-                    println!("      📦 Raw tx: {} bytes", raw.len());
-
                     // Parse header
                     if raw.len() >= 4 {
                         let header = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
                         let parsed_version = (header & 0x7FFFFFFF) as i32;
                         let overwintered = (header >> 31) == 1;
-                        println!("      📋 Parsed: v{} overwintered={}", parsed_version, overwintered);
-
-                        if parsed_version as i64 == version {
-                            println!("      ✅ Version matches!");
-                        } else {
-                            println!("      ❌ Version mismatch (RPC says v{})", version);
-                        }
+                        println!("      📋 {} bytes, v{}, overwintered={}", raw.len(), parsed_version, overwintered);
+                    } else {
+                        println!("      📋 {} bytes", raw.len());
                     }
                 }
                 Err(e) => {
-                    println!("      ⚠️  Raw tx: {}", e);
+                    println!("      ⚠️  Raw tx error: {}", e);
                 }
             }
 
