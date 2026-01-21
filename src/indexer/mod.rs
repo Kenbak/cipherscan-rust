@@ -23,7 +23,7 @@ impl Indexer {
     /// Create new indexer
     pub async fn new(config: Config) -> Result<Self, String> {
         let zebra = ZebraState::open(&config)?;
-        let postgres = PostgresWriter::connect(&config).await
+        let postgres = PostgresWriter::connect(&config.database_url).await
             .map_err(|e| format!("PostgreSQL error: {}", e))?;
 
         Ok(Self {
@@ -78,7 +78,7 @@ impl Indexer {
             );
 
             // Update checkpoint
-            self.postgres.update_checkpoint(batch_end).await
+            self.postgres.update_checkpoint("last_indexed_height", &batch_end.to_string()).await
                 .map_err(|e| format!("Checkpoint error: {}", e))?;
 
             current = batch_end + 1;
@@ -113,7 +113,7 @@ impl Indexer {
                     }
                 }
 
-                self.postgres.update_checkpoint(tip).await
+                self.postgres.update_checkpoint("last_indexed_height", &tip.to_string()).await
                     .map_err(|e| format!("Checkpoint error: {}", e))?;
             }
 
