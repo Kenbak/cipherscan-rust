@@ -195,18 +195,29 @@ impl ZebraState {
                     (bits_hex, diff)
                 };
 
-                // Nonce - extract hex from HexDebug format
+                // Nonce - extract hex from HexDebug format and reverse bytes for standard display
                 let nonce = {
                     let nonce_str = format!("{:?}", header.nonce);
-                    // Format is like '[u8; 32]("b67501...")'
-                    if let Some(start) = nonce_str.find('"') {
+                    // Format is like '[u8; 32]("5800d153...")'
+                    let hex_str = if let Some(start) = nonce_str.find('"') {
                         if let Some(end) = nonce_str.rfind('"') {
                             nonce_str[start + 1..end].to_string()
                         } else {
-                            nonce_str
+                            nonce_str.clone()
                         }
                     } else {
-                        nonce_str
+                        nonce_str.clone()
+                    };
+
+                    // Reverse byte order for standard display (little-endian to big-endian)
+                    if hex_str.len() == 64 {
+                        let bytes: Vec<u8> = (0..32)
+                            .filter_map(|i| u8::from_str_radix(&hex_str[i*2..i*2+2], 16).ok())
+                            .collect();
+                        let reversed: Vec<u8> = bytes.into_iter().rev().collect();
+                        hex::encode(&reversed)
+                    } else {
+                        hex_str
                     }
                 };
 
