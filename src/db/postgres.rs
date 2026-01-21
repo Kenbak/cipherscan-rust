@@ -391,8 +391,10 @@ impl PostgresWriter {
         }
 
         let mut count = 0u64;
+        let mut errors = 0u64;
+
         for flow in flows {
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 INSERT INTO shielded_flows (
                     txid, block_height, block_time, flow_type, amount_zat, pool,
@@ -412,9 +414,24 @@ impl PostgresWriter {
             .bind(&flow.transparent_addresses)
             .bind(flow.amount)
             .execute(&self.pool)
-            .await?;
+            .await;
 
-            count += 1;
+            match result {
+                Ok(_) => count += 1,
+                Err(e) => {
+                    errors += 1;
+                    if errors <= 3 {
+                        tracing::error!(
+                            "Flow insert error: {} | txid={} flow_type={} pool={}",
+                            e, &flow.txid[..16], flow.flow_type, flow.pool
+                        );
+                    }
+                }
+            }
+        }
+
+        if errors > 0 {
+            tracing::warn!("Flow inserts: {} ok, {} errors", count, errors);
         }
 
         Ok(count)
