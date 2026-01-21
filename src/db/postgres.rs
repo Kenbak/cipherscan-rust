@@ -394,6 +394,12 @@ impl PostgresWriter {
         let mut errors = 0u64;
 
         for flow in flows {
+            // Debug: print first flow
+            if count == 0 && errors == 0 {
+                eprintln!("DEBUG FLOW: txid={} type={} pool={} amount={}", 
+                    &flow.txid[..16], flow.flow_type, flow.pool, flow.amount);
+            }
+
             let result = sqlx::query(
                 r#"
                 INSERT INTO shielded_flows (
@@ -420,18 +426,15 @@ impl PostgresWriter {
                 Ok(_) => count += 1,
                 Err(e) => {
                     errors += 1;
-                    if errors <= 3 {
-                        tracing::error!(
-                            "Flow insert error: {} | txid={} flow_type={} pool={}",
-                            e, &flow.txid[..16], flow.flow_type, flow.pool
-                        );
-                    }
+                    // Always print errors to stderr
+                    eprintln!("FLOW INSERT ERROR: {} | txid={} flow_type={} pool={}", 
+                        e, &flow.txid[..16], flow.flow_type, flow.pool);
                 }
             }
         }
 
         if errors > 0 {
-            tracing::warn!("Flow inserts: {} ok, {} errors", count, errors);
+            eprintln!("FLOW SUMMARY: {} ok, {} errors", count, errors);
         }
 
         Ok(count)
