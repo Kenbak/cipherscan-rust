@@ -263,101 +263,42 @@ fn analyze_database(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Run backfill indexer
+/// Run backfill indexer (with PostgreSQL writes)
 async fn run_backfill(config: &Config, from: Option<u32>, to: Option<u32>) -> Result<(), String> {
-    let zebra = ZebraState::open(config)?;
+    use crate::indexer::Indexer;
 
-    let tip = zebra.get_tip_height()?;
-    let start_height = from.unwrap_or(0);
-    let end_height = to.unwrap_or(tip);
-
-    println!("📊 Backfill: {} → {} ({} blocks)",
-        start_height, end_height, end_height - start_height + 1);
-    println!();
-
-    let batch_size = config.batch_size;
-    let mut current = start_height;
-    let overall_start = Instant::now();
-    let mut total_blocks = 0u64;
-
-    while current <= end_height {
-        let batch_end = std::cmp::min(current + batch_size as u32 - 1, end_height);
-        let batch_start = Instant::now();
-
-        let mut blocks_in_batch = 0u32;
-
-        for result in zebra.iter_blocks(current, batch_end) {
-            match result {
-                Ok((height, _hash)) => {
-                    blocks_in_batch += 1;
-                    total_blocks += 1;
-                }
-                Err(e) => {
-                    tracing::warn!("Error at {}: {}", current, e);
-                }
-            }
-        }
-
-        let elapsed = batch_start.elapsed();
-        let rate = blocks_in_batch as f64 / elapsed.as_secs_f64();
-        let total_elapsed = overall_start.elapsed();
-        let overall_rate = total_blocks as f64 / total_elapsed.as_secs_f64();
-        let remaining = (end_height - batch_end) as f64 / overall_rate;
-        let progress = (batch_end - start_height) as f64 / (end_height - start_height) as f64 * 100.0;
-
-        println!("📦 {} → {} | {:.1}% | {:.0} blk/s | ETA: {:.1}h",
-            current, batch_end, progress, rate, remaining / 3600.0);
-
-        current = batch_end + 1;
+    // Check if DATABASE_URL is configured
+    if config.database_url.is_empty() {
+        return Err("DATABASE_URL not configured. Set it in .env or pass --database-url".to_string());
     }
 
-    let total_time = overall_start.elapsed();
-    println!();
-    println!("════════════════════════════════════════════════════════════");
-    println!("✅ Backfill complete!");
-    println!("   Total blocks: {}", total_blocks);
-    println!("   Total time: {:?}", total_time);
-    println!("   Average rate: {:.0} blocks/sec", total_blocks as f64 / total_time.as_secs_f64());
-    println!("════════════════════════════════════════════════════════════");
+    println!("🔗 Connecting to PostgreSQL...");
 
-    Ok(())
+    let indexer = Indexer::new(config.clone()).await?;
+
+    println!("✅ Connected to PostgreSQL");
+    println!();
+
+    indexer.backfill(from, to).await
 }
 
-/// Run live indexer
+/// Run live indexer (with PostgreSQL writes)
 async fn run_live(config: &Config) -> Result<(), String> {
-    let zebra = ZebraState::open(config)?;
+    use crate::indexer::Indexer;
 
-    println!("🔄 Starting live indexer (Ctrl+C to stop)...");
+    // Check if DATABASE_URL is configured
+    if config.database_url.is_empty() {
+        return Err("DATABASE_URL not configured. Set it in .env or pass --database-url".to_string());
+    }
+
+    println!("🔗 Connecting to PostgreSQL...");
+
+    let indexer = Indexer::new(config.clone()).await?;
+
+    println!("✅ Connected to PostgreSQL");
     println!();
 
-    let mut last_height = zebra.get_tip_height()?;
-    println!("📈 Starting at height: {}", last_height);
-
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-        let current_tip = zebra.get_tip_height()?;
-
-        if current_tip > last_height {
-            let new_blocks = current_tip - last_height;
-            println!("📦 New blocks: {} → {} (+{})", last_height + 1, current_tip, new_blocks);
-
-            for result in zebra.iter_blocks(last_height + 1, current_tip) {
-                match result {
-                    Ok((height, hash)) => {
-                        let mut hash_rev = hash;
-                        hash_rev.reverse();
-                        tracing::debug!("Block {}: {}", height, hex::encode(&hash_rev[..8]));
-                    }
-                    Err(e) => {
-                        tracing::error!("Error: {}", e);
-                    }
-                }
-            }
-
-            last_height = current_tip;
-        }
-    }
+    indexer.live().await
 }
 
 /// Show indexer status
