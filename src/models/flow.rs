@@ -74,8 +74,11 @@ pub struct ShieldedFlow {
 
 impl ShieldedFlow {
     /// Analyze a transaction and extract flows
-    /// Matches Node.js behavior: ONE flow per (txid, flow_type) with pool="mixed" when both pools used
-    /// DB constraint is UNIQUE(txid, flow_type), so we must combine pools
+    /// Matches Node.js behavior EXACTLY:
+    /// - Calculate NET total = sapling_value_balance + orchard_value_balance
+    /// - If total > 0 → ONE deshield flow
+    /// - If total < 0 → ONE shield flow
+    /// - Pool = "mixed" if both pools have non-zero balance
     pub fn from_transaction(tx: &Transaction) -> Vec<ShieldedFlow> {
         let mut flows = Vec::new();
 
@@ -84,65 +87,45 @@ impl ShieldedFlow {
             return flows;
         }
 
-        // Note: We do NOT skip fully shielded transactions (vin_count=0, vout_count=0)
-        // Node.js creates flows for all transactions with value_balance != 0
-        // This ensures compatibility and captures fee payments from shielded funds
+        // Calculate NET total (exactly like Node.js)
+        let total_value_balance = tx.sapling_value_balance + tx.orchard_value_balance;
 
-        // Collect transparent addresses for context (may be empty for fully shielded)
+        // Only create a flow if there's net movement
+        if total_value_balance == 0 {
+            return flows;
+        }
+
+        // Collect transparent addresses for context
         let addresses: Vec<String> = tx.vin.iter()
             .filter_map(|v| v.address.clone())
             .chain(tx.vout.iter().filter_map(|v| v.address.clone()))
             .collect();
 
-        // Check for shielding (value_balance < 0 = value entering shielded pool)
-        let sapling_shield = if tx.sapling_value_balance < 0 { -tx.sapling_value_balance } else { 0 };
-        let orchard_shield = if tx.orchard_value_balance < 0 { -tx.orchard_value_balance } else { 0 };
-        let total_shield = sapling_shield + orchard_shield;
+        // Determine flow type based on NET total (Node.js logic)
+        let flow_type = if total_value_balance > 0 {
+            FlowType::Deshield
+        } else {
+            FlowType::Shield
+        };
 
-        if total_shield > 0 {
-            // Determine pool type (match Node.js logic)
-            let pool = if sapling_shield > 0 && orchard_shield > 0 {
-                "mixed".to_string()
-            } else if orchard_shield > 0 {
-                Pool::Orchard.to_string()
-            } else {
-                Pool::Sapling.to_string()
-            };
+        // Determine pool type (Node.js logic)
+        // "mixed" if BOTH pools have non-zero balance (regardless of sign)
+        let pool = if tx.sapling_value_balance != 0 && tx.orchard_value_balance != 0 {
+            "mixed".to_string()
+        } else if tx.orchard_value_balance != 0 {
+            Pool::Orchard.to_string()
+        } else {
+            Pool::Sapling.to_string()
+        };
 
-            flows.push(ShieldedFlow {
-                txid: tx.txid.clone(),
-                flow_type: FlowType::Shield.to_string(),
-                pool,
-                amount: total_shield,
-                block_height: tx.block_height,
-                transparent_addresses: addresses.clone(),
-            });
-        }
-
-        // Check for deshielding (value_balance > 0 = value leaving shielded pool)
-        let sapling_deshield = if tx.sapling_value_balance > 0 { tx.sapling_value_balance } else { 0 };
-        let orchard_deshield = if tx.orchard_value_balance > 0 { tx.orchard_value_balance } else { 0 };
-        let total_deshield = sapling_deshield + orchard_deshield;
-
-        if total_deshield > 0 {
-            // Determine pool type (match Node.js logic)
-            let pool = if sapling_deshield > 0 && orchard_deshield > 0 {
-                "mixed".to_string()
-            } else if orchard_deshield > 0 {
-                Pool::Orchard.to_string()
-            } else {
-                Pool::Sapling.to_string()
-            };
-
-            flows.push(ShieldedFlow {
-                txid: tx.txid.clone(),
-                flow_type: FlowType::Deshield.to_string(),
-                pool,
-                amount: total_deshield,
-                block_height: tx.block_height,
-                transparent_addresses: addresses,
-            });
-        }
+        flows.push(ShieldedFlow {
+            txid: tx.txid.clone(),
+            flow_type: flow_type.to_string(),
+            pool,
+            amount: total_value_balance.abs(),  // Always positive
+            block_height: tx.block_height,
+            transparent_addresses: addresses,
+        });
 
         flows
     }
