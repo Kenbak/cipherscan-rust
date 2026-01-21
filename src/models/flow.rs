@@ -74,6 +74,8 @@ pub struct ShieldedFlow {
 
 impl ShieldedFlow {
     /// Analyze a transaction and extract flows
+    /// Only generates 'shield' and 'deshield' flows (DB constraint compatible)
+    /// Pool migrations and fully shielded are detectable from transaction fields
     pub fn from_transaction(tx: &Transaction) -> Vec<ShieldedFlow> {
         let mut flows = Vec::new();
 
@@ -82,65 +84,26 @@ impl ShieldedFlow {
             return flows;
         }
 
-        // Check for pool migration (shielded → shielded between pools)
-        let is_pool_migration = tx.vin_count == 0
-            && tx.vout_count == 0
-            && tx.has_shielded()
-            && (tx.sapling_value_balance != 0 || tx.orchard_value_balance != 0);
-
-        if is_pool_migration {
-            // Sapling → Orchard migration
-            if tx.sapling_value_balance > 0 && tx.orchard_value_balance < 0 {
-                flows.push(ShieldedFlow {
-                    txid: tx.txid.clone(),
-                    flow_type: FlowType::PoolMigration.to_string(),
-                    pool: "sapling_to_orchard".to_string(),
-                    amount: tx.sapling_value_balance,
-                    block_height: tx.block_height,
-                    transparent_addresses: vec![],
-                });
-            }
-            // Orchard → Sapling migration
-            else if tx.orchard_value_balance > 0 && tx.sapling_value_balance < 0 {
-                flows.push(ShieldedFlow {
-                    txid: tx.txid.clone(),
-                    flow_type: FlowType::PoolMigration.to_string(),
-                    pool: "orchard_to_sapling".to_string(),
-                    amount: tx.orchard_value_balance,
-                    block_height: tx.block_height,
-                    transparent_addresses: vec![],
-                });
-            }
+        // Skip pool migrations and fully shielded - no transparent involvement
+        // These don't belong in shielded_flows (no transparent addresses to track)
+        if tx.vin_count == 0 && tx.vout_count == 0 {
             return flows;
         }
 
-        // Fully shielded (no transparent, just shielded activity)
-        if tx.is_fully_shielded() {
-            let pool = tx.dominant_pool().unwrap_or("sapling");
-            flows.push(ShieldedFlow {
-                txid: tx.txid.clone(),
-                flow_type: FlowType::FullyShielded.to_string(),
-                pool: pool.to_string(),
-                amount: 0,  // Cannot determine amount for fully shielded
-                block_height: tx.block_height,
-                transparent_addresses: vec![],
-            });
-            return flows;
-        }
-
-        // Collect transparent addresses
+        // Collect transparent addresses for context
         let addresses: Vec<String> = tx.vin.iter()
             .filter_map(|v| v.address.clone())
             .chain(tx.vout.iter().filter_map(|v| v.address.clone()))
             .collect();
 
         // Shielding (transparent → sapling/orchard)
+        // value_balance < 0 means value is entering the shielded pool
         if tx.sapling_value_balance < 0 {
             flows.push(ShieldedFlow {
                 txid: tx.txid.clone(),
                 flow_type: FlowType::Shield.to_string(),
                 pool: Pool::Sapling.to_string(),
-                amount: -tx.sapling_value_balance,
+                amount: -tx.sapling_value_balance,  // Make positive
                 block_height: tx.block_height,
                 transparent_addresses: addresses.clone(),
             });
@@ -151,13 +114,14 @@ impl ShieldedFlow {
                 txid: tx.txid.clone(),
                 flow_type: FlowType::Shield.to_string(),
                 pool: Pool::Orchard.to_string(),
-                amount: -tx.orchard_value_balance,
+                amount: -tx.orchard_value_balance,  // Make positive
                 block_height: tx.block_height,
                 transparent_addresses: addresses.clone(),
             });
         }
 
         // Deshielding (sapling/orchard → transparent)
+        // value_balance > 0 means value is leaving the shielded pool
         if tx.sapling_value_balance > 0 {
             flows.push(ShieldedFlow {
                 txid: tx.txid.clone(),
