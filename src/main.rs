@@ -875,7 +875,7 @@ async fn compare_with_postgres(
 
     // Get sample transactions from PostgreSQL
     let query = r#"
-        SELECT 
+        SELECT
             txid, block_height, tx_index, version, locktime,
             vin_count, vout_count, size, fee,
             shielded_spends, shielded_outputs, orchard_actions,
@@ -1016,22 +1016,192 @@ async fn compare_with_postgres(
         }
     }
 
-    // Summary
+    // Summary for transactions
     println!();
-    println!("════════════════════════════════════════════════════════════");
-    println!("📊 Comparison Results:");
-    println!("   Total compared: {}", total);
-    if total > 0 {
-        println!("   ✅ Matches: {} ({:.1}%)", matches, matches as f64 / total as f64 * 100.0);
-    }
-    println!("   ❌ Mismatches: {}", mismatches.len());
+    println!("────────────────────────────────────────────────────────────");
+    println!("📊 Transaction Comparison:");
+    println!("   Total: {} | ✅ Matches: {} | ❌ Mismatches: {}", total, matches, mismatches.len());
 
     if !mismatches.is_empty() {
-        println!();
-        println!("📋 Mismatch Details (first 20):");
-        for m in mismatches.iter().take(20) {
-            println!("   {}", m);
+        println!("   First 10 mismatches:");
+        for m in mismatches.iter().take(10) {
+            println!("      {}", m);
         }
+    }
+
+    // ========================================================================
+    // COMPARE BLOCKS
+    // ========================================================================
+    println!();
+    println!("────────────────────────────────────────────────────────────");
+    println!("📦 Comparing Blocks...");
+
+    let block_query = r#"
+        SELECT height, hash, timestamp, transaction_count
+        FROM blocks
+        WHERE height >= $1
+        ORDER BY height
+        LIMIT $2
+    "#;
+
+    let block_rows = sqlx::query(block_query)
+        .bind(from_height as i64)
+        .bind(sample_count as i64)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("Block query failed: {}", e))?;
+
+    let mut block_total = 0;
+    let mut block_matches = 0;
+    let mut block_mismatches: Vec<String> = Vec::new();
+
+    for row in &block_rows {
+        let pg_height: i64 = row.get("height");
+        let pg_hash: String = row.get("hash");
+        let pg_tx_count: Option<i32> = row.try_get("transaction_count").ok();
+
+        let height = pg_height as u32;
+
+        // Get from RocksDB
+        let rust_hash = match zebra.get_block_hash(height) {
+            Ok(h) => {
+                let mut rev = h;
+                rev.reverse();
+                hex::encode(&rev)
+            }
+            Err(_) => continue,
+        };
+
+        let rust_tx_count = zebra.get_block_tx_count(height).unwrap_or(0);
+
+        block_total += 1;
+        let mut diffs: Vec<String> = Vec::new();
+
+        if rust_hash != pg_hash {
+            diffs.push(format!("hash mismatch"));
+        }
+
+        if let Some(pg_tc) = pg_tx_count {
+            if rust_tx_count as i32 != pg_tc {
+                diffs.push(format!("tx_count: rust={} pg={}", rust_tx_count, pg_tc));
+            }
+        }
+
+        if diffs.is_empty() {
+            block_matches += 1;
+        } else {
+            block_mismatches.push(format!("Block {}: {}", height, diffs.join(", ")));
+        }
+    }
+
+    println!("   Total: {} | ✅ Matches: {} | ❌ Mismatches: {}", block_total, block_matches, block_mismatches.len());
+    for m in block_mismatches.iter().take(5) {
+        println!("      {}", m);
+    }
+
+    // ========================================================================
+    // COMPARE TRANSACTION OUTPUTS (sample)
+    // ========================================================================
+    println!();
+    println!("────────────────────────────────────────────────────────────");
+    println!("📤 Comparing Transaction Outputs (vout)...");
+
+    let vout_query = r#"
+        SELECT o.txid, o.vout_index, o.value, o.address, t.block_height, t.tx_index
+        FROM transaction_outputs o
+        JOIN transactions t ON o.txid = t.txid
+        WHERE t.block_height >= $1
+        ORDER BY t.block_height, t.tx_index, o.vout_index
+        LIMIT $2
+    "#;
+
+    let vout_rows = sqlx::query(vout_query)
+        .bind(from_height as i64)
+        .bind((sample_count * 3) as i64)  // More outputs than tx
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("Vout query failed: {}", e))?;
+
+    let mut vout_total = 0;
+    let mut vout_matches = 0;
+    let mut vout_mismatches: Vec<String> = Vec::new();
+
+    for row in &vout_rows {
+        let pg_txid: String = row.get("txid");
+        let pg_vout_index: i32 = row.get("vout_index");
+        let pg_value: i64 = row.get("value");
+        let pg_address: Option<String> = row.try_get("address").ok();
+        let pg_height: i64 = row.get("block_height");
+        let pg_tx_index: Option<i32> = row.try_get("tx_index").ok();
+
+        let height = pg_height as u32;
+        let tx_index = pg_tx_index.unwrap_or(0) as u16;
+
+        // Parse from RocksDB
+        let raw = match zebra.get_transaction_by_loc(height, tx_index) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let block_hash = {
+            let mut h = zebra.get_block_hash(height).unwrap_or([0u8; 32]);
+            h.reverse();
+            hex::encode(&h)
+        };
+
+        let rust_tx = match TransactionParser::parse(&raw, height, &block_hash) {
+            Ok(tx) => tx,
+            Err(_) => continue,
+        };
+
+        // Find the matching vout
+        if let Some(rust_vout) = rust_tx.vout.iter().find(|v| v.n == pg_vout_index as u32) {
+            vout_total += 1;
+            let mut diffs: Vec<String> = Vec::new();
+
+            if rust_vout.value != pg_value {
+                diffs.push(format!("value: rust={} pg={}", rust_vout.value, pg_value));
+            }
+
+            // Compare addresses (both might be None/null)
+            let rust_addr = rust_vout.address.as_deref();
+            let pg_addr = pg_address.as_deref();
+            if rust_addr != pg_addr {
+                let r = rust_addr.unwrap_or("(none)");
+                let p = pg_addr.unwrap_or("(none)");
+                // Only report if both are Some but different
+                if rust_addr.is_some() && pg_addr.is_some() {
+                    diffs.push(format!("addr: rust={} pg={}", &r[..16.min(r.len())], &p[..16.min(p.len())]));
+                }
+            }
+
+            if diffs.is_empty() {
+                vout_matches += 1;
+            } else {
+                vout_mismatches.push(format!("{}:{} vout[{}]: {}", height, tx_index, pg_vout_index, diffs.join(", ")));
+            }
+        }
+    }
+
+    println!("   Total: {} | ✅ Matches: {} | ❌ Mismatches: {}", vout_total, vout_matches, vout_mismatches.len());
+    for m in vout_mismatches.iter().take(5) {
+        println!("      {}", m);
+    }
+
+    // ========================================================================
+    // FINAL SUMMARY
+    // ========================================================================
+    println!();
+    println!("════════════════════════════════════════════════════════════");
+    println!("📊 FINAL COMPARISON SUMMARY:");
+    println!("   Transactions: {}/{} matched ({:.1}%)", matches, total, if total > 0 { matches as f64 / total as f64 * 100.0 } else { 0.0 });
+    println!("   Blocks:       {}/{} matched ({:.1}%)", block_matches, block_total, if block_total > 0 { block_matches as f64 / block_total as f64 * 100.0 } else { 0.0 });
+    println!("   Vouts:        {}/{} matched ({:.1}%)", vout_matches, vout_total, if vout_total > 0 { vout_matches as f64 / vout_total as f64 * 100.0 } else { 0.0 });
+
+    let all_match = mismatches.is_empty() && block_mismatches.is_empty() && vout_mismatches.is_empty();
+    if all_match {
+        println!();
+        println!("🎉 All data matches! Rust parser is validated.");
     }
 
     println!("════════════════════════════════════════════════════════════");
