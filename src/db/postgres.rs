@@ -292,10 +292,25 @@ impl PostgresWriter {
         let mut db_tx = self.pool.begin().await?;
         let mut count = 0u64;
 
-        // Calculate total fees for the block (sum of all tx fees)
+        // Calculate block-level aggregates
         let total_fees: i64 = transactions.iter()
             .filter_map(|tx| tx.fee)
             .sum();
+
+        // Block size = sum of all tx sizes
+        let block_size: i32 = transactions.iter()
+            .map(|tx| tx.size as i32)
+            .sum();
+
+        // Miner address = first output of coinbase transaction
+        let miner_address: Option<String> = transactions.first()
+            .and_then(|coinbase| {
+                if coinbase.vin.first().map(|v| v.is_coinbase).unwrap_or(false) {
+                    coinbase.vout.first().and_then(|out| out.address.clone())
+                } else {
+                    None
+                }
+            });
 
         // Insert block with all header fields
         sqlx::query(
@@ -303,9 +318,9 @@ impl PostgresWriter {
             INSERT INTO blocks (
                 height, hash, timestamp, transaction_count, total_fees,
                 version, merkle_root, final_sapling_root, bits, nonce, solution,
-                difficulty, previous_block_hash
+                difficulty, previous_block_hash, size, miner_address
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (height) DO UPDATE SET
                 hash = EXCLUDED.hash,
                 transaction_count = EXCLUDED.transaction_count,
@@ -317,7 +332,9 @@ impl PostgresWriter {
                 nonce = EXCLUDED.nonce,
                 solution = EXCLUDED.solution,
                 difficulty = EXCLUDED.difficulty,
-                previous_block_hash = EXCLUDED.previous_block_hash
+                previous_block_hash = EXCLUDED.previous_block_hash,
+                size = EXCLUDED.size,
+                miner_address = EXCLUDED.miner_address
             "#
         )
         .bind(height as i64)
@@ -333,6 +350,8 @@ impl PostgresWriter {
         .bind(&header.solution)
         .bind(header.difficulty)
         .bind(&header.previous_block_hash)
+        .bind(block_size)
+        .bind(&miner_address)
         .execute(&mut *db_tx)
         .await?;
 
