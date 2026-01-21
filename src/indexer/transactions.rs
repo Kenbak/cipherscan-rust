@@ -237,6 +237,34 @@ impl TransactionParser {
 
         bs58::encode(&data).into_string()
     }
+
+    /// Resolve input addresses and values by looking up previous outputs
+    /// This mutates the transaction in place
+    pub fn resolve_inputs(tx: &mut Transaction, zebra: &crate::db::ZebraState) {
+        for input in tx.vin.iter_mut() {
+            // Skip coinbase inputs
+            if input.is_coinbase {
+                continue;
+            }
+
+            // Look up the previous output
+            match zebra.get_prev_output(&input.txid, input.vout) {
+                Ok((value, address)) => {
+                    input.value = Some(value);
+                    input.address = address;
+                }
+                Err(_e) => {
+                    // Previous output not found (might be from before our indexed range)
+                    // This is normal during partial backfills
+                }
+            }
+        }
+
+        // Recalculate transparent_value_in
+        tx.transparent_value_in = tx.vin.iter()
+            .filter_map(|v| v.value)
+            .sum();
+    }
 }
 
 #[cfg(test)]

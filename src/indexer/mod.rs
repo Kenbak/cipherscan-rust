@@ -52,7 +52,10 @@ impl Indexer {
 
         for (tx_index, raw) in &raw_txs {
             match TransactionParser::parse(raw, height, &block_hash) {
-                Ok(tx) => {
+                Ok(mut tx) => {
+                    // Resolve input addresses and values from previous outputs
+                    TransactionParser::resolve_inputs(&mut tx, &self.zebra);
+
                     // Extract shielded flows
                     let tx_flows = ShieldedFlow::from_transaction(&tx);
                     flows.extend(tx_flows);

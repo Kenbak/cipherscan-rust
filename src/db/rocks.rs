@@ -264,6 +264,73 @@ impl ZebraState {
         Ok(txs.len() as u16)
     }
 
+    /// Get transaction location (height, index) by txid hash
+    /// The txid should be in internal byte order (not display order)
+    pub fn get_tx_loc_by_hash(&self, txid_bytes: &[u8; 32]) -> Result<(u32, u16), String> {
+        let cf = self.db.cf_handle("tx_loc_by_hash")
+            .ok_or("tx_loc_by_hash CF not found")?;
+
+        match self.db.get_cf(cf, txid_bytes) {
+            Ok(Some(value)) => {
+                if value.len() >= 5 {
+                    // 3-byte height BE + 2-byte tx_index BE
+                    let height = ((value[0] as u32) << 16)
+                        | ((value[1] as u32) << 8)
+                        | (value[2] as u32);
+                    let tx_index = ((value[3] as u16) << 8) | (value[4] as u16);
+                    Ok((height, tx_index))
+                } else {
+                    Err(format!("Invalid tx_loc length: {}", value.len()))
+                }
+            }
+            Ok(None) => Err("Transaction not found by hash".to_string()),
+            Err(e) => Err(format!("Error looking up tx by hash: {}", e)),
+        }
+    }
+
+    /// Get a previous output's value and address
+    /// Returns (value_zat, address_option)
+    pub fn get_prev_output(&self, prev_txid_hex: &str, prev_vout: u32) -> Result<(i64, Option<String>), String> {
+        use crate::indexer::TransactionParser;
+
+        // Convert hex txid to bytes (internal order - reversed)
+        let txid_bytes = hex::decode(prev_txid_hex)
+            .map_err(|e| format!("Invalid txid hex: {}", e))?;
+
+        if txid_bytes.len() != 32 {
+            return Err(format!("Invalid txid length: {}", txid_bytes.len()));
+        }
+
+        // Reverse for internal byte order (Zcash stores in internal order)
+        let mut txid_internal = [0u8; 32];
+        for (i, b) in txid_bytes.iter().enumerate() {
+            txid_internal[31 - i] = *b;
+        }
+
+        // Look up the transaction location
+        let (height, tx_index) = self.get_tx_loc_by_hash(&txid_internal)?;
+
+        // Get the raw transaction
+        let raw_tx = self.get_transaction_by_loc(height, tx_index)?;
+
+        // Get block hash for parsing
+        let block_hash = {
+            let mut h = self.get_block_hash(height)?;
+            h.reverse();
+            hex::encode(&h)
+        };
+
+        // Parse the transaction
+        let tx = TransactionParser::parse(&raw_tx, height, &block_hash)?;
+
+        // Get the output at prev_vout
+        if let Some(output) = tx.vout.get(prev_vout as usize) {
+            Ok((output.value, output.address.clone()))
+        } else {
+            Err(format!("Output {} not found in tx", prev_vout))
+        }
+    }
+
     /// Count entries in a column family
     pub fn count_cf_entries(&self, cf_name: &str, limit: usize) -> usize {
         let cf = match self.db.cf_handle(cf_name) {

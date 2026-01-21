@@ -1228,7 +1228,10 @@ async fn validate_full(
 
         for (tx_index, raw) in &raw_txs {
             match TransactionParser::parse(raw, height, &block_hash) {
-                Ok(tx) => {
+                Ok(mut tx) => {
+                    // Resolve input addresses and values from previous outputs
+                    TransactionParser::resolve_inputs(&mut tx, &zebra);
+
                     let flows = ShieldedFlow::from_transaction(&tx);
                     rust_flow_count += flows.len() as u64;
                     all_flows.extend(flows);
