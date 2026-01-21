@@ -223,6 +223,47 @@ impl ZebraState {
         }
     }
 
+    /// Iterate over all transactions in a block
+    /// Returns (tx_index, raw_tx_bytes) for each transaction
+    pub fn iter_block_transactions(&self, height: u32) -> Result<Vec<(u16, Vec<u8>)>, String> {
+        let cf = self.db.cf_handle("tx_by_loc")
+            .ok_or("tx_by_loc CF not found")?;
+
+        // Prefix for this block height (3 bytes BE)
+        let prefix = [
+            ((height >> 16) & 0xFF) as u8,
+            ((height >> 8) & 0xFF) as u8,
+            (height & 0xFF) as u8,
+        ];
+
+        let mut transactions = Vec::new();
+
+        // Iterate from the start of this height's prefix
+        for item in self.db.prefix_iterator_cf(cf, &prefix) {
+            match item {
+                Ok((key, value)) => {
+                    // Check if still in same block (first 3 bytes match)
+                    if key.len() >= 5 && key[0..3] == prefix {
+                        let tx_index = ((key[3] as u16) << 8) | (key[4] as u16);
+                        transactions.push((tx_index, value.to_vec()));
+                    } else {
+                        // Moved to next block, stop
+                        break;
+                    }
+                }
+                Err(e) => return Err(format!("Error iterating transactions: {}", e)),
+            }
+        }
+
+        Ok(transactions)
+    }
+
+    /// Get count of transactions in a block
+    pub fn get_block_tx_count(&self, height: u32) -> Result<u16, String> {
+        let txs = self.iter_block_transactions(height)?;
+        Ok(txs.len() as u16)
+    }
+
     /// Count entries in a column family
     pub fn count_cf_entries(&self, cf_name: &str, limit: usize) -> usize {
         let cf = match self.db.cf_handle(cf_name) {

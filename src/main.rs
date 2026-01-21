@@ -360,20 +360,76 @@ async fn show_status(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Show a specific block
+/// Show a specific block with all its transactions
 fn show_block(config: &Config, height: u32) -> Result<(), String> {
+    use crate::indexer::TransactionParser;
+
     let zebra = ZebraState::open(config)?;
 
     let hash = zebra.get_block_hash(height)?;
     let mut hash_rev = hash;
     hash_rev.reverse();
+    let block_hash = hex::encode(&hash_rev);
 
     println!("📦 Block {}", height);
     println!("────────────────────────────────────────────────────────────");
-    println!("   Hash: {}", hex::encode(&hash_rev));
+    println!("   Hash: {}", block_hash);
+
+    // Get all transactions in block
+    let transactions = zebra.iter_block_transactions(height)?;
+    println!("   Transactions: {}", transactions.len());
     println!();
 
-    // TODO: Show more block details
+    // Summary counters
+    let mut total_transparent_out: i64 = 0;
+    let mut total_orchard_actions: u32 = 0;
+    let mut total_sapling_spends: u32 = 0;
+    let mut total_sapling_outputs: u32 = 0;
+
+    println!("   📋 Transaction Summary:");
+    println!("   ─────────────────────────────────────────────────────────");
+
+    for (idx, raw) in &transactions {
+        match TransactionParser::parse(raw, height, &block_hash) {
+            Ok(tx) => {
+                total_transparent_out += tx.transparent_value_out;
+                total_orchard_actions += tx.orchard_actions as u32;
+                total_sapling_spends += tx.sapling_spends as u32;
+                total_sapling_outputs += tx.sapling_outputs as u32;
+
+                // Brief summary line
+                let shielded = if tx.orchard_actions > 0 || tx.sapling_spends > 0 || tx.sapling_outputs > 0 {
+                    format!("🔒O:{} S:{}/{}",
+                        tx.orchard_actions,
+                        tx.sapling_spends,
+                        tx.sapling_outputs
+                    )
+                } else {
+                    "".to_string()
+                };
+
+                println!("   [{:3}] {} v{} | {} vout | {:.4} ZEC {}",
+                    idx,
+                    &tx.txid[..16],
+                    tx.version,
+                    tx.vout_count,
+                    tx.transparent_value_out as f64 / 100_000_000.0,
+                    shielded
+                );
+            }
+            Err(e) => {
+                println!("   [{:3}] ❌ Parse error: {}", idx, e);
+            }
+        }
+    }
+
+    println!();
+    println!("   📊 Block Totals:");
+    println!("      Transparent value: {:.8} ZEC", total_transparent_out as f64 / 100_000_000.0);
+    println!("      Orchard actions:   {}", total_orchard_actions);
+    println!("      Sapling spends:    {}", total_sapling_spends);
+    println!("      Sapling outputs:   {}", total_sapling_outputs);
+    println!();
 
     Ok(())
 }
