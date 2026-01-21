@@ -89,6 +89,16 @@ enum Commands {
         #[arg(long, env = "ZEBRA_RPC_COOKIE_FILE", default_value = "/root/.cache/zebra/.cookie")]
         cookie_file: String,
     },
+
+    /// Parse and display a transaction from RocksDB
+    Tx {
+        /// Block height
+        height: u32,
+
+        /// Transaction index within block
+        #[arg(default_value = "0")]
+        index: u16,
+    },
 }
 
 #[tokio::main]
@@ -140,6 +150,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Verify { height, count, rpc_url, cookie_file } => {
             verify_parsing(&config, height, count, &rpc_url, &cookie_file).await?;
+        }
+        Commands::Tx { height, index } => {
+            show_transaction(&config, height, index)?;
         }
     }
 
@@ -361,6 +374,86 @@ fn show_block(config: &Config, height: u32) -> Result<(), String> {
     println!();
 
     // TODO: Show more block details
+
+    Ok(())
+}
+
+/// Show a specific transaction parsed from RocksDB
+fn show_transaction(config: &Config, height: u32, index: u16) -> Result<(), String> {
+    use crate::indexer::TransactionParser;
+
+    let zebra = ZebraState::open(config)?;
+
+    // Get block hash
+    let block_hash = {
+        let mut h = zebra.get_block_hash(height)?;
+        h.reverse();
+        hex::encode(&h)
+    };
+
+    // Get raw transaction
+    let raw = zebra.get_transaction_by_loc(height, index)?;
+
+    println!("📋 Transaction at {}:{}", height, index);
+    println!("────────────────────────────────────────────────────────────");
+    println!("   Raw size: {} bytes", raw.len());
+    println!();
+
+    // Parse using zebra-chain
+    match TransactionParser::parse(&raw, height, &block_hash) {
+        Ok(tx) => {
+            println!("   ✅ Parsed successfully!");
+            println!();
+            println!("   TXID:       {}", tx.txid);
+            println!("   Version:    v{}", tx.version);
+            println!("   Lock time:  {}", tx.lock_time);
+            if let Some(exp) = tx.expiry_height {
+                println!("   Expiry:     {}", exp);
+            }
+            println!();
+            println!("   📥 Transparent Inputs:  {}", tx.vin_count);
+            println!("   📤 Transparent Outputs: {}", tx.vout_count);
+            println!("   💰 Value out: {} ZEC", tx.transparent_value_out as f64 / 100_000_000.0);
+            println!();
+            println!("   🔒 Shielded:");
+            println!("      Sprout JoinSplits: {}", tx.joinsplit_count);
+            println!("      Sapling Spends:    {}", tx.sapling_spends);
+            println!("      Sapling Outputs:   {}", tx.sapling_outputs);
+            println!("      Orchard Actions:   {}", tx.orchard_actions);
+            println!();
+            println!("   💱 Value Balances:");
+            println!("      Sapling: {} ZEC", tx.sapling_value_balance as f64 / 100_000_000.0);
+            println!("      Orchard: {} ZEC", tx.orchard_value_balance as f64 / 100_000_000.0);
+
+            // Show transparent outputs
+            if !tx.vout.is_empty() {
+                println!();
+                println!("   📤 Outputs:");
+                for vout in &tx.vout {
+                    let addr = vout.address.as_deref().unwrap_or("(unknown)");
+                    println!("      [{}] {} ZEC → {}",
+                        vout.n,
+                        vout.value as f64 / 100_000_000.0,
+                        addr
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            println!("   ❌ Parse error: {}", e);
+
+            // Show raw header for debugging
+            if raw.len() >= 4 {
+                let header = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                let version = (header & 0x7FFFFFFF) as i32;
+                let overwintered = (header >> 31) == 1;
+                println!("   Header: v{}, overwintered={}", version, overwintered);
+            }
+        }
+    }
+
+    println!();
+    println!("════════════════════════════════════════════════════════════");
 
     Ok(())
 }
