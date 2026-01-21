@@ -1252,7 +1252,7 @@ async fn validate_full(
         if (height - from_height + 1) % 10 == 0 {
             let elapsed = rust_start.elapsed();
             let rate = (height - from_height + 1) as f64 / elapsed.as_secs_f64();
-            println!("   📦 {} / {} | {:.1} blk/s | {} txs", 
+            println!("   📦 {} / {} | {:.1} blk/s | {} txs",
                 height, to_height, rate, rust_tx_count);
         }
     }
@@ -1294,7 +1294,7 @@ async fn validate_full(
 
     // Compare transactions
     println!("📊 Comparing transactions...");
-    
+
     let prod_txs: Vec<_> = sqlx::query(
         r#"
         SELECT txid, block_height, version, vin_count, vout_count,
@@ -1333,7 +1333,7 @@ async fn validate_full(
     println!("   Test DB: {} transactions", test_txs.len());
 
     // Build lookup map for test txs
-    let mut test_tx_map: std::collections::HashMap<String, &sqlx::postgres::PgRow> = 
+    let mut test_tx_map: std::collections::HashMap<String, &sqlx::postgres::PgRow> =
         std::collections::HashMap::new();
     for row in &test_txs {
         let txid: String = row.get("txid");
@@ -1357,7 +1357,7 @@ async fn validate_full(
                 ($field:expr, $ty:ty) => {{
                     let prod_val: Option<$ty> = prod_row.try_get($field).ok();
                     let test_val: Option<$ty> = test_row.try_get($field).ok();
-                    
+
                     match (prod_val, test_val) {
                         (Some(p), Some(t)) if p != t => {
                             diffs.push(format!("{}: prod={:?} test={:?}", $field, p, t));
@@ -1426,7 +1426,7 @@ async fn validate_full(
         SELECT txid, vout_index, value, address
         FROM transaction_outputs
         WHERE txid IN (
-            SELECT txid FROM transactions 
+            SELECT txid FROM transactions
             WHERE block_height >= $1 AND block_height <= $2
         )
         ORDER BY txid, vout_index
@@ -1443,7 +1443,7 @@ async fn validate_full(
         SELECT txid, vout_index, value, address
         FROM transaction_outputs
         WHERE txid IN (
-            SELECT txid FROM transactions 
+            SELECT txid FROM transactions
             WHERE block_height >= $1 AND block_height <= $2
         )
         ORDER BY txid, vout_index
@@ -1523,6 +1523,220 @@ async fn validate_full(
         }
     }
 
+    // Compare transaction inputs
+    println!();
+    println!("📥 Comparing transaction inputs...");
+
+    let prod_inputs: Vec<_> = sqlx::query(
+        r#"
+        SELECT txid, vout_index, prev_txid, prev_vout, address, value
+        FROM transaction_inputs
+        WHERE txid IN (
+            SELECT txid FROM transactions
+            WHERE block_height >= $1 AND block_height <= $2
+        )
+        ORDER BY txid, vout_index
+        "#
+    )
+    .bind(from_height as i64)
+    .bind(to_height as i64)
+    .fetch_all(&prod_pool)
+    .await
+    .map_err(|e| format!("Prod inputs query failed: {}", e))?;
+
+    let test_inputs: Vec<_> = sqlx::query(
+        r#"
+        SELECT txid, vout_index, prev_txid, prev_vout, address, value
+        FROM transaction_inputs
+        WHERE txid IN (
+            SELECT txid FROM transactions
+            WHERE block_height >= $1 AND block_height <= $2
+        )
+        ORDER BY txid, vout_index
+        "#
+    )
+    .bind(from_height as i64)
+    .bind(to_height as i64)
+    .fetch_all(&test_pool)
+    .await
+    .map_err(|e| format!("Test inputs query failed: {}", e))?;
+
+    println!("   Prod DB: {} inputs", prod_inputs.len());
+    println!("   Test DB: {} inputs", test_inputs.len());
+
+    // Build lookup
+    let mut test_input_map: std::collections::HashMap<(String, i32), &sqlx::postgres::PgRow> =
+        std::collections::HashMap::new();
+    for row in &test_inputs {
+        let txid: String = row.get("txid");
+        let vin: i32 = row.get("vout_index");
+        test_input_map.insert((txid, vin), row);
+    }
+
+    let mut in_matches = 0;
+    let mut in_mismatches: Vec<String> = Vec::new();
+    let mut in_missing = 0;
+
+    for prod_row in &prod_inputs {
+        let txid: String = prod_row.get("txid");
+        let vin: i32 = prod_row.get("vout_index");
+        let prod_prev_txid: Option<String> = prod_row.try_get("prev_txid").ok().flatten();
+        let prod_value: Option<i64> = prod_row.try_get("value").ok().flatten();
+
+        if let Some(test_row) = test_input_map.get(&(txid.clone(), vin)) {
+            let test_prev_txid: Option<String> = test_row.try_get("prev_txid").ok().flatten();
+            let test_value: Option<i64> = test_row.try_get("value").ok().flatten();
+
+            let mut diffs: Vec<String> = Vec::new();
+
+            match (&prod_prev_txid, &test_prev_txid) {
+                (Some(p), Some(t)) if p != t => {
+                    diffs.push(format!("prev_txid differs"));
+                }
+                (Some(_), None) => diffs.push("prev_txid: prod has value, test NULL".to_string()),
+                (None, Some(_)) => diffs.push("prev_txid: prod NULL, test has value".to_string()),
+                _ => {}
+            }
+
+            match (prod_value, test_value) {
+                (Some(p), Some(t)) if p != t => {
+                    diffs.push(format!("value: prod={} test={}", p, t));
+                }
+                (Some(p), None) => diffs.push(format!("value: prod={} test=NULL", p)),
+                (None, Some(t)) => diffs.push(format!("value: prod=NULL test={}", t)),
+                _ => {}
+            }
+
+            if diffs.is_empty() {
+                in_matches += 1;
+            } else {
+                in_mismatches.push(format!("{}[{}]: {}", &txid[..12], vin, diffs.join(", ")));
+            }
+        } else {
+            in_missing += 1;
+        }
+    }
+
+    println!();
+    println!("   ✅ Matches: {}", in_matches);
+    println!("   ❌ Mismatches: {}", in_mismatches.len());
+    println!("   ⚠️  Missing: {}", in_missing);
+
+    // Compare shielded flows
+    println!();
+    println!("🔒 Comparing shielded flows...");
+
+    let prod_flows: Vec<_> = sqlx::query(
+        r#"
+        SELECT txid, flow_type, pool, amount_zat, block_height
+        FROM shielded_flows
+        WHERE block_height >= $1 AND block_height <= $2
+        ORDER BY txid, flow_type
+        "#
+    )
+    .bind(from_height as i32)
+    .bind(to_height as i32)
+    .fetch_all(&prod_pool)
+    .await
+    .map_err(|e| format!("Prod flows query failed: {}", e))?;
+
+    let test_flows: Vec<_> = sqlx::query(
+        r#"
+        SELECT txid, flow_type, pool, amount_zat, block_height
+        FROM shielded_flows
+        WHERE block_height >= $1 AND block_height <= $2
+        ORDER BY txid, flow_type
+        "#
+    )
+    .bind(from_height as i32)
+    .bind(to_height as i32)
+    .fetch_all(&test_pool)
+    .await
+    .map_err(|e| format!("Test flows query failed: {}", e))?;
+
+    println!("   Prod DB: {} flows", prod_flows.len());
+    println!("   Test DB: {} flows", test_flows.len());
+
+    // Build lookup
+    let mut test_flow_map: std::collections::HashMap<(String, String), &sqlx::postgres::PgRow> =
+        std::collections::HashMap::new();
+    for row in &test_flows {
+        let txid: String = row.get("txid");
+        let flow_type: String = row.get("flow_type");
+        test_flow_map.insert((txid, flow_type), row);
+    }
+
+    let mut flow_matches = 0;
+    let mut flow_mismatches: Vec<String> = Vec::new();
+    let mut flow_missing = 0;
+
+    for prod_row in &prod_flows {
+        let txid: String = prod_row.get("txid");
+        let flow_type: String = prod_row.get("flow_type");
+        let prod_pool_name: String = prod_row.get("pool");
+        let prod_amount: i64 = prod_row.get("amount_zat");
+
+        if let Some(test_row) = test_flow_map.get(&(txid.clone(), flow_type.clone())) {
+            let test_pool_name: String = test_row.get("pool");
+            let test_amount: i64 = test_row.get("amount_zat");
+
+            let mut diffs: Vec<String> = Vec::new();
+
+            if prod_pool_name != test_pool_name {
+                diffs.push(format!("pool: prod={} test={}", prod_pool_name, test_pool_name));
+            }
+
+            if prod_amount != test_amount {
+                diffs.push(format!("amount: prod={} test={}", prod_amount, test_amount));
+            }
+
+            if diffs.is_empty() {
+                flow_matches += 1;
+            } else {
+                flow_mismatches.push(format!("{} {}: {}", &txid[..12], flow_type, diffs.join(", ")));
+            }
+        } else {
+            flow_missing += 1;
+            if flow_missing <= 3 {
+                println!("   ⚠️  Missing in test: {} {} (prod has it)", &txid[..16], flow_type);
+            }
+        }
+    }
+
+    // Also check for extra flows in test that aren't in prod
+    let mut flow_extra = 0;
+    for test_row in &test_flows {
+        let txid: String = test_row.get("txid");
+        let flow_type: String = test_row.get("flow_type");
+
+        let prod_has_it = prod_flows.iter().any(|r| {
+            let pt: String = r.get("txid");
+            let pf: String = r.get("flow_type");
+            pt == txid && pf == flow_type
+        });
+
+        if !prod_has_it {
+            flow_extra += 1;
+            if flow_extra <= 3 {
+                println!("   ℹ️  Extra in test: {} {} (prod doesn't have it)", &txid[..16], flow_type);
+            }
+        }
+    }
+
+    println!();
+    println!("   ✅ Matches: {}", flow_matches);
+    println!("   ❌ Mismatches: {}", flow_mismatches.len());
+    println!("   ⚠️  Missing in test: {}", flow_missing);
+    println!("   ℹ️  Extra in test: {}", flow_extra);
+
+    if !flow_mismatches.is_empty() {
+        println!();
+        println!("   First 10 flow mismatches:");
+        for m in flow_mismatches.iter().take(10) {
+            println!("      {}", m);
+        }
+    }
+
     // ========================================================================
     // SUMMARY
     // ========================================================================
@@ -1536,15 +1750,25 @@ async fn validate_full(
         rust_elapsed.as_secs_f64(), block_count, rust_rate, rust_tx_rate);
     println!();
     println!("🔍 Data Comparison:");
-    println!("   Transactions: {}/{} matched ({:.1}%)", 
+    println!("   Transactions: {}/{} matched ({:.1}%)",
         tx_matches, prod_txs.len(),
         if !prod_txs.is_empty() { tx_matches as f64 / prod_txs.len() as f64 * 100.0 } else { 0.0 });
     println!("   Outputs:      {}/{} matched ({:.1}%)",
         out_matches, prod_outputs.len(),
         if !prod_outputs.is_empty() { out_matches as f64 / prod_outputs.len() as f64 * 100.0 } else { 0.0 });
+    println!("   Inputs:       {}/{} matched ({:.1}%)",
+        in_matches, prod_inputs.len(),
+        if !prod_inputs.is_empty() { in_matches as f64 / prod_inputs.len() as f64 * 100.0 } else { 0.0 });
+    println!("   Flows:        {}/{} matched ({:.1}%)",
+        flow_matches, prod_flows.len(),
+        if !prod_flows.is_empty() { flow_matches as f64 / prod_flows.len() as f64 * 100.0 } else { 0.0 });
 
-    let all_ok = tx_mismatches.is_empty() && out_mismatches.is_empty() && tx_missing == 0;
-    
+    let all_ok = tx_mismatches.is_empty() 
+        && out_mismatches.is_empty() 
+        && in_mismatches.is_empty()
+        && flow_mismatches.is_empty()
+        && tx_missing == 0;
+
     println!();
     if all_ok {
         println!("🎉 VALIDATION PASSED! Rust indexer matches production data.");
