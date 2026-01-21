@@ -239,14 +239,15 @@ impl TransactionParser {
     }
 
     /// Resolve input addresses and values by looking up previous outputs
-    /// This mutates the transaction in place
+    /// This mutates the transaction in place, and calculates the fee
     pub fn resolve_inputs(tx: &mut Transaction, zebra: &crate::db::ZebraState) {
-        for input in tx.vin.iter_mut() {
-            // Skip coinbase inputs
-            if input.is_coinbase {
-                continue;
-            }
+        // Skip coinbase - no inputs to resolve, no fee
+        if tx.vin.iter().any(|v| v.is_coinbase) {
+            tx.fee = None;
+            return;
+        }
 
+        for input in tx.vin.iter_mut() {
             // Look up the previous output
             match zebra.get_prev_output(&input.txid, input.vout) {
                 Ok((value, address)) => {
@@ -264,6 +265,16 @@ impl TransactionParser {
         tx.transparent_value_in = tx.vin.iter()
             .filter_map(|v| v.value)
             .sum();
+
+        // Calculate fee:
+        // fee = transparent_in + shielded_value_balance - transparent_out
+        // where shielded_value_balance = sapling_value_balance + orchard_value_balance
+        // (positive value_balance means ZEC leaving shielded pool = more inputs)
+        let shielded_value_balance = tx.sapling_value_balance + tx.orchard_value_balance;
+        let fee = tx.transparent_value_in + shielded_value_balance - tx.transparent_value_out;
+
+        // Fee should always be positive (or zero for edge cases)
+        tx.fee = if fee >= 0 { Some(fee) } else { None };
     }
 }
 

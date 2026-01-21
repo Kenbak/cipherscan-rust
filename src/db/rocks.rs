@@ -340,13 +340,13 @@ impl ZebraState {
                 if value.len() < 8 {
                     return Ok(None);
                 }
-                
+
                 let amount = i64::from_le_bytes(value[0..8].try_into().unwrap());
                 let script = &value[8..];
-                
+
                 // Parse address from script
                 let address = Self::parse_address_from_script(script);
-                
+
                 Ok(Some((amount, address)))
             }
             Ok(None) => Ok(None), // UTXO not found (already spent)
@@ -357,7 +357,7 @@ impl ZebraState {
     /// Parse address from raw script bytes
     fn parse_address_from_script(script: &[u8]) -> Option<String> {
         use sha2::{Sha256, Digest};
-        
+
         // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
         if script.len() == 25
             && script[0] == 0x76  // OP_DUP
