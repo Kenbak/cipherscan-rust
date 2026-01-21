@@ -1355,7 +1355,7 @@ async fn validate_full(
     let mut tx_nulls_checked = 0;
 
     // Fields where prod=0 and test=value is an IMPROVEMENT (Node.js doesn't calculate these)
-    let improvement_fields: std::collections::HashSet<&str> = 
+    let improvement_fields: std::collections::HashSet<&str> =
         ["fee", "total_input", "total_output", "is_coinbase"].iter().cloned().collect();
 
     for prod_row in &prod_txs {
@@ -1377,7 +1377,7 @@ async fn validate_full(
                             // Check if this is an "improvement" field where prod=0
                             let is_improvement = improvement_fields.contains($field);
                             let prod_is_zero = format!("{:?}", p) == "0" || format!("{:?}", p) == "false";
-                            
+
                             if is_improvement && prod_is_zero {
                                 // This is an improvement, not a mismatch
                                 improvements.push(format!("{}: +{:?}", $field, t));
