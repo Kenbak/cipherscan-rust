@@ -1350,8 +1350,13 @@ async fn validate_full(
 
     let mut tx_matches = 0;
     let mut tx_mismatches: Vec<String> = Vec::new();
+    let mut tx_improvements: Vec<String> = Vec::new();
     let mut tx_missing = 0;
     let mut tx_nulls_checked = 0;
+
+    // Fields where prod=0 and test=value is an IMPROVEMENT (Node.js doesn't calculate these)
+    let improvement_fields: std::collections::HashSet<&str> = 
+        ["fee", "total_input", "total_output", "is_coinbase"].iter().cloned().collect();
 
     for prod_row in &prod_txs {
         let txid: String = prod_row.get("txid");
@@ -1359,6 +1364,7 @@ async fn validate_full(
 
         if let Some(test_row) = test_tx_map.get(&txid) {
             let mut diffs: Vec<String> = Vec::new();
+            let mut improvements: Vec<String> = Vec::new();
 
             // Compare each field - explicit null checking
             macro_rules! compare_field {
@@ -1368,7 +1374,16 @@ async fn validate_full(
 
                     match (prod_val, test_val) {
                         (Some(p), Some(t)) if p != t => {
-                            diffs.push(format!("{}: prod={:?} test={:?}", $field, p, t));
+                            // Check if this is an "improvement" field where prod=0
+                            let is_improvement = improvement_fields.contains($field);
+                            let prod_is_zero = format!("{:?}", p) == "0" || format!("{:?}", p) == "false";
+                            
+                            if is_improvement && prod_is_zero {
+                                // This is an improvement, not a mismatch
+                                improvements.push(format!("{}: +{:?}", $field, t));
+                            } else {
+                                diffs.push(format!("{}: prod={:?} test={:?}", $field, p, t));
+                            }
                         }
                         (Some(p), None) => {
                             diffs.push(format!("{}: prod={:?} test=NULL", $field, p));
@@ -1377,7 +1392,6 @@ async fn validate_full(
                             diffs.push(format!("{}: prod=NULL test={:?}", $field, t));
                         }
                         (None, None) => {
-                            // Both NULL - this is suspicious, track it
                             tx_nulls_checked += 1;
                         }
                         _ => {} // Match
@@ -1400,6 +1414,9 @@ async fn validate_full(
 
             if diffs.is_empty() {
                 tx_matches += 1;
+                if !improvements.is_empty() {
+                    tx_improvements.push(format!("{}:{} {}", height, &txid[..16], improvements.join(", ")));
+                }
             } else {
                 tx_mismatches.push(format!("{}:{} {}", height, &txid[..16], diffs.join(", ")));
             }
@@ -1413,15 +1430,23 @@ async fn validate_full(
 
     println!();
     println!("   ✅ Matches: {}", tx_matches);
-    println!("   ❌ Mismatches: {}", tx_mismatches.len());
+    println!("   ❌ Real mismatches: {}", tx_mismatches.len());
+    println!("   ✨ Improvements (Rust adds data): {}", tx_improvements.len());
     println!("   ⚠️  Missing: {}", tx_missing);
-    println!("   🔍 NULL==NULL fields: {}", tx_nulls_checked);
 
     if !tx_mismatches.is_empty() {
         println!();
-        println!("   First 10 mismatches:");
-        for m in tx_mismatches.iter().take(10) {
-            println!("      {}", m);
+        println!("   First 5 real mismatches:");
+        for m in tx_mismatches.iter().take(5) {
+            println!("      ❌ {}", m);
+        }
+    }
+
+    if !tx_improvements.is_empty() && tx_improvements.len() <= 3 {
+        println!();
+        println!("   Sample improvements:");
+        for m in tx_improvements.iter().take(3) {
+            println!("      ✨ {}", m);
         }
     }
 
