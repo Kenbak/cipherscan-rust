@@ -84,13 +84,11 @@ impl ShieldedFlow {
             return flows;
         }
 
-        // Skip fully shielded (no transparent involvement)
-        // These don't belong in shielded_flows (no transparent addresses to track)
-        if tx.vin_count == 0 && tx.vout_count == 0 {
-            return flows;
-        }
+        // Note: We do NOT skip fully shielded transactions (vin_count=0, vout_count=0)
+        // Node.js creates flows for all transactions with value_balance != 0
+        // This ensures compatibility and captures fee payments from shielded funds
 
-        // Collect transparent addresses for context
+        // Collect transparent addresses for context (may be empty for fully shielded)
         let addresses: Vec<String> = tx.vin.iter()
             .filter_map(|v| v.address.clone())
             .chain(tx.vout.iter().filter_map(|v| v.address.clone()))
