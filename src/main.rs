@@ -99,6 +99,21 @@ enum Commands {
         #[arg(default_value = "0")]
         index: u16,
     },
+
+    /// Compare Rust parsing with existing PostgreSQL data
+    Compare {
+        /// Number of transactions to sample
+        #[arg(long, default_value = "50")]
+        sample: usize,
+
+        /// Start height for sampling
+        #[arg(long, default_value = "3200000")]
+        from_height: u32,
+
+        /// PostgreSQL connection URL
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -153,6 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Tx { height, index } => {
             show_transaction(&config, height, index)?;
+        }
+        Commands::Compare { sample, from_height, database_url } => {
+            let db_url = database_url.unwrap_or_else(|| config.database_url.clone());
+            compare_with_postgres(&config, &db_url, sample, from_height).await?;
         }
     }
 
@@ -819,6 +838,202 @@ async fn verify_transaction_simple(
     }
 
     println!();
+    println!("════════════════════════════════════════════════════════════");
+
+    Ok(())
+}
+
+/// Compare Rust parsing with existing PostgreSQL data
+async fn compare_with_postgres(
+    config: &Config,
+    database_url: &str,
+    sample_count: usize,
+    from_height: u32,
+) -> Result<(), String> {
+    use crate::indexer::TransactionParser;
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::Row;
+
+    println!("🔍 Comparing Rust parsing with PostgreSQL data...");
+    println!("   Database: {}...", &database_url[..40.min(database_url.len())]);
+    println!("   Sample size: {}", sample_count);
+    println!("   From height: {}", from_height);
+    println!("────────────────────────────────────────────────────────────");
+    println!();
+
+    // Connect to PostgreSQL
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await
+        .map_err(|e| format!("Failed to connect to PostgreSQL: {}", e))?;
+
+    println!("✅ Connected to PostgreSQL");
+
+    // Open RocksDB
+    let zebra = ZebraState::open(config)?;
+
+    // Get sample transactions from PostgreSQL
+    let query = r#"
+        SELECT 
+            txid, block_height, tx_index, version, locktime,
+            vin_count, vout_count, size, fee,
+            shielded_spends, shielded_outputs, orchard_actions,
+            value_balance_sapling, value_balance_orchard,
+            is_coinbase, has_sapling, has_orchard
+        FROM transactions
+        WHERE block_height >= $1
+        ORDER BY block_height, tx_index
+        LIMIT $2
+    "#;
+
+    let rows = sqlx::query(query)
+        .bind(from_height as i64)
+        .bind(sample_count as i64)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("Query failed: {}", e))?;
+
+    println!("📊 Fetched {} transactions from PostgreSQL", rows.len());
+    println!();
+
+    // Comparison stats
+    let mut total = 0;
+    let mut matches = 0;
+    let mut mismatches: Vec<String> = Vec::new();
+
+    for row in &rows {
+        let pg_txid: String = row.get("txid");
+        let pg_height: i64 = row.get("block_height");
+        let pg_tx_index: Option<i32> = row.try_get("tx_index").ok();
+        let pg_version: Option<i32> = row.try_get("version").ok();
+        let pg_vin_count: Option<i32> = row.try_get("vin_count").ok();
+        let pg_vout_count: Option<i32> = row.try_get("vout_count").ok();
+        let pg_sapling_spends: Option<i32> = row.try_get("shielded_spends").ok();
+        let pg_sapling_outputs: Option<i32> = row.try_get("shielded_outputs").ok();
+        let pg_orchard_actions: Option<i32> = row.try_get("orchard_actions").ok();
+        let pg_value_balance_sapling: Option<i64> = row.try_get("value_balance_sapling").ok();
+        let pg_value_balance_orchard: Option<i64> = row.try_get("value_balance_orchard").ok();
+
+        let height = pg_height as u32;
+        let tx_index = pg_tx_index.unwrap_or(0) as u16;
+
+        // Parse from RocksDB
+        let raw = match zebra.get_transaction_by_loc(height, tx_index) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("⚠️  {}:{} - RocksDB error: {}", height, tx_index, e);
+                continue;
+            }
+        };
+
+        let block_hash = {
+            let mut h = zebra.get_block_hash(height).unwrap_or([0u8; 32]);
+            h.reverse();
+            hex::encode(&h)
+        };
+
+        let rust_tx = match TransactionParser::parse(&raw, height, &block_hash) {
+            Ok(tx) => tx,
+            Err(e) => {
+                println!("⚠️  {}:{} - Parse error: {}", height, tx_index, e);
+                continue;
+            }
+        };
+
+        total += 1;
+        let mut tx_matches = true;
+        let mut diffs: Vec<String> = Vec::new();
+
+        // Compare fields
+        if rust_tx.txid != pg_txid {
+            diffs.push(format!("txid: rust={} pg={}", &rust_tx.txid[..16], &pg_txid[..16]));
+            tx_matches = false;
+        }
+
+        if let Some(pg_v) = pg_version {
+            if rust_tx.version != pg_v {
+                diffs.push(format!("version: rust={} pg={}", rust_tx.version, pg_v));
+                tx_matches = false;
+            }
+        }
+
+        if let Some(pg_vin) = pg_vin_count {
+            if rust_tx.vin_count as i32 != pg_vin {
+                diffs.push(format!("vin_count: rust={} pg={}", rust_tx.vin_count, pg_vin));
+                tx_matches = false;
+            }
+        }
+
+        if let Some(pg_vout) = pg_vout_count {
+            if rust_tx.vout_count as i32 != pg_vout {
+                diffs.push(format!("vout_count: rust={} pg={}", rust_tx.vout_count, pg_vout));
+                tx_matches = false;
+            }
+        }
+
+        if let Some(pg_ss) = pg_sapling_spends {
+            if rust_tx.sapling_spends as i32 != pg_ss {
+                diffs.push(format!("sapling_spends: rust={} pg={}", rust_tx.sapling_spends, pg_ss));
+                tx_matches = false;
+            }
+        }
+
+        if let Some(pg_so) = pg_sapling_outputs {
+            if rust_tx.sapling_outputs as i32 != pg_so {
+                diffs.push(format!("sapling_outputs: rust={} pg={}", rust_tx.sapling_outputs, pg_so));
+                tx_matches = false;
+            }
+        }
+
+        if let Some(pg_oa) = pg_orchard_actions {
+            if rust_tx.orchard_actions as i32 != pg_oa {
+                diffs.push(format!("orchard_actions: rust={} pg={}", rust_tx.orchard_actions, pg_oa));
+                tx_matches = false;
+            }
+        }
+
+        if let Some(pg_vbs) = pg_value_balance_sapling {
+            if rust_tx.sapling_value_balance != pg_vbs {
+                diffs.push(format!("sapling_balance: rust={} pg={}", rust_tx.sapling_value_balance, pg_vbs));
+                tx_matches = false;
+            }
+        }
+
+        if let Some(pg_vbo) = pg_value_balance_orchard {
+            if rust_tx.orchard_value_balance != pg_vbo {
+                diffs.push(format!("orchard_balance: rust={} pg={}", rust_tx.orchard_value_balance, pg_vbo));
+                tx_matches = false;
+            }
+        }
+
+        if tx_matches {
+            matches += 1;
+        } else {
+            let txid_short = if pg_txid.len() > 16 { &pg_txid[..16] } else { &pg_txid };
+            let msg = format!("{}:{} {} - {}", height, tx_index, txid_short, diffs.join(", "));
+            mismatches.push(msg);
+        }
+    }
+
+    // Summary
+    println!();
+    println!("════════════════════════════════════════════════════════════");
+    println!("📊 Comparison Results:");
+    println!("   Total compared: {}", total);
+    if total > 0 {
+        println!("   ✅ Matches: {} ({:.1}%)", matches, matches as f64 / total as f64 * 100.0);
+    }
+    println!("   ❌ Mismatches: {}", mismatches.len());
+
+    if !mismatches.is_empty() {
+        println!();
+        println!("📋 Mismatch Details (first 20):");
+        for m in mismatches.iter().take(20) {
+            println!("   {}", m);
+        }
+    }
+
     println!("════════════════════════════════════════════════════════════");
 
     Ok(())
