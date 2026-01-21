@@ -297,10 +297,14 @@ impl PostgresWriter {
             .filter_map(|tx| tx.fee)
             .sum();
 
-        // Block size = sum of all tx sizes
-        let block_size: i32 = transactions.iter()
+        // Block size = sum of all tx sizes + header size (~1487 bytes for Zcash)
+        // Header: 4 (version) + 32 (prev_hash) + 32 (merkle) + 32 (reserved) + 4 (time) 
+        //       + 4 (bits) + 32 (nonce) + 3 (solution length) + 1344 (solution) = ~1487
+        const HEADER_SIZE: i32 = 1487;
+        let tx_sizes: i32 = transactions.iter()
             .map(|tx| tx.size as i32)
             .sum();
+        let block_size = tx_sizes + HEADER_SIZE;
 
         // Miner address = first output of coinbase transaction
         let miner_address: Option<String> = transactions.first()
