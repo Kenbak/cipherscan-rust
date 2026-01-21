@@ -268,20 +268,27 @@ impl PostgresWriter {
         let mut db_tx = self.pool.begin().await?;
         let mut count = 0u64;
 
+        // Calculate total fees for the block (sum of all tx fees)
+        let total_fees: i64 = transactions.iter()
+            .filter_map(|tx| tx.fee)
+            .sum();
+
         // Insert block
         sqlx::query(
             r#"
-            INSERT INTO blocks (height, hash, timestamp, transaction_count)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO blocks (height, hash, timestamp, transaction_count, total_fees)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (height) DO UPDATE SET
                 hash = EXCLUDED.hash,
-                transaction_count = EXCLUDED.transaction_count
+                transaction_count = EXCLUDED.transaction_count,
+                total_fees = EXCLUDED.total_fees
             "#
         )
         .bind(height as i64)
         .bind(hash)
         .bind(timestamp as i64)
         .bind(transactions.len() as i32)
+        .bind(total_fees)
         .execute(&mut *db_tx)
         .await?;
 
