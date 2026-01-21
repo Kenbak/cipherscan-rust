@@ -1244,14 +1244,13 @@ async fn validate_full(
             }
         }
 
-        // Get block time (use current time as placeholder)
-        let block_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        // Get block header for timestamp and other fields
+        let header = zebra.get_block_header(height)
+            .map_err(|e| format!("Header error at {}: {}", height, e))?;
+        let block_time = header.time;
 
-        // Write to test database
-        test_writer.batch_insert(height, &block_hash, block_time, &transactions).await
+        // Write to test database with full header info
+        test_writer.batch_insert_with_header(height, &block_hash, block_time, &transactions, &header).await
             .map_err(|e| format!("DB write error at {}: {}", height, e))?;
 
         // Write flows
