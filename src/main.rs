@@ -1763,8 +1763,8 @@ async fn validate_full(
         flow_matches, prod_flows.len(),
         if !prod_flows.is_empty() { flow_matches as f64 / prod_flows.len() as f64 * 100.0 } else { 0.0 });
 
-    let all_ok = tx_mismatches.is_empty() 
-        && out_mismatches.is_empty() 
+    let all_ok = tx_mismatches.is_empty()
+        && out_mismatches.is_empty()
         && in_mismatches.is_empty()
         && flow_mismatches.is_empty()
         && tx_missing == 0;

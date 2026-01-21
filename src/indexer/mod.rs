@@ -75,17 +75,15 @@ impl Indexer {
             0
         };
 
-        // Write to PostgreSQL
+        // Write to PostgreSQL (blocks, transactions, outputs, inputs)
         self.postgres.batch_insert(height, &block_hash, block_time, &transactions).await
             .map_err(|e| format!("DB insert error: {}", e))?;
 
         // Write flows
-        for flow in &flows {
-            self.postgres.upsert_flow(flow, block_time).await
-                .map_err(|e| format!("Flow insert error: {}", e))?;
-        }
+        let flow_count = self.postgres.batch_insert_flows(&flows, block_time).await
+            .map_err(|e| format!("Flow insert error: {}", e))?;
 
-        Ok((tx_count, flows.len() as u32))
+        Ok((tx_count, flow_count as u32))
     }
 
     /// Run backfill from start_height to end_height (or tip)

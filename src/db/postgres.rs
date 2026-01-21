@@ -350,10 +350,73 @@ impl PostgresWriter {
                 .await?;
             }
 
+            // Insert inputs (skip coinbase)
+            for (i, input) in tx.vin.iter().enumerate() {
+                if input.is_coinbase {
+                    continue;
+                }
+
+                sqlx::query(
+                    r#"
+                    INSERT INTO transaction_inputs (txid, vout_index, prev_txid, prev_vout, address, value)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT DO NOTHING
+                    "#
+                )
+                .bind(&tx.txid)
+                .bind(i as i32)
+                .bind(&input.txid)
+                .bind(input.vout as i32)
+                .bind(&input.address)
+                .bind(input.value)
+                .execute(&mut *db_tx)
+                .await?;
+            }
+
             count += 1;
         }
 
         db_tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Batch insert flows
+    pub async fn batch_insert_flows(
+        &self,
+        flows: &[crate::models::ShieldedFlow],
+        block_time: u64,
+    ) -> Result<u64, sqlx::Error> {
+        if flows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut count = 0u64;
+        for flow in flows {
+            sqlx::query(
+                r#"
+                INSERT INTO shielded_flows (
+                    txid, block_height, block_time, flow_type, amount_zat, pool,
+                    transparent_addresses, transparent_value_zat
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (txid, flow_type) DO UPDATE SET
+                    amount_zat = EXCLUDED.amount_zat,
+                    transparent_addresses = EXCLUDED.transparent_addresses
+                "#
+            )
+            .bind(&flow.txid)
+            .bind(flow.block_height as i32)
+            .bind(block_time as i32)
+            .bind(&flow.flow_type)
+            .bind(flow.amount)
+            .bind(&flow.pool)
+            .bind(&flow.transparent_addresses)
+            .bind(flow.amount)
+            .execute(&self.pool)
+            .await?;
+
+            count += 1;
+        }
+
         Ok(count)
     }
 }
