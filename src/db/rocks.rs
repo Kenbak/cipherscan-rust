@@ -288,11 +288,10 @@ impl ZebraState {
         }
     }
 
-    /// Get a previous output's value and address
+    /// Get a previous output's value and address using UTXO lookup (fast path)
+    /// Falls back to parsing the full transaction if UTXO not found (already spent)
     /// Returns (value_zat, address_option)
     pub fn get_prev_output(&self, prev_txid_hex: &str, prev_vout: u32) -> Result<(i64, Option<String>), String> {
-        use crate::indexer::TransactionParser;
-
         // Convert hex txid to bytes (internal order - reversed)
         let txid_bytes = hex::decode(prev_txid_hex)
             .map_err(|e| format!("Invalid txid hex: {}", e))?;
@@ -310,24 +309,113 @@ impl ZebraState {
         // Look up the transaction location
         let (height, tx_index) = self.get_tx_loc_by_hash(&txid_internal)?;
 
-        // Get the raw transaction
+        // Try UTXO lookup first (fast path - only works for unspent outputs)
+        if let Ok(Some((value, address))) = self.get_utxo_by_loc(height, tx_index, prev_vout as u16) {
+            return Ok((value, address));
+        }
+
+        // Fallback: parse the full transaction (slower, but works for spent outputs)
+        self.get_output_by_parsing(height, tx_index, prev_vout)
+    }
+
+    /// Get UTXO directly from utxo_by_out_loc (fast, but only for unspent)
+    fn get_utxo_by_loc(&self, height: u32, tx_index: u16, output_index: u16) -> Result<Option<(i64, Option<String>)>, String> {
+        let cf = self.db.cf_handle("utxo_by_out_loc")
+            .ok_or("utxo_by_out_loc CF not found")?;
+
+        // Key: 3-byte height BE + 2-byte tx_index BE + 2-byte output_index BE
+        let key = [
+            ((height >> 16) & 0xFF) as u8,
+            ((height >> 8) & 0xFF) as u8,
+            (height & 0xFF) as u8,
+            ((tx_index >> 8) & 0xFF) as u8,
+            (tx_index & 0xFF) as u8,
+            ((output_index >> 8) & 0xFF) as u8,
+            (output_index & 0xFF) as u8,
+        ];
+
+        match self.db.get_cf(cf, &key) {
+            Ok(Some(value)) => {
+                // Parse the UTXO value: 8-byte value LE + script
+                if value.len() < 8 {
+                    return Ok(None);
+                }
+                
+                let amount = i64::from_le_bytes(value[0..8].try_into().unwrap());
+                let script = &value[8..];
+                
+                // Parse address from script
+                let address = Self::parse_address_from_script(script);
+                
+                Ok(Some((amount, address)))
+            }
+            Ok(None) => Ok(None), // UTXO not found (already spent)
+            Err(e) => Err(format!("UTXO lookup error: {}", e)),
+        }
+    }
+
+    /// Parse address from raw script bytes
+    fn parse_address_from_script(script: &[u8]) -> Option<String> {
+        use sha2::{Sha256, Digest};
+        
+        // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+        if script.len() == 25
+            && script[0] == 0x76  // OP_DUP
+            && script[1] == 0xa9  // OP_HASH160
+            && script[2] == 0x14  // Push 20 bytes
+            && script[23] == 0x88 // OP_EQUALVERIFY
+            && script[24] == 0xac // OP_CHECKSIG
+        {
+            let hash = &script[3..23];
+            return Some(Self::encode_address_static(&[0x1C, 0xB8], hash)); // Mainnet t1
+        }
+
+        // P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+        if script.len() == 23
+            && script[0] == 0xa9  // OP_HASH160
+            && script[1] == 0x14  // Push 20 bytes
+            && script[22] == 0x87 // OP_EQUAL
+        {
+            let hash = &script[2..22];
+            return Some(Self::encode_address_static(&[0x1C, 0xBD], hash)); // Mainnet t3
+        }
+
+        None
+    }
+
+    /// Encode address with Base58Check
+    fn encode_address_static(prefix: &[u8], hash: &[u8]) -> String {
+        use sha2::{Sha256, Digest};
+
+        let mut data = Vec::with_capacity(prefix.len() + hash.len() + 4);
+        data.extend_from_slice(prefix);
+        data.extend_from_slice(hash);
+
+        let first = Sha256::digest(&data);
+        let second = Sha256::digest(&first);
+        data.extend_from_slice(&second[0..4]);
+
+        bs58::encode(&data).into_string()
+    }
+
+    /// Fallback: parse the full transaction to get output (slower)
+    fn get_output_by_parsing(&self, height: u32, tx_index: u16, output_index: u32) -> Result<(i64, Option<String>), String> {
+        use crate::indexer::TransactionParser;
+
         let raw_tx = self.get_transaction_by_loc(height, tx_index)?;
 
-        // Get block hash for parsing
         let block_hash = {
             let mut h = self.get_block_hash(height)?;
             h.reverse();
             hex::encode(&h)
         };
 
-        // Parse the transaction
         let tx = TransactionParser::parse(&raw_tx, height, &block_hash)?;
 
-        // Get the output at prev_vout
-        if let Some(output) = tx.vout.get(prev_vout as usize) {
+        if let Some(output) = tx.vout.get(output_index as usize) {
             Ok((output.value, output.address.clone()))
         } else {
-            Err(format!("Output {} not found in tx", prev_vout))
+            Err(format!("Output {} not found in tx", output_index))
         }
     }
 
