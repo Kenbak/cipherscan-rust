@@ -42,6 +42,10 @@ impl Indexer {
         hash_rev.reverse();
         let block_hash = hex::encode(&hash_rev);
 
+        // Get block header for timestamp and other fields
+        let header = self.zebra.get_block_header(height)?;
+        let block_time = header.time;
+
         // Get all transactions in block
         let raw_txs = self.zebra.iter_block_transactions(height)?;
         let tx_count = raw_txs.len() as u32;
@@ -67,19 +71,8 @@ impl Indexer {
             }
         }
 
-        // Get block timestamp from first tx (coinbase) or estimate
-        let block_time = if let Some(first_tx) = transactions.first() {
-            // For now, use current time - we'd need to parse block header for actual time
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        } else {
-            0
-        };
-
         // Write to PostgreSQL (blocks, transactions, outputs, inputs)
-        self.postgres.batch_insert(height, &block_hash, block_time, &transactions).await
+        self.postgres.batch_insert_with_header(height, &block_hash, block_time, &transactions, &header).await
             .map_err(|e| format!("DB insert error: {}", e))?;
 
         // Write flows

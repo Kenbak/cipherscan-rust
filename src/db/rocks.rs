@@ -4,10 +4,12 @@
 //! This is ~100-1000x faster than JSON-RPC calls.
 
 use rocksdb::{DB, Options, IteratorMode};
-use std::path::Path;
+use std::io::Cursor;
 use std::time::Instant;
 use crate::config::Config;
 use crate::models::{Block, Transaction, TransparentInput, TransparentOutput};
+use zebra_chain::block::Header as ZebraHeader;
+use zebra_chain::serialization::ZcashDeserialize;
 
 /// Zebra column families we care about
 pub const COLUMN_FAMILIES: &[&str] = &[
@@ -116,6 +118,124 @@ impl ZebraState {
             Ok(None) => Err(format!("Block not found at height {}", height)),
             Err(e) => Err(format!("Error reading block hash: {}", e)),
         }
+    }
+
+    /// Get and parse block header
+    pub fn get_block_header(&self, height: u32) -> Result<ParsedBlockHeader, String> {
+        let cf = self.db.cf_handle("block_header_by_height")
+            .ok_or("block_header_by_height CF not found")?;
+
+        // Encode height as 3-byte big-endian
+        let key = [
+            ((height >> 16) & 0xFF) as u8,
+            ((height >> 8) & 0xFF) as u8,
+            (height & 0xFF) as u8,
+        ];
+
+        match self.db.get_cf(cf, &key) {
+            Ok(Some(value)) => {
+                // Parse header using zebra-chain
+                let mut cursor = Cursor::new(&value[..]);
+                let header = ZebraHeader::zcash_deserialize(&mut cursor)
+                    .map_err(|e| format!("Failed to parse header: {:?}", e))?;
+
+                // Extract version (use Debug format to get the inner value)
+                let version = {
+                    let v_str = format!("{:?}", header.version);
+                    // Parse "Version(4)" -> 4
+                    v_str.trim_start_matches("Version(")
+                        .trim_end_matches(')')
+                        .parse::<i32>()
+                        .unwrap_or(4)
+                };
+
+                // Convert hashes to hex (display order = reversed)
+                let prev_hash = {
+                    let bytes: [u8; 32] = header.previous_block_hash.0.into();
+                    let mut rev = bytes;
+                    rev.reverse();
+                    hex::encode(&rev)
+                };
+
+                let merkle_root = {
+                    let bytes: [u8; 32] = header.merkle_root.0.into();
+                    let mut rev = bytes;
+                    rev.reverse();
+                    hex::encode(&rev)
+                };
+
+                let final_sapling_root = {
+                    let bytes: [u8; 32] = header.commitment_bytes.0;
+                    let mut rev = bytes;
+                    rev.reverse();
+                    hex::encode(&rev)
+                };
+
+                // Time
+                let time = header.time.timestamp() as u64;
+
+                // Difficulty/bits - use Debug format since field is private
+                let bits = {
+                    let bits_str = format!("{:?}", header.difficulty_threshold);
+                    // Parse "CompactDifficulty(0x1c00f2d4)" -> "1c00f2d4"
+                    bits_str.trim_start_matches("CompactDifficulty(0x")
+                        .trim_end_matches(')')
+                        .to_string()
+                };
+
+                // Calculate difficulty - extract the u32 value from debug output
+                let difficulty = {
+                    let bits_val = u32::from_str_radix(&bits, 16).unwrap_or(0);
+                    Self::compact_to_difficulty(bits_val)
+                };
+
+                // Nonce - use Debug format since it's wrapped in HexDebug
+                let nonce = format!("{:?}", header.nonce);
+
+                // Solution - use the bytes directly
+                let solution = {
+                    let sol_str = format!("{:?}", header.solution);
+                    // Just store a truncated version or empty if too complex
+                    if sol_str.len() > 100 {
+                        // Solution is ~1344 bytes, just note it exists
+                        format!("({}bytes)", sol_str.len())
+                    } else {
+                        sol_str
+                    }
+                };
+
+                Ok(ParsedBlockHeader {
+                    version,
+                    previous_block_hash: prev_hash,
+                    merkle_root,
+                    final_sapling_root,
+                    time,
+                    bits,
+                    difficulty,
+                    nonce,
+                    solution,
+                })
+            }
+            Ok(None) => Err(format!("Block header not found at height {}", height)),
+            Err(e) => Err(format!("Error reading block header: {}", e)),
+        }
+    }
+
+    /// Convert compact difficulty (nBits) to full difficulty
+    fn compact_to_difficulty(compact: u32) -> f64 {
+        let exponent = (compact >> 24) as i32;
+        let mantissa = (compact & 0x00ffffff) as f64;
+
+        if mantissa == 0.0 {
+            return 0.0;
+        }
+
+        // Difficulty = max_target / current_target
+        // For Zcash, max_target has exponent 0x1f and mantissa 0x07ffff
+        let max_target = 0x07ffff as f64 * 256.0_f64.powi(0x1f - 3);
+        let current_target = mantissa * 256.0_f64.powi(exponent - 3);
+
+        max_target / current_target
     }
 
     /// Iterate over all blocks from start_height to end_height
@@ -449,6 +569,20 @@ pub struct DbStats {
     pub tip_height: u32,
     pub block_count: u32,
     pub network: String,
+}
+
+/// Parsed block header with all fields
+#[derive(Debug, Clone)]
+pub struct ParsedBlockHeader {
+    pub version: i32,
+    pub previous_block_hash: String,
+    pub merkle_root: String,
+    pub final_sapling_root: String,
+    pub time: u64,
+    pub bits: String,
+    pub difficulty: f64,
+    pub nonce: String,
+    pub solution: String,
 }
 
 #[cfg(test)]

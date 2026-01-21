@@ -265,6 +265,30 @@ impl PostgresWriter {
         timestamp: u64,
         transactions: &[Transaction],
     ) -> Result<u64, sqlx::Error> {
+        // Use default header (for backwards compatibility)
+        let header = crate::db::ParsedBlockHeader {
+            version: 4,
+            previous_block_hash: String::new(),
+            merkle_root: String::new(),
+            final_sapling_root: String::new(),
+            time: timestamp,
+            bits: String::new(),
+            difficulty: 0.0,
+            nonce: String::new(),
+            solution: String::new(),
+        };
+        self.batch_insert_with_header(height, hash, timestamp, transactions, &header).await
+    }
+
+    /// Batch insert with full block header info
+    pub async fn batch_insert_with_header(
+        &self,
+        height: u32,
+        hash: &str,
+        timestamp: u64,
+        transactions: &[Transaction],
+        header: &crate::db::ParsedBlockHeader,
+    ) -> Result<u64, sqlx::Error> {
         let mut db_tx = self.pool.begin().await?;
         let mut count = 0u64;
 
@@ -273,15 +297,27 @@ impl PostgresWriter {
             .filter_map(|tx| tx.fee)
             .sum();
 
-        // Insert block
+        // Insert block with all header fields
         sqlx::query(
             r#"
-            INSERT INTO blocks (height, hash, timestamp, transaction_count, total_fees)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO blocks (
+                height, hash, timestamp, transaction_count, total_fees,
+                version, merkle_root, final_sapling_root, bits, nonce, solution,
+                difficulty, previous_block_hash
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (height) DO UPDATE SET
                 hash = EXCLUDED.hash,
                 transaction_count = EXCLUDED.transaction_count,
-                total_fees = EXCLUDED.total_fees
+                total_fees = EXCLUDED.total_fees,
+                version = EXCLUDED.version,
+                merkle_root = EXCLUDED.merkle_root,
+                final_sapling_root = EXCLUDED.final_sapling_root,
+                bits = EXCLUDED.bits,
+                nonce = EXCLUDED.nonce,
+                solution = EXCLUDED.solution,
+                difficulty = EXCLUDED.difficulty,
+                previous_block_hash = EXCLUDED.previous_block_hash
             "#
         )
         .bind(height as i64)
@@ -289,6 +325,14 @@ impl PostgresWriter {
         .bind(timestamp as i64)
         .bind(transactions.len() as i32)
         .bind(total_fees)
+        .bind(header.version)
+        .bind(&header.merkle_root)
+        .bind(&header.final_sapling_root)
+        .bind(&header.bits)
+        .bind(&header.nonce)
+        .bind(&header.solution)
+        .bind(header.difficulty)
+        .bind(&header.previous_block_hash)
         .execute(&mut *db_tx)
         .await?;
 
