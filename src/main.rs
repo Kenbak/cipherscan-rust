@@ -1224,12 +1224,14 @@ async fn validate_full(
         // Get all transactions
         let raw_txs = zebra.iter_block_transactions(height)?;
         let mut transactions = Vec::with_capacity(raw_txs.len());
+        let mut all_flows = Vec::new();
 
         for (tx_index, raw) in &raw_txs {
             match TransactionParser::parse(raw, height, &block_hash) {
                 Ok(tx) => {
                     let flows = ShieldedFlow::from_transaction(&tx);
                     rust_flow_count += flows.len() as u64;
+                    all_flows.extend(flows);
                     transactions.push(tx);
                     rust_tx_count += 1;
                 }
@@ -1248,6 +1250,10 @@ async fn validate_full(
         // Write to test database
         test_writer.batch_insert(height, &block_hash, block_time, &transactions).await
             .map_err(|e| format!("DB write error at {}: {}", height, e))?;
+
+        // Write flows
+        test_writer.batch_insert_flows(&all_flows, block_time).await
+            .map_err(|e| format!("Flow write error at {}: {}", height, e))?;
 
         if (height - from_height + 1) % 10 == 0 {
             let elapsed = rust_start.elapsed();
@@ -1698,7 +1704,8 @@ async fn validate_full(
         } else {
             flow_missing += 1;
             if flow_missing <= 3 {
-                println!("   ⚠️  Missing in test: {} {} (prod has it)", &txid[..16], flow_type);
+                let txid_short = if txid.len() > 16 { &txid[..16] } else { &txid };
+                println!("   ⚠️  Missing in test: {} {} (prod has it)", txid_short, flow_type);
             }
         }
     }
@@ -1718,7 +1725,8 @@ async fn validate_full(
         if !prod_has_it {
             flow_extra += 1;
             if flow_extra <= 3 {
-                println!("   ℹ️  Extra in test: {} {} (prod doesn't have it)", &txid[..16], flow_type);
+                let txid_short = if txid.len() > 16 { &txid[..16] } else { &txid };
+                println!("   ℹ️  Extra in test: {} {} (prod doesn't have it)", txid_short, flow_type);
             }
         }
     }

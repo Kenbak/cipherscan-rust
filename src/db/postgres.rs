@@ -396,7 +396,7 @@ impl PostgresWriter {
         for flow in flows {
             // Debug: print first flow
             if count == 0 && errors == 0 {
-                eprintln!("DEBUG FLOW: txid={} type={} pool={} amount={}", 
+                eprintln!("DEBUG FLOW: txid={} type={} pool={} amount={}",
                     &flow.txid[..16], flow.flow_type, flow.pool, flow.amount);
             }
 
@@ -427,7 +427,7 @@ impl PostgresWriter {
                 Err(e) => {
                     errors += 1;
                     // Always print errors to stderr
-                    eprintln!("FLOW INSERT ERROR: {} | txid={} flow_type={} pool={}", 
+                    eprintln!("FLOW INSERT ERROR: {} | txid={} flow_type={} pool={}",
                         e, &flow.txid[..16], flow.flow_type, flow.pool);
                 }
             }
