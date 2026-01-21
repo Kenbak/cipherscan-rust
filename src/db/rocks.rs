@@ -174,33 +174,53 @@ impl ZebraState {
                 // Time
                 let time = header.time.timestamp() as u64;
 
-                // Difficulty/bits - use Debug format since field is private
-                let bits = {
+                // Difficulty/bits - extract from Debug format
+                let (bits, difficulty) = {
                     let bits_str = format!("{:?}", header.difficulty_threshold);
-                    // Parse "CompactDifficulty(0x1c00f2d4)" -> "1c00f2d4"
-                    bits_str.trim_start_matches("CompactDifficulty(0x")
-                        .trim_end_matches(')')
-                        .to_string()
+                    // Format is like "CompactDifficulty(0x1c00f2d4, Some(...))"
+                    // Extract just the hex value
+                    let bits_hex = if let Some(start) = bits_str.find("0x") {
+                        let after_0x = &bits_str[start + 2..];
+                        if let Some(end) = after_0x.find(|c: char| !c.is_ascii_hexdigit()) {
+                            after_0x[..end].to_string()
+                        } else {
+                            after_0x.to_string()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    let bits_val = u32::from_str_radix(&bits_hex, 16).unwrap_or(0);
+                    let diff = Self::compact_to_difficulty(bits_val);
+                    (bits_hex, diff)
                 };
 
-                // Calculate difficulty - extract the u32 value from debug output
-                let difficulty = {
-                    let bits_val = u32::from_str_radix(&bits, 16).unwrap_or(0);
-                    Self::compact_to_difficulty(bits_val)
+                // Nonce - extract hex from HexDebug format
+                let nonce = {
+                    let nonce_str = format!("{:?}", header.nonce);
+                    // Format is like '[u8; 32]("b67501...")'
+                    if let Some(start) = nonce_str.find('"') {
+                        if let Some(end) = nonce_str.rfind('"') {
+                            nonce_str[start + 1..end].to_string()
+                        } else {
+                            nonce_str
+                        }
+                    } else {
+                        nonce_str
+                    }
                 };
 
-                // Nonce - use Debug format since it's wrapped in HexDebug
-                let nonce = format!("{:?}", header.nonce);
-
-                // Solution - use the bytes directly
+                // Solution - extract hex, store truncated
                 let solution = {
                     let sol_str = format!("{:?}", header.solution);
-                    // Just store a truncated version or empty if too complex
-                    if sol_str.len() > 100 {
-                        // Solution is ~1344 bytes, just note it exists
-                        format!("({}bytes)", sol_str.len())
+                    if let Some(start) = sol_str.find('"') {
+                        if let Some(end) = sol_str.rfind('"') {
+                            sol_str[start + 1..end].to_string()
+                        } else {
+                            String::new()
+                        }
                     } else {
-                        sol_str
+                        String::new()
                     }
                 };
 
