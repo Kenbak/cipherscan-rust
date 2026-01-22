@@ -166,9 +166,14 @@ impl Indexer {
         println!("   ✅ RPC client initialized");
 
         loop {
+            println!("   🔍 Querying RPC for chain tip...");
+            
             // Get tip from RPC (always accurate)
             let rpc_tip = match rpc.get_block_count().await {
-                Ok(tip) => tip as u32,
+                Ok(tip) => {
+                    println!("   📊 RPC tip: {}", tip);
+                    tip as u32
+                }
                 Err(e) => {
                     println!("   ⚠️ RPC error: {}", e);
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -178,12 +183,14 @@ impl Indexer {
 
             // Try to catch up RocksDB with primary
             if let Err(e) = self.zebra.try_catch_up() {
-                tracing::debug!("RocksDB catch up: {}", e);
+                println!("   ⚠️ RocksDB catch up: {}", e);
             }
 
             let last_indexed = self.postgres.get_checkpoint().await
                 .map_err(|e| format!("Checkpoint error: {}", e))?
                 .unwrap_or(0);
+            
+            println!("   📊 Checkpoint: {}, RPC tip: {}", last_indexed, rpc_tip);
 
             if rpc_tip > last_indexed {
                 let blocks_behind = rpc_tip - last_indexed;
@@ -194,7 +201,7 @@ impl Indexer {
                     let mut retries = 0;
                     loop {
                         if let Err(_) = self.zebra.try_catch_up() {}
-                        
+
                         match self.zebra.get_block_hash(height) {
                             Ok(_) => break,
                             Err(_) if retries < 30 => {
