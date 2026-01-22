@@ -1,0 +1,26 @@
+[Unit]
+Description=CipherScan Rust Indexer (Mainnet)
+After=network.target zebrad.service postgresql.service
+Wants=zebrad.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/cipherscan-rust
+Environment=RUST_LOG=info
+Environment=ZEBRA_STATE_PATH=/root/.cache/zebra/state/v27/mainnet
+Environment=DATABASE_URL=postgres://zcash_user:w95MGD6bhVGQFWGWpxf/9ptOZ0hBBQBwB3jIRiNIDss=@localhost/zcash_explorer_mainnet
+Environment=NETWORK=mainnet
+
+ExecStart=/root/cipherscan-rust/target/release/cipherscan-indexer live
+
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cipherscan-rust
+
+[Install]
+WantedBy=multi-user.target
