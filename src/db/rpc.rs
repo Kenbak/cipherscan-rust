@@ -149,12 +149,28 @@ impl ZebraRpc {
         self.get_block(&hash).await
     }
 
-    /// Get raw transaction
+    /// Get raw transaction hex
+    pub async fn get_raw_transaction_hex(&self, txid: &str) -> Result<String, String> {
+        self.call(
+            "getrawtransaction",
+            vec![serde_json::json!(txid), serde_json::json!(0)],
+        )
+        .await
+    }
+
+    /// Get raw transaction verbose (JSON)
     pub async fn get_raw_transaction(&self, txid: &str) -> Result<serde_json::Value, String> {
         self.call(
             "getrawtransaction",
             vec![serde_json::json!(txid), serde_json::json!(1)],
         )
         .await
+    }
+
+    /// Get raw block hex
+    pub async fn get_block_hex(&self, height: u64) -> Result<String, String> {
+        let hash = self.get_block_hash(height).await?;
+        self.call("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
+            .await
     }
 }

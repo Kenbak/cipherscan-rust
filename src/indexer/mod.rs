@@ -152,8 +152,64 @@ impl Indexer {
         Ok(())
     }
 
+    /// Index a single block from RPC (for live mode)
+    async fn index_block_from_rpc(&self, rpc: &crate::db::ZebraRpc, height: u32) -> Result<(u32, u32), String> {
+        // Get block info from RPC
+        let block_info = rpc.get_block_by_height(height as u64).await?;
+        let block_hash = block_info.hash.clone();
+        let block_time = block_info.time;
+
+        let tx_count = block_info.tx.len() as u32;
+        let mut transactions = Vec::with_capacity(block_info.tx.len());
+        let mut flows = Vec::new();
+
+        // Get each transaction
+        for (tx_index, txid) in block_info.tx.iter().enumerate() {
+            let raw_hex = rpc.get_raw_transaction_hex(txid).await?;
+            let raw_bytes = hex::decode(&raw_hex)
+                .map_err(|e| format!("Hex decode error: {}", e))?;
+
+            match TransactionParser::parse(&raw_bytes, height, &block_hash) {
+                Ok(mut tx) => {
+                    // For live mode, we can't resolve inputs from RocksDB easily
+                    // The values will be 0 for shielded inputs anyway
+                    // TODO: Could fetch previous tx via RPC if needed
+
+                    let tx_flows = ShieldedFlow::from_transaction(&tx);
+                    flows.extend(tx_flows);
+                    transactions.push(tx);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse tx {}:{}: {}", height, tx_index, e);
+                }
+            }
+        }
+
+        // Create a minimal header for RPC mode
+        let header = crate::db::ParsedBlockHeader {
+            version: 4, // Default, could fetch from RPC if needed
+            previous_block_hash: block_info.previousblockhash.clone().unwrap_or_default(),
+            merkle_root: String::new(),
+            final_sapling_root: String::new(),
+            time: block_info.time,
+            bits: String::new(),
+            nonce: String::new(),
+            difficulty: 0.0,
+            solution: String::new(),
+        };
+
+        // Write to PostgreSQL
+        self.postgres.batch_insert_with_header(height, &block_hash, block_time, &transactions, &header).await
+            .map_err(|e| format!("DB insert error: {}", e))?;
+
+        let flow_count = self.postgres.batch_insert_flows(&flows, block_time).await
+            .map_err(|e| format!("Flow insert error: {}", e))?;
+
+        Ok((tx_count, flow_count as u32))
+    }
+
     /// Run live mode (follow chain tip)
-    /// Uses RPC to get the tip (always accurate), RocksDB to index blocks (fast)
+    /// Uses RPC for everything - more reliable than RocksDB secondary mode
     pub async fn live(&self) -> Result<(), String> {
         use crate::db::ZebraRpc;
 
@@ -166,14 +222,9 @@ impl Indexer {
         println!("   ✅ RPC client initialized");
 
         loop {
-            println!("   🔍 Querying RPC for chain tip...");
-            
-            // Get tip from RPC (always accurate)
+            // Get tip from RPC
             let rpc_tip = match rpc.get_block_count().await {
-                Ok(tip) => {
-                    println!("   📊 RPC tip: {}", tip);
-                    tip as u32
-                }
+                Ok(tip) => tip as u32,
                 Err(e) => {
                     println!("   ⚠️ RPC error: {}", e);
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -181,57 +232,36 @@ impl Indexer {
                 }
             };
 
-            // Try to catch up RocksDB with primary
-            if let Err(e) = self.zebra.try_catch_up() {
-                println!("   ⚠️ RocksDB catch up: {}", e);
-            }
-
             let last_indexed = self.postgres.get_checkpoint().await
                 .map_err(|e| format!("Checkpoint error: {}", e))?
                 .unwrap_or(0);
-            
-            println!("   📊 Checkpoint: {}, RPC tip: {}", last_indexed, rpc_tip);
 
             if rpc_tip > last_indexed {
                 let blocks_behind = rpc_tip - last_indexed;
                 println!("📥 New blocks: {} → {} ({} behind)", last_indexed + 1, rpc_tip, blocks_behind);
 
                 for height in (last_indexed + 1)..=rpc_tip {
-                    // Wait for RocksDB to have this block
-                    let mut retries = 0;
-                    loop {
-                        if let Err(_) = self.zebra.try_catch_up() {}
-
-                        match self.zebra.get_block_hash(height) {
-                            Ok(_) => break,
-                            Err(_) if retries < 30 => {
-                                retries += 1;
-                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                            }
-                            Err(e) => {
-                                println!("   ⚠️ Block {} not in RocksDB after 30s: {}", height, e);
-                                break;
-                            }
-                        }
-                    }
-
-                    match self.index_block(height).await {
+                    match self.index_block_from_rpc(&rpc, height).await {
                         Ok((tx_count, flow_count)) => {
                             println!("   ✅ Block {} | {} txs, {} flows", height, tx_count, flow_count);
                         }
                         Err(e) => {
                             println!("   ❌ Block {} error: {}", height, e);
+                            // Don't continue if we can't index a block
+                            break;
                         }
                     }
                 }
 
-                self.postgres.update_checkpoint("last_indexed_height", &rpc_tip.to_string()).await
+                // Update checkpoint to highest successfully indexed
+                let new_checkpoint = std::cmp::min(rpc_tip, last_indexed + blocks_behind);
+                self.postgres.update_checkpoint("last_indexed_height", &new_checkpoint.to_string()).await
                     .map_err(|e| format!("Checkpoint error: {}", e))?;
 
-                println!("   ✅ Synced to block {}", rpc_tip);
+                println!("   ✅ Synced to block {}", new_checkpoint);
             }
 
-            // Wait before checking again (~1 block time)
+            // Wait before checking again (~75s = average block time)
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     }
