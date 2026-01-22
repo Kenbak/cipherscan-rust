@@ -379,7 +379,13 @@ impl PostgresWriter {
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
                 )
-                ON CONFLICT (txid) DO NOTHING
+                ON CONFLICT (txid) DO UPDATE SET
+                    block_height = EXCLUDED.block_height,
+                    block_hash = EXCLUDED.block_hash,
+                    fee = EXCLUDED.fee,
+                    total_input = EXCLUDED.total_input,
+                    total_output = EXCLUDED.total_output,
+                    is_coinbase = EXCLUDED.is_coinbase
                 "#
             )
             .bind(&tx.txid)
@@ -412,7 +418,10 @@ impl PostgresWriter {
                     r#"
                     INSERT INTO transaction_outputs (txid, vout_index, value, address, script_type)
                     VALUES ($1, $2, $3, $4, $5)
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT (txid, vout_index) DO UPDATE SET
+                        value = EXCLUDED.value,
+                        address = EXCLUDED.address,
+                        script_type = EXCLUDED.script_type
                     "#
                 )
                 .bind(&tx.txid)
@@ -434,7 +443,9 @@ impl PostgresWriter {
                     r#"
                     INSERT INTO transaction_inputs (txid, vout_index, prev_txid, prev_vout, address, value)
                     VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT (txid, vout_index) DO UPDATE SET
+                        address = EXCLUDED.address,
+                        value = EXCLUDED.value
                     "#
                 )
                 .bind(&tx.txid)
