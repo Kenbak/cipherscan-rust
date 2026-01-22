@@ -171,9 +171,39 @@ impl Indexer {
 
             match TransactionParser::parse(&raw_bytes, height, &block_hash) {
                 Ok(mut tx) => {
-                    // For live mode, we can't resolve inputs from RocksDB easily
-                    // The values will be 0 for shielded inputs anyway
-                    // TODO: Could fetch previous tx via RPC if needed
+                    // Resolve input values via RPC (for fee calculation)
+                    if !tx.is_coinbase() && !tx.vin.is_empty() {
+                        let mut total_input: i64 = 0;
+                        for input in &mut tx.vin {
+                            if input.is_coinbase {
+                                continue;
+                            }
+                            if let Ok(prev_tx_json) = rpc.get_raw_transaction(&input.txid).await {
+                                if let Some(vout_array) = prev_tx_json.get("vout").and_then(|v| v.as_array()) {
+                                    if let Some(prev_output) = vout_array.get(input.vout as usize) {
+                                        // Get value (in ZEC, convert to zatoshi)
+                                        if let Some(value_zec) = prev_output.get("value").and_then(|v| v.as_f64()) {
+                                            let value_zatoshi = (value_zec * 100_000_000.0) as i64;
+                                            input.value = Some(value_zatoshi);
+                                            total_input += value_zatoshi;
+                                        }
+                                        // Get address
+                                        if let Some(script_pubkey) = prev_output.get("scriptPubKey") {
+                                            if let Some(addresses) = script_pubkey.get("addresses").and_then(|a| a.as_array()) {
+                                                if let Some(addr) = addresses.first().and_then(|a| a.as_str()) {
+                                                    input.address = Some(addr.to_string());
+                                                }
+                                            } else if let Some(addr) = script_pubkey.get("address").and_then(|a| a.as_str()) {
+                                                input.address = Some(addr.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        tx.transparent_value_in = total_input;
+                        tx.fee = Some(total_input - tx.transparent_value_out);
+                    }
 
                     let tx_flows = ShieldedFlow::from_transaction(&tx);
                     flows.extend(tx_flows);
@@ -185,17 +215,17 @@ impl Indexer {
             }
         }
 
-        // Create a minimal header for RPC mode
+        // Create header from RPC block info
         let header = crate::db::ParsedBlockHeader {
-            version: 4, // Default, could fetch from RPC if needed
+            version: block_info.version,
             previous_block_hash: block_info.previousblockhash.clone().unwrap_or_default(),
-            merkle_root: String::new(),
-            final_sapling_root: String::new(),
+            merkle_root: block_info.merkleroot.clone(),
+            final_sapling_root: block_info.finalsaplingroot.clone().unwrap_or_default(),
             time: block_info.time,
-            bits: String::new(),
-            nonce: String::new(),
-            difficulty: 0.0,
-            solution: String::new(),
+            bits: block_info.bits.clone(),
+            nonce: block_info.nonce.clone(),
+            difficulty: block_info.difficulty,
+            solution: String::new(), // Not returned by RPC, but not critical
         };
 
         // Write to PostgreSQL

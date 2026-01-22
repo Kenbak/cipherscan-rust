@@ -48,6 +48,21 @@ pub struct BlockInfo {
     pub tx: Vec<String>,
     #[serde(default)]
     pub previousblockhash: Option<String>,
+    // Header fields
+    #[serde(default)]
+    pub version: i32,
+    #[serde(default)]
+    pub difficulty: f64,
+    #[serde(default)]
+    pub bits: String,
+    #[serde(default)]
+    pub nonce: String,
+    #[serde(default)]
+    pub merkleroot: String,
+    #[serde(default)]
+    pub finalsaplingroot: Option<String>,
+    #[serde(default)]
+    pub size: u64,
 }
 
 impl ZebraRpc {
