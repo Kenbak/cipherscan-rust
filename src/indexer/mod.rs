@@ -153,25 +153,61 @@ impl Indexer {
     }
 
     /// Run live mode (follow chain tip)
+    /// Uses RPC to get the tip (always accurate), RocksDB to index blocks (fast)
     pub async fn live(&self) -> Result<(), String> {
-        println!("🔴 Starting live indexer...");
+        use crate::db::ZebraRpc;
+
+        println!("🔴 Starting live indexer (RPC mode)...");
         println!("   Press Ctrl+C to stop");
         println!("────────────────────────────────────────────────────────────");
 
+        // Initialize RPC client
+        let rpc = ZebraRpc::from_env()?;
+        println!("   ✅ RPC client initialized");
+
         loop {
-            // Catch up with Zebra's latest writes
-            self.zebra.try_catch_up()?;
-            
-            let tip = self.zebra.get_tip_height()?;
+            // Get tip from RPC (always accurate)
+            let rpc_tip = match rpc.get_block_count().await {
+                Ok(tip) => tip as u32,
+                Err(e) => {
+                    println!("   ⚠️ RPC error: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
+
+            // Try to catch up RocksDB with primary
+            if let Err(e) = self.zebra.try_catch_up() {
+                tracing::debug!("RocksDB catch up: {}", e);
+            }
+
             let last_indexed = self.postgres.get_checkpoint().await
                 .map_err(|e| format!("Checkpoint error: {}", e))?
                 .unwrap_or(0);
 
-            if tip > last_indexed {
-                let blocks_behind = tip - last_indexed;
-                println!("📥 New blocks detected: {} → {} ({} behind)", last_indexed + 1, tip, blocks_behind);
+            if rpc_tip > last_indexed {
+                let blocks_behind = rpc_tip - last_indexed;
+                println!("📥 New blocks: {} → {} ({} behind)", last_indexed + 1, rpc_tip, blocks_behind);
 
-                for height in (last_indexed + 1)..=tip {
+                for height in (last_indexed + 1)..=rpc_tip {
+                    // Wait for RocksDB to have this block
+                    let mut retries = 0;
+                    loop {
+                        if let Err(_) = self.zebra.try_catch_up() {}
+                        
+                        match self.zebra.get_block_hash(height) {
+                            Ok(_) => break,
+                            Err(_) if retries < 30 => {
+                                retries += 1;
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            }
+                            Err(e) => {
+                                println!("   ⚠️ Block {} not in RocksDB after 30s: {}", height, e);
+                                break;
+                            }
+                        }
+                    }
+
                     match self.index_block(height).await {
                         Ok((tx_count, flow_count)) => {
                             println!("   ✅ Block {} | {} txs, {} flows", height, tx_count, flow_count);
@@ -182,14 +218,14 @@ impl Indexer {
                     }
                 }
 
-                self.postgres.update_checkpoint("last_indexed_height", &tip.to_string()).await
+                self.postgres.update_checkpoint("last_indexed_height", &rpc_tip.to_string()).await
                     .map_err(|e| format!("Checkpoint error: {}", e))?;
 
-                println!("   ✅ Synced to block {}", tip);
+                println!("   ✅ Synced to block {}", rpc_tip);
             }
 
-            // Wait before checking again (75 seconds = ~1 block time)
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            // Wait before checking again (~1 block time)
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     }
 }
