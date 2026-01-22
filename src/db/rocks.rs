@@ -2,6 +2,8 @@
 //!
 //! Reads directly from Zebra's RocksDB state database.
 //! This is ~100-1000x faster than JSON-RPC calls.
+//!
+//! Uses RocksDB secondary mode to follow Zebra's writes in real-time.
 
 use rocksdb::{DB, Options, IteratorMode};
 use std::io::Cursor;
@@ -35,10 +37,11 @@ pub const COLUMN_FAMILIES: &[&str] = &[
 pub struct ZebraState {
     db: DB,
     config: Config,
+    secondary_path: std::path::PathBuf,
 }
 
 impl ZebraState {
-    /// Open Zebra state in read-only mode
+    /// Open Zebra state in secondary mode (can follow primary writes)
     pub fn open(config: &Config) -> Result<Self, String> {
         let path = &config.zebra_state_path;
 
@@ -55,16 +58,28 @@ impl ZebraState {
         let cf_names = DB::list_cf(&Options::default(), path)
             .map_err(|e| format!("Failed to list column families: {}", e))?;
 
+        // Create secondary path for RocksDB secondary instance
+        let secondary_path = std::env::temp_dir().join("cipherscan-rocks-secondary");
+        std::fs::create_dir_all(&secondary_path)
+            .map_err(|e| format!("Failed to create secondary path: {}", e))?;
+
         let start = Instant::now();
-        let db = DB::open_cf_for_read_only(&opts, path, &cf_names, false)
-            .map_err(|e| format!("Failed to open RocksDB: {}", e))?;
+        let db = DB::open_cf_as_secondary(&opts, path, &secondary_path, &cf_names)
+            .map_err(|e| format!("Failed to open RocksDB as secondary: {}", e))?;
 
         tracing::info!("RocksDB opened in {:?}", start.elapsed());
 
         Ok(Self {
             db,
             config: config.clone(),
+            secondary_path,
         })
+    }
+
+    /// Catch up with primary (Zebra) to see latest blocks
+    pub fn try_catch_up(&self) -> Result<(), String> {
+        self.db.try_catch_up_with_primary()
+            .map_err(|e| format!("Failed to catch up with primary: {}", e))
     }
 
     /// Get current chain tip height

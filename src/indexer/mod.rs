@@ -159,6 +159,9 @@ impl Indexer {
         println!("────────────────────────────────────────────────────────────");
 
         loop {
+            // Catch up with Zebra's latest writes
+            self.zebra.try_catch_up()?;
+            
             let tip = self.zebra.get_tip_height()?;
             let last_indexed = self.postgres.get_checkpoint().await
                 .map_err(|e| format!("Checkpoint error: {}", e))?
