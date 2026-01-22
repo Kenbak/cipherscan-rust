@@ -85,10 +85,22 @@ impl Indexer {
     /// Run backfill from start_height to end_height (or tip)
     pub async fn backfill(&self, start_height: Option<u32>, end_height: Option<u32>) -> Result<(), String> {
         let tip = self.zebra.get_tip_height()?;
-        let start = start_height.unwrap_or_else(|| {
-            // Resume from checkpoint if available
-            0
-        });
+        
+        // If no start specified, resume from backfill checkpoint
+        let start = match start_height {
+            Some(h) => h,
+            None => {
+                let checkpoint = self.postgres.get_checkpoint_key("backfill_height").await
+                    .map_err(|e| format!("Checkpoint error: {}", e))?
+                    .unwrap_or(0);
+                if checkpoint > 0 {
+                    println!("📍 Resuming from checkpoint: {}", checkpoint);
+                    checkpoint + 1  // Start from next block
+                } else {
+                    0
+                }
+            }
+        };
         let end = end_height.unwrap_or(tip);
 
         println!("🚀 Starting backfill from {} to {}", start, end);
@@ -129,8 +141,8 @@ impl Indexer {
                     rate, total_txs, total_flows, eta_secs
                 );
 
-                // Update checkpoint
-                self.postgres.update_checkpoint("last_indexed_height", &current.to_string()).await
+                // Update backfill checkpoint (separate from live checkpoint)
+                self.postgres.update_checkpoint("backfill_height", &current.to_string()).await
                     .map_err(|e| format!("Checkpoint error: {}", e))?;
             }
 

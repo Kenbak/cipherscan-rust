@@ -257,6 +257,14 @@ impl PostgresWriter {
         }
     }
 
+    /// Get checkpoint by specific key
+    pub async fn get_checkpoint_key(&self, key: &str) -> Result<Option<u32>, sqlx::Error> {
+        match self.get_state(key).await? {
+            Some(v) => Ok(v.parse().ok()),
+            None => Ok(None),
+        }
+    }
+
     /// Batch insert for better performance (transactions in a DB transaction)
     pub async fn batch_insert(
         &self,
