@@ -469,8 +469,93 @@ impl PostgresWriter {
             count += 1;
         }
 
+        // Update addresses table (aggregate per-address for this block)
+        self.update_addresses_for_block(&mut db_tx, transactions, timestamp).await?;
+
         db_tx.commit().await?;
         Ok(count)
+    }
+
+    /// Update the addresses summary table for all addresses in a block's transactions
+    async fn update_addresses_for_block(
+        &self,
+        db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        transactions: &[Transaction],
+        block_time: u64,
+    ) -> Result<(), sqlx::Error> {
+        use std::collections::HashMap;
+
+        // Aggregate: address -> (total_received, total_sent, set of txids)
+        struct AddrStats {
+            total_received: i64,
+            total_sent: i64,
+            txids: std::collections::HashSet<String>,
+        }
+
+        let mut addr_map: HashMap<String, AddrStats> = HashMap::new();
+
+        for tx in transactions {
+            // Outputs = received
+            for output in &tx.vout {
+                if let Some(ref address) = output.address {
+                    let entry = addr_map.entry(address.clone()).or_insert_with(|| AddrStats {
+                        total_received: 0,
+                        total_sent: 0,
+                        txids: std::collections::HashSet::new(),
+                    });
+                    entry.total_received += output.value;
+                    entry.txids.insert(tx.txid.clone());
+                }
+            }
+
+            // Inputs = sent
+            for input in &tx.vin {
+                if input.is_coinbase {
+                    continue;
+                }
+                if let Some(ref address) = input.address {
+                    if let Some(value) = input.value {
+                        let entry = addr_map.entry(address.clone()).or_insert_with(|| AddrStats {
+                            total_received: 0,
+                            total_sent: 0,
+                            txids: std::collections::HashSet::new(),
+                        });
+                        entry.total_sent += value;
+                        entry.txids.insert(tx.txid.clone());
+                    }
+                }
+            }
+        }
+
+        // Upsert each address
+        for (address, stats) in &addr_map {
+            let tx_count = stats.txids.len() as i64;
+            let balance_delta = stats.total_received - stats.total_sent;
+
+            sqlx::query(
+                r#"
+                INSERT INTO addresses (address, balance, total_received, total_sent, tx_count, first_seen, last_seen, address_type)
+                VALUES ($1, $2, $3, $4, $5, $6, $6, 'transparent')
+                ON CONFLICT (address) DO UPDATE SET
+                    balance = addresses.balance + $2,
+                    total_received = addresses.total_received + $3,
+                    total_sent = addresses.total_sent + $4,
+                    tx_count = addresses.tx_count + $5,
+                    last_seen = $6,
+                    updated_at = NOW()
+                "#
+            )
+            .bind(address)             // $1
+            .bind(balance_delta)       // $2 balance delta
+            .bind(stats.total_received) // $3
+            .bind(stats.total_sent)     // $4
+            .bind(tx_count)             // $5
+            .bind(block_time as i64)    // $6
+            .execute(&mut **db_tx)
+            .await?;
+        }
+
+        Ok(())
     }
 
     /// Batch insert flows
