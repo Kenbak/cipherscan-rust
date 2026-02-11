@@ -368,7 +368,7 @@ impl PostgresWriter {
         .await?;
 
         // Insert transactions and their outputs
-        for tx in transactions {
+        for (tx_idx, tx) in transactions.iter().enumerate() {
             // Insert transaction
             let has_sapling = tx.sapling_spends > 0 || tx.sapling_outputs > 0;
             let has_orchard = tx.orchard_actions > 0;
@@ -382,10 +382,10 @@ impl PostgresWriter {
                     shielded_spends, shielded_outputs, orchard_actions,
                     value_balance_sapling, value_balance_orchard,
                     is_coinbase, has_sapling, has_orchard,
-                    vin_count, vout_count, block_time
+                    vin_count, vout_count, block_time, tx_index
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
                 )
                 ON CONFLICT (txid) DO UPDATE SET
                     block_height = EXCLUDED.block_height,
@@ -393,7 +393,8 @@ impl PostgresWriter {
                     fee = EXCLUDED.fee,
                     total_input = EXCLUDED.total_input,
                     total_output = EXCLUDED.total_output,
-                    is_coinbase = EXCLUDED.is_coinbase
+                    is_coinbase = EXCLUDED.is_coinbase,
+                    tx_index = EXCLUDED.tx_index
                 "#
             )
             .bind(&tx.txid)
@@ -417,6 +418,7 @@ impl PostgresWriter {
             .bind(tx.vin_count as i32)
             .bind(tx.vout_count as i32)
             .bind(timestamp as i64)
+            .bind(tx_idx as i32)            // $22 tx_index
             .execute(&mut *db_tx)
             .await?;
 
