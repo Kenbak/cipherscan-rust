@@ -95,6 +95,18 @@ impl ShieldedFlow {
             return flows;
         }
 
+        // No transparent inputs or outputs — check if this is a pool migration
+        // or just a fully shielded tx where the value balance is the fee.
+        // Pool migrations have opposing signs (one pool positive, the other negative).
+        if tx.vin_count == 0 && tx.vout_count == 0 {
+            let is_pool_migration =
+                (tx.sapling_value_balance > 0 && tx.orchard_value_balance < 0)
+                || (tx.orchard_value_balance > 0 && tx.sapling_value_balance < 0);
+            if !is_pool_migration {
+                return flows;
+            }
+        }
+
         // Collect transparent addresses for context
         let addresses: Vec<String> = tx.vin.iter()
             .filter_map(|v| v.address.clone())
@@ -134,10 +146,69 @@ impl ShieldedFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Transaction;
 
     #[test]
     fn test_flow_type_display() {
         assert_eq!(FlowType::Shield.as_str(), "shield");
         assert_eq!(FlowType::Deshield.as_str(), "deshield");
+    }
+
+    #[test]
+    fn test_fully_shielded_tx_produces_no_flow() {
+        let tx = Transaction {
+            txid: "fully_shielded".to_string(),
+            block_height: 3244398,
+            block_hash: "hash".to_string(),
+            version: 5,
+            lock_time: 0,
+            expiry_height: None,
+            size: 200,
+            vin_count: 0,
+            vout_count: 0,
+            transparent_value_in: 0,
+            transparent_value_out: 0,
+            joinsplit_count: 0,
+            sapling_spends: 0,
+            sapling_outputs: 0,
+            orchard_actions: 2,
+            sapling_value_balance: 0,
+            orchard_value_balance: 10000, // fee only
+            fee: Some(10000),
+            vin: vec![],
+            vout: vec![],
+        };
+
+        let flows = ShieldedFlow::from_transaction(&tx);
+        assert!(flows.is_empty(), "Fully shielded tx should produce no flows");
+    }
+
+    #[test]
+    fn test_pool_migration_still_produces_flow() {
+        let tx = Transaction {
+            txid: "pool_migration".to_string(),
+            block_height: 3000000,
+            block_hash: "hash".to_string(),
+            version: 5,
+            lock_time: 0,
+            expiry_height: None,
+            size: 500,
+            vin_count: 0,
+            vout_count: 0,
+            transparent_value_in: 0,
+            transparent_value_out: 0,
+            joinsplit_count: 0,
+            sapling_spends: 2,
+            sapling_outputs: 0,
+            orchard_actions: 2,
+            sapling_value_balance: 5000000,    // 0.05 ZEC leaving Sapling
+            orchard_value_balance: -4990000,   // ~0.05 ZEC entering Orchard (minus fee)
+            fee: Some(10000),
+            vin: vec![],
+            vout: vec![],
+        };
+
+        let flows = ShieldedFlow::from_transaction(&tx);
+        assert!(!flows.is_empty(), "Pool migration should still produce a flow");
     }
 }
