@@ -5,21 +5,30 @@
 use std::io::Cursor;
 use zebra_chain::serialization::ZcashDeserialize;
 use zebra_chain::transaction::Transaction as ZebraTransaction;
+use crate::config::Network;
 use crate::models::{Transaction, TransparentInput, TransparentOutput};
 
 /// Transaction parser using zebra-chain
 pub struct TransactionParser;
 
 impl TransactionParser {
+    /// Get address version prefixes for the given network
+    fn addr_prefixes(network: Network) -> ([u8; 2], [u8; 2]) {
+        match network {
+            Network::Mainnet => ([0x1C, 0xB8], [0x1C, 0xBD]), // t1, t3
+            Network::Testnet => ([0x1D, 0x25], [0x1C, 0xBA]), // tm, t2
+        }
+    }
+
     /// Parse a raw transaction from bytes using zebra-chain
-    pub fn parse(raw: &[u8], block_height: u32, block_hash: &str) -> Result<Transaction, String> {
+    pub fn parse(raw: &[u8], block_height: u32, block_hash: &str, network: Network) -> Result<Transaction, String> {
         // Use zebra-chain to deserialize
         let mut cursor = Cursor::new(raw);
         let zebra_tx = ZebraTransaction::zcash_deserialize(&mut cursor)
             .map_err(|e| format!("Failed to deserialize transaction: {:?}", e))?;
 
         // Convert to our Transaction type
-        Self::from_zebra_tx(zebra_tx, block_height, block_hash, raw.len())
+        Self::from_zebra_tx(zebra_tx, block_height, block_hash, raw.len(), network)
     }
 
     /// Convert zebra-chain Transaction to our Transaction model
@@ -28,6 +37,7 @@ impl TransactionParser {
         block_height: u32,
         block_hash: &str,
         size: usize,
+        network: Network,
     ) -> Result<Transaction, String> {
         use zebra_chain::transaction::Transaction::*;
 
@@ -89,7 +99,7 @@ impl TransactionParser {
             transparent_value_out += value_zat;
 
             // Try to get address from lock script
-            let (address, script_type) = Self::parse_output_script(&output.lock_script);
+            let (address, script_type) = Self::parse_output_script(&output.lock_script, network);
 
             vout.push(TransparentOutput {
                 n: n as u32,
@@ -183,12 +193,14 @@ impl TransactionParser {
     }
 
     /// Parse output script to get address and type
-    fn parse_output_script(script: &zebra_chain::transparent::Script) -> (Option<String>, String) {
+    fn parse_output_script(script: &zebra_chain::transparent::Script, network: Network) -> (Option<String>, String) {
         let bytes = script.as_raw_bytes();
 
         if bytes.is_empty() {
             return (None, "empty".to_string());
         }
+
+        let (p2pkh_prefix, p2sh_prefix) = Self::addr_prefixes(network);
 
         // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
         if bytes.len() == 25
@@ -199,7 +211,7 @@ impl TransactionParser {
             && bytes[24] == 0xac // OP_CHECKSIG
         {
             let hash = &bytes[3..23];
-            let address = Self::encode_address(&[0x1C, 0xB8], hash); // Mainnet t1
+            let address = Self::encode_address(&p2pkh_prefix, hash);
             return (Some(address), "pubkeyhash".to_string());
         }
 
@@ -210,7 +222,7 @@ impl TransactionParser {
             && bytes[22] == 0x87 // OP_EQUAL
         {
             let hash = &bytes[2..22];
-            let address = Self::encode_address(&[0x1C, 0xBD], hash); // Mainnet t3
+            let address = Self::encode_address(&p2sh_prefix, hash);
             return (Some(address), "scripthash".to_string());
         }
 
@@ -283,10 +295,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_address_encoding() {
-        // Test P2PKH address encoding
+    fn test_address_encoding_mainnet() {
         let hash = hex::decode("0000000000000000000000000000000000000000").unwrap();
-        let addr = TransactionParser::encode_address(&[0x1C, 0xB8], &hash);
-        assert!(addr.starts_with("t1"));
+        let (p2pkh, p2sh) = TransactionParser::addr_prefixes(Network::Mainnet);
+        assert!(TransactionParser::encode_address(&p2pkh, &hash).starts_with("t1"));
+        assert!(TransactionParser::encode_address(&p2sh, &hash).starts_with("t3"));
+    }
+
+    #[test]
+    fn test_address_encoding_testnet() {
+        let hash = hex::decode("0000000000000000000000000000000000000000").unwrap();
+        let (p2pkh, p2sh) = TransactionParser::addr_prefixes(Network::Testnet);
+        assert!(TransactionParser::encode_address(&p2pkh, &hash).starts_with("tm"));
+        assert!(TransactionParser::encode_address(&p2sh, &hash).starts_with("t2"));
     }
 }

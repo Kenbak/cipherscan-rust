@@ -511,7 +511,7 @@ impl ZebraState {
                 let script = &value[8..];
 
                 // Parse address from script
-                let address = Self::parse_address_from_script(script);
+                let address = self.parse_address_from_script(script);
 
                 Ok(Some((amount, address)))
             }
@@ -521,8 +521,13 @@ impl ZebraState {
     }
 
     /// Parse address from raw script bytes
-    fn parse_address_from_script(script: &[u8]) -> Option<String> {
-        use sha2::{Sha256, Digest};
+    fn parse_address_from_script(&self, script: &[u8]) -> Option<String> {
+        use crate::config::Network;
+
+        let (p2pkh_prefix, p2sh_prefix) = match self.config.network {
+            Network::Mainnet => ([0x1C, 0xB8], [0x1C, 0xBD]), // t1, t3
+            Network::Testnet => ([0x1D, 0x25], [0x1C, 0xBA]), // tm, t2
+        };
 
         // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
         if script.len() == 25
@@ -533,7 +538,7 @@ impl ZebraState {
             && script[24] == 0xac // OP_CHECKSIG
         {
             let hash = &script[3..23];
-            return Some(Self::encode_address_static(&[0x1C, 0xB8], hash)); // Mainnet t1
+            return Some(Self::encode_address_static(&p2pkh_prefix, hash));
         }
 
         // P2SH: OP_HASH160 <20 bytes> OP_EQUAL
@@ -543,7 +548,7 @@ impl ZebraState {
             && script[22] == 0x87 // OP_EQUAL
         {
             let hash = &script[2..22];
-            return Some(Self::encode_address_static(&[0x1C, 0xBD], hash)); // Mainnet t3
+            return Some(Self::encode_address_static(&p2sh_prefix, hash));
         }
 
         None
@@ -576,7 +581,7 @@ impl ZebraState {
             hex::encode(&h)
         };
 
-        let tx = TransactionParser::parse(&raw_tx, height, &block_hash)?;
+        let tx = TransactionParser::parse(&raw_tx, height, &block_hash, self.config.network)?;
 
         if let Some(output) = tx.vout.get(output_index as usize) {
             Ok((output.value, output.address.clone()))

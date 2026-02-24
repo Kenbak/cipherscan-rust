@@ -373,7 +373,7 @@ fn show_block(config: &Config, height: u32) -> Result<(), String> {
     println!("   ─────────────────────────────────────────────────────────");
 
     for (idx, raw) in &transactions {
-        match TransactionParser::parse(raw, height, &block_hash) {
+        match TransactionParser::parse(raw, height, &block_hash, config.network) {
             Ok(tx) => {
                 total_transparent_out += tx.transparent_value_out;
                 total_orchard_actions += tx.orchard_actions as u32;
@@ -439,7 +439,7 @@ fn show_transaction(config: &Config, height: u32, index: u16) -> Result<(), Stri
     println!();
 
     // Parse using zebra-chain
-    match TransactionParser::parse(&raw, height, &block_hash) {
+    match TransactionParser::parse(&raw, height, &block_hash, config.network) {
         Ok(tx) => {
             println!("   ✅ Parsed successfully!");
             println!();
@@ -897,7 +897,7 @@ async fn compare_with_postgres(
             hex::encode(&h)
         };
 
-        let rust_tx = match TransactionParser::parse(&raw, height, &block_hash) {
+        let rust_tx = match TransactionParser::parse(&raw, height, &block_hash, config.network) {
             Ok(tx) => tx,
             Err(e) => {
                 println!("⚠️  {}:{} - Parse error: {}", height, tx_index, e);
@@ -1113,7 +1113,7 @@ async fn compare_with_postgres(
             hex::encode(&h)
         };
 
-        let rust_tx = match TransactionParser::parse(&raw, height, &block_hash) {
+        let rust_tx = match TransactionParser::parse(&raw, height, &block_hash, config.network) {
             Ok(tx) => tx,
             Err(_) => continue,
         };
@@ -1227,7 +1227,7 @@ async fn validate_full(
         let mut all_flows = Vec::new();
 
         for (tx_index, raw) in &raw_txs {
-            match TransactionParser::parse(raw, height, &block_hash) {
+            match TransactionParser::parse(raw, height, &block_hash, config.network) {
                 Ok(mut tx) => {
                     // Resolve input addresses and values from previous outputs
                     TransactionParser::resolve_inputs(&mut tx, &zebra);

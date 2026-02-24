@@ -55,7 +55,7 @@ impl Indexer {
         let mut flows = Vec::new();
 
         for (tx_index, raw) in &raw_txs {
-            match TransactionParser::parse(raw, height, &block_hash) {
+            match TransactionParser::parse(raw, height, &block_hash, self.config.network) {
                 Ok(mut tx) => {
                     // Resolve input addresses and values from previous outputs
                     TransactionParser::resolve_inputs(&mut tx, &self.zebra);
@@ -181,7 +181,7 @@ impl Indexer {
             let raw_bytes = hex::decode(&raw_hex)
                 .map_err(|e| format!("Hex decode error: {}", e))?;
 
-            match TransactionParser::parse(&raw_bytes, height, &block_hash) {
+            match TransactionParser::parse(&raw_bytes, height, &block_hash, self.config.network) {
                 Ok(mut tx) => {
                     // Resolve input values via RPC (for fee calculation)
                     if !tx.is_coinbase() && !tx.vin.is_empty() {
@@ -214,7 +214,7 @@ impl Indexer {
                             }
                         }
                         tx.transparent_value_in = total_input;
-                        tx.fee = Some(total_input - tx.transparent_value_out);
+                        tx.fee = Some(total_input - tx.transparent_value_out + tx.sapling_value_balance + tx.orchard_value_balance);
                     }
 
                     let tx_flows = ShieldedFlow::from_transaction(&tx);
