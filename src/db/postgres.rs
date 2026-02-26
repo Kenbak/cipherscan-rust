@@ -468,6 +468,51 @@ impl PostgresWriter {
                 .await?;
             }
 
+            // Insert into address_transactions (denormalized lookup table)
+            {
+                use std::collections::HashMap;
+                let mut addr_map: HashMap<&str, (i64, i64)> = HashMap::new();
+
+                for output in &tx.vout {
+                    if let Some(ref addr) = output.address {
+                        let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
+                        entry.1 += output.value; // value_out
+                    }
+                }
+                for input in &tx.vin {
+                    if input.is_coinbase { continue; }
+                    if let Some(ref addr) = input.address {
+                        let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
+                        entry.0 += input.value; // value_in
+                    }
+                }
+
+                for (addr, (val_in, val_out)) in &addr_map {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO address_transactions (address, txid, block_height, tx_index, block_time, is_input, is_output, value_in, value_out)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        ON CONFLICT (address, block_height, tx_index, txid)
+                        DO UPDATE SET is_input = EXCLUDED.is_input OR address_transactions.is_input,
+                                      is_output = EXCLUDED.is_output OR address_transactions.is_output,
+                                      value_in = EXCLUDED.value_in,
+                                      value_out = EXCLUDED.value_out
+                        "#
+                    )
+                    .bind(addr)
+                    .bind(&tx.txid)
+                    .bind(block_height as i32)
+                    .bind(tx_idx as i32)
+                    .bind(timestamp as i64)
+                    .bind(*val_in > 0)
+                    .bind(*val_out > 0)
+                    .bind(*val_in)
+                    .bind(*val_out)
+                    .execute(&mut *db_tx)
+                    .await?;
+                }
+            }
+
             count += 1;
         }
 
