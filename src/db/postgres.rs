@@ -483,7 +483,7 @@ impl PostgresWriter {
                     if input.is_coinbase { continue; }
                     if let Some(ref addr) = input.address {
                         let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
-                        entry.0 += input.value; // value_in
+                        entry.0 += input.value.unwrap_or(0); // value_in
                     }
                 }
 
@@ -501,7 +501,7 @@ impl PostgresWriter {
                     )
                     .bind(addr)
                     .bind(&tx.txid)
-                    .bind(block_height as i32)
+                    .bind(tx.block_height as i32)
                     .bind(tx_idx as i32)
                     .bind(timestamp as i64)
                     .bind(*val_in > 0)
