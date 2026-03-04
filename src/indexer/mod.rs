@@ -193,13 +193,11 @@ impl Indexer {
                             if let Ok(prev_tx_json) = rpc.get_raw_transaction(&input.txid).await {
                                 if let Some(vout_array) = prev_tx_json.get("vout").and_then(|v| v.as_array()) {
                                     if let Some(prev_output) = vout_array.get(input.vout as usize) {
-                                        // Get value (in ZEC, convert to zatoshi)
                                         if let Some(value_zec) = prev_output.get("value").and_then(|v| v.as_f64()) {
                                             let value_zatoshi = (value_zec * 100_000_000.0) as i64;
                                             input.value = Some(value_zatoshi);
                                             total_input += value_zatoshi;
                                         }
-                                        // Get address
                                         if let Some(script_pubkey) = prev_output.get("scriptPubKey") {
                                             if let Some(addresses) = script_pubkey.get("addresses").and_then(|a| a.as_array()) {
                                                 if let Some(addr) = addresses.first().and_then(|a| a.as_str()) {
@@ -214,7 +212,13 @@ impl Indexer {
                             }
                         }
                         tx.transparent_value_in = total_input;
-                        tx.fee = Some(total_input - tx.transparent_value_out + tx.sapling_value_balance + tx.orchard_value_balance);
+                    }
+
+                    if !tx.is_coinbase() {
+                        let fee = tx.transparent_value_in - tx.transparent_value_out + tx.sapling_value_balance + tx.orchard_value_balance;
+                        if fee >= 0 {
+                            tx.fee = Some(fee);
+                        }
                     }
 
                     let tx_flows = ShieldedFlow::from_transaction(&tx);
