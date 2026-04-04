@@ -20,6 +20,10 @@ pub struct Config {
 
     /// Maximum RocksDB open files (to avoid ulimit issues)
     pub max_open_files: i32,
+
+    /// Zebra gRPC indexer URL (e.g. "http://127.0.0.1:8230")
+    /// When set, enables instant block notifications instead of 30s polling
+    pub zebra_grpc_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +40,7 @@ impl Default for Config {
             batch_size: 1000,
             network: Network::Mainnet,
             max_open_files: 256,
+            zebra_grpc_url: None,
         }
     }
 }
@@ -70,6 +75,17 @@ impl Config {
             };
         } else if config.zebra_state_path.to_string_lossy().contains("testnet") {
             config.network = Network::Testnet;
+        }
+
+        if let Ok(url) = env::var("ZEBRA_GRPC_URL") {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                config.zebra_grpc_url = Some(if url.starts_with("http") {
+                    url
+                } else {
+                    format!("http://{}", url)
+                });
+            }
         }
 
         config

@@ -255,25 +255,81 @@ impl Indexer {
     }
 
     /// Run live mode (follow chain tip)
-    /// Uses RPC for everything - more reliable than RocksDB secondary mode
+    /// Uses gRPC streaming for instant block notifications when available,
+    /// falls back to 30s JSON-RPC polling otherwise.
     pub async fn live(&self) -> Result<(), String> {
-        use crate::db::ZebraRpc;
+        use crate::db::{ZebraRpc, connect_chain_tip_stream};
+        use tokio::time::Duration;
+        use tonic::Streaming;
+        use crate::db::grpc::proto::BlockHashAndHeight;
 
-        println!("🔴 Starting live indexer (RPC mode)...");
+        println!("🔴 Starting live indexer...");
         println!("   Press Ctrl+C to stop");
         println!("────────────────────────────────────────────────────────────");
 
-        // Initialize RPC client
         let rpc = ZebraRpc::from_env()?;
-        println!("   ✅ RPC client initialized");
+        println!("   ✅ JSON-RPC client initialized");
+
+        let grpc_url = self.config.zebra_grpc_url.clone();
+        let mut grpc_stream: Option<Streaming<BlockHashAndHeight>> = None;
+
+        if let Some(ref url) = grpc_url {
+            println!("🔗 Connecting to Zebra gRPC at {}...", url);
+            match connect_chain_tip_stream(url).await {
+                Ok(stream) => {
+                    grpc_stream = Some(stream);
+                    println!("   ✅ gRPC connected — instant block notifications enabled");
+                }
+                Err(e) => {
+                    println!("   ⚠️ gRPC unavailable ({}), using 30s polling", e);
+                }
+            }
+        } else {
+            println!("   ℹ️ ZEBRA_GRPC_URL not set — using 30s polling");
+        }
 
         loop {
-            // Get tip from RPC
+            // Wait for trigger: gRPC tip notification OR 30s polling timeout
+            if let Some(ref mut stream) = grpc_stream {
+                tokio::select! {
+                    msg = stream.message() => {
+                        match msg {
+                            Ok(Some(tip)) => {
+                                let hash = hex::encode(&tip.hash);
+                                println!("📦 [gRPC] New block: {} ({}...)", tip.height, &hash[..16.min(hash.len())]);
+                            }
+                            Ok(None) => {
+                                println!("⚠️ [gRPC] Stream ended, falling back to polling");
+                                grpc_stream = None;
+                            }
+                            Err(e) => {
+                                println!("⚠️ [gRPC] Stream error: {}, falling back to polling", e);
+                                grpc_stream = None;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                        // Periodic poll even with gRPC, as a safety net
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+
+                // Periodically try to reconnect gRPC
+                if let Some(ref url) = grpc_url {
+                    if let Ok(stream) = connect_chain_tip_stream(url).await {
+                        println!("   ✅ [gRPC] Reconnected");
+                        grpc_stream = Some(stream);
+                    }
+                }
+            }
+
+            // Get authoritative tip from JSON-RPC
             let rpc_tip = match rpc.get_block_count().await {
                 Ok(tip) => tip as u32,
                 Err(e) => {
                     println!("   ⚠️ RPC error: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                     continue;
                 }
             };
@@ -286,29 +342,27 @@ impl Indexer {
                 let blocks_behind = rpc_tip - last_indexed;
                 println!("📥 New blocks: {} → {} ({} behind)", last_indexed + 1, rpc_tip, blocks_behind);
 
+                let mut last_success = last_indexed;
+
                 for height in (last_indexed + 1)..=rpc_tip {
                     match self.index_block_from_rpc(&rpc, height).await {
                         Ok((tx_count, flow_count)) => {
                             println!("   ✅ Block {} | {} txs, {} flows", height, tx_count, flow_count);
+                            last_success = height;
                         }
                         Err(e) => {
                             println!("   ❌ Block {} error: {}", height, e);
-                            // Don't continue if we can't index a block
                             break;
                         }
                     }
                 }
 
-                // Update checkpoint to highest successfully indexed
-                let new_checkpoint = std::cmp::min(rpc_tip, last_indexed + blocks_behind);
-                self.postgres.update_checkpoint("last_indexed_height", &new_checkpoint.to_string()).await
-                    .map_err(|e| format!("Checkpoint error: {}", e))?;
-
-                println!("   ✅ Synced to block {}", new_checkpoint);
+                if last_success > last_indexed {
+                    self.postgres.update_checkpoint("last_indexed_height", &last_success.to_string()).await
+                        .map_err(|e| format!("Checkpoint error: {}", e))?;
+                    println!("   ✅ Synced to block {}", last_success);
+                }
             }
-
-            // Wait before checking again (~75s = average block time)
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     }
 }
