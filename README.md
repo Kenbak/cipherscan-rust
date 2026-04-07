@@ -54,6 +54,7 @@ TELEGRAM_CHAT_ID=123456789
 # Optional: health thresholds and repeat cooldown
 INDEXER_MAX_LAG=3
 INDEXER_MAX_CONSECUTIVE_FAILURES=0
+INDEXER_MAX_HEARTBEAT_AGE_SECONDS=600
 INDEXER_ALERT_COOLDOWN_SECONDS=1800
 ```
 
@@ -242,14 +243,14 @@ The first production-ready monitoring path lives under `deploy/`:
 
 How it works:
 
-1. systemd runs the health check once per minute
-2. the script calls `cipherscan-indexer status --json` and `cipherscan-indexer health --json`
+1. systemd runs the health check every 5 minutes by default
+2. the script verifies `cipherscan-rust.service` is active, then calls `cipherscan-indexer health --json`
 3. healthy runs send no Telegram message
 4. unhealthy runs send one Telegram alert when the problem first appears
 5. repeated alerts are suppressed unless the failure fingerprint changes or the cooldown expires
 6. one recovery message is sent when the indexer becomes healthy again
 
-This does not spam every minute in normal operation. The steady-state cost is one local status/health check per minute and zero outbound Telegram calls while healthy.
+The monitoring path is optimized to avoid reopening RocksDB on each run. `health` now relies on PostgreSQL state plus Zebra RPC, enforces heartbeat freshness, and the steady-state cost is one lightweight health check every 5 minutes with zero outbound Telegram calls while healthy.
 
 ### Install The Timer
 
@@ -273,6 +274,7 @@ TELEGRAM_BOT_TOKEN=123456:abc123
 TELEGRAM_CHAT_ID=123456789
 INDEXER_MAX_LAG=3
 INDEXER_MAX_CONSECUTIVE_FAILURES=0
+INDEXER_MAX_HEARTBEAT_AGE_SECONDS=600
 INDEXER_ALERT_COOLDOWN_SECONDS=1800
 ```
 
@@ -280,7 +282,9 @@ Recommended behavior for the first version:
 
 - `INDEXER_MAX_LAG=3` means alert if the live checkpoint falls more than 3 blocks behind the local Zebra tip
 - `INDEXER_MAX_CONSECUTIVE_FAILURES=0` means alert on the first persistent failure state
+- `INDEXER_MAX_HEARTBEAT_AGE_SECONDS=600` means alert if the live process stops updating its tip or success heartbeat for 10 minutes
 - `INDEXER_ALERT_COOLDOWN_SECONDS=1800` means resend at most every 30 minutes unless the failure changes
+- the systemd timer defaults to every 5 minutes to keep monitoring overhead low while still alerting fast enough for operator response
 
 ### Test It
 

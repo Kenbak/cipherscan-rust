@@ -16,7 +16,7 @@ mod models;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::Config;
@@ -79,6 +79,10 @@ enum Commands {
         /// Maximum acceptable consecutive failures before unhealthy
         #[arg(long, default_value = "0")]
         max_consecutive_failures: u32,
+
+        /// Maximum acceptable age for live heartbeat state in seconds
+        #[arg(long, env = "INDEXER_MAX_HEARTBEAT_AGE_SECONDS", default_value = "600")]
+        max_heartbeat_age: u64,
 
         /// Emit machine-readable JSON
         #[arg(long)]
@@ -215,9 +219,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Health {
             max_lag,
             max_consecutive_failures,
+            max_heartbeat_age,
             json,
         } => {
-            check_health(&config, max_lag, max_consecutive_failures, json).await?;
+            check_health(
+                &config,
+                max_lag,
+                max_consecutive_failures,
+                max_heartbeat_age,
+                json,
+            )
+            .await?;
         }
         Commands::Block { height } => {
             show_block(&config, height)?;
@@ -406,6 +418,9 @@ struct IndexerStatus {
     last_indexed_height: Option<u32>,
     backfill_height: Option<u32>,
     lag_blocks: Option<u32>,
+    last_seen_rpc_tip: Option<u32>,
+    last_tip_check_at: Option<u64>,
+    last_success_at: Option<u64>,
     failure: FailureState,
 }
 
@@ -423,10 +438,19 @@ fn parse_optional_u64(value: Option<String>) -> Option<u64> {
     value.and_then(|v| v.parse::<u64>().ok())
 }
 
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn assess_health(
     status: &IndexerStatus,
     max_lag: u32,
     max_consecutive_failures: u32,
+    max_heartbeat_age: u64,
+    now: u64,
 ) -> HealthAssessment {
     let mut reasons = Vec::new();
 
@@ -447,6 +471,39 @@ fn assess_health(
         }
     }
 
+    if status.chain_tip_source != "rpc" {
+        reasons.push(format!(
+            "rpc tip unavailable; using {} fallback",
+            status.chain_tip_source
+        ));
+    }
+
+    match status.last_tip_check_at {
+        Some(timestamp) => {
+            let age = now.saturating_sub(timestamp);
+            if age > max_heartbeat_age {
+                reasons.push(format!(
+                    "tip heartbeat age {}s exceeds threshold {}s",
+                    age, max_heartbeat_age
+                ));
+            }
+        }
+        None => reasons.push("tip heartbeat missing".to_string()),
+    }
+
+    match status.last_success_at {
+        Some(timestamp) => {
+            let age = now.saturating_sub(timestamp);
+            if age > max_heartbeat_age {
+                reasons.push(format!(
+                    "success heartbeat age {}s exceeds threshold {}s",
+                    age, max_heartbeat_age
+                ));
+            }
+        }
+        None => reasons.push("success heartbeat missing".to_string()),
+    }
+
     if status.failure.consecutive_failures > max_consecutive_failures {
         reasons.push(format!(
             "consecutive failures {} exceeds threshold {}",
@@ -461,20 +518,11 @@ fn assess_health(
 }
 
 async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
-    let zebra = ZebraState::open(config)?;
-    let _ = zebra.try_catch_up();
-    let stats = zebra.get_stats();
-
-    let (chain_tip, chain_tip_source) = match crate::db::ZebraRpc::from_env() {
-        Ok(rpc) => match rpc.get_block_count().await {
-            Ok(tip) => (tip as u32, "rpc".to_string()),
-            Err(_) => (stats.tip_height, "rocksdb".to_string()),
-        },
-        Err(_) => (stats.tip_height, "rocksdb".to_string()),
-    };
-
     let mut last_indexed_height = None;
     let mut backfill_height = None;
+    let mut last_seen_rpc_tip = None;
+    let mut last_tip_check_at = None;
+    let mut last_success_at = None;
     let mut failure = FailureState {
         height: None,
         mode: None,
@@ -497,6 +545,24 @@ async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
         backfill_height = parse_optional_u32(
             postgres
                 .get_state("backfill_height")
+                .await
+                .map_err(|e| format!("Status read error: {}", e))?,
+        );
+        last_seen_rpc_tip = parse_optional_u32(
+            postgres
+                .get_state("last_seen_rpc_tip")
+                .await
+                .map_err(|e| format!("Status read error: {}", e))?,
+        );
+        last_tip_check_at = parse_optional_u64(
+            postgres
+                .get_state("last_tip_check_at")
+                .await
+                .map_err(|e| format!("Status read error: {}", e))?,
+        );
+        last_success_at = parse_optional_u64(
+            postgres
+                .get_state("last_success_at")
                 .await
                 .map_err(|e| format!("Status read error: {}", e))?,
         );
@@ -530,16 +596,39 @@ async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
         .unwrap_or(0);
     }
 
+    let (chain_tip, chain_tip_source) = match crate::db::ZebraRpc::from_env() {
+        Ok(rpc) => match rpc.get_block_count().await {
+            Ok(tip) => (tip as u32, "rpc".to_string()),
+            Err(_) => match last_seen_rpc_tip {
+                Some(tip) => (tip, "state".to_string()),
+                None => (
+                    last_indexed_height.or(backfill_height).unwrap_or(0),
+                    "checkpoint".to_string(),
+                ),
+            },
+        },
+        Err(_) => match last_seen_rpc_tip {
+            Some(tip) => (tip, "state".to_string()),
+            None => (
+                last_indexed_height.or(backfill_height).unwrap_or(0),
+                "checkpoint".to_string(),
+            ),
+        },
+    };
+
     let lag_blocks = last_indexed_height.map(|indexed| chain_tip.saturating_sub(indexed));
 
     Ok(IndexerStatus {
-        network: stats.network.to_string(),
+        network: config.network_name().to_string(),
         chain_tip,
         chain_tip_source,
         block_count: chain_tip as u64 + 1,
         last_indexed_height,
         backfill_height,
         lag_blocks,
+        last_seen_rpc_tip,
+        last_tip_check_at,
+        last_success_at,
         failure,
     })
 }
@@ -581,6 +670,27 @@ async fn show_status(config: &Config, json: bool) -> Result<(), String> {
         status
             .lag_blocks
             .map(|v| format!("{} blocks", v))
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "   Last RPC tip:      {}",
+        status
+            .last_seen_rpc_tip
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "   Last tip check:    {}",
+        status
+            .last_tip_check_at
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "   Last success:      {}",
+        status
+            .last_success_at
+            .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string())
     );
     println!();
@@ -635,10 +745,17 @@ async fn check_health(
     config: &Config,
     max_lag: u32,
     max_consecutive_failures: u32,
+    max_heartbeat_age: u64,
     json: bool,
 ) -> Result<(), String> {
     let status = collect_status(config).await?;
-    let assessment = assess_health(&status, max_lag, max_consecutive_failures);
+    let assessment = assess_health(
+        &status,
+        max_lag,
+        max_consecutive_failures,
+        max_heartbeat_age,
+        unix_timestamp_secs(),
+    );
 
     if json {
         println!(
@@ -684,6 +801,8 @@ async fn check_health(
 mod health_tests {
     use super::{assess_health, FailureState, IndexerStatus};
 
+    const NOW: u64 = 1_710_000_300;
+
     fn sample_status(lag_blocks: Option<u32>, consecutive_failures: u32) -> IndexerStatus {
         IndexerStatus {
             network: "mainnet".to_string(),
@@ -693,6 +812,9 @@ mod health_tests {
             last_indexed_height: Some(100u32.saturating_sub(lag_blocks.unwrap_or(0))),
             backfill_height: Some(100),
             lag_blocks,
+            last_seen_rpc_tip: Some(100),
+            last_tip_check_at: Some(NOW - 60),
+            last_success_at: Some(NOW - 30),
             failure: FailureState {
                 height: None,
                 mode: None,
@@ -705,14 +827,14 @@ mod health_tests {
 
     #[test]
     fn health_passes_when_lag_and_failures_are_within_threshold() {
-        let assessment = assess_health(&sample_status(Some(2), 0), 3, 0);
+        let assessment = assess_health(&sample_status(Some(2), 0), 3, 0, 600, NOW);
         assert!(assessment.healthy);
         assert!(assessment.reasons.is_empty());
     }
 
     #[test]
     fn health_fails_when_lag_exceeds_threshold() {
-        let assessment = assess_health(&sample_status(Some(5), 0), 3, 0);
+        let assessment = assess_health(&sample_status(Some(5), 0), 3, 0, 600, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
@@ -722,7 +844,7 @@ mod health_tests {
 
     #[test]
     fn health_fails_when_failure_count_exceeds_threshold() {
-        let assessment = assess_health(&sample_status(Some(1), 2), 3, 0);
+        let assessment = assess_health(&sample_status(Some(1), 2), 3, 0, 600, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
@@ -737,12 +859,51 @@ mod health_tests {
         status.last_indexed_height = Some(100);
         status.lag_blocks = Some(0);
 
-        let assessment = assess_health(&status, 3, 0);
+        let assessment = assess_health(&status, 3, 0, 600, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
             .iter()
             .any(|reason| reason.contains("exceeds chain tip")));
+    }
+
+    #[test]
+    fn health_fails_when_rpc_tip_is_unavailable() {
+        let mut status = sample_status(Some(0), 0);
+        status.chain_tip_source = "state".to_string();
+
+        let assessment = assess_health(&status, 3, 0, 600, NOW);
+        assert!(!assessment.healthy);
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("rpc tip unavailable")));
+    }
+
+    #[test]
+    fn health_fails_when_tip_heartbeat_is_stale() {
+        let mut status = sample_status(Some(0), 0);
+        status.last_tip_check_at = Some(NOW - 601);
+
+        let assessment = assess_health(&status, 3, 0, 600, NOW);
+        assert!(!assessment.healthy);
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("tip heartbeat age")));
+    }
+
+    #[test]
+    fn health_fails_when_success_heartbeat_is_stale() {
+        let mut status = sample_status(Some(0), 0);
+        status.last_success_at = Some(NOW - 601);
+
+        let assessment = assess_health(&status, 3, 0, 600, NOW);
+        assert!(!assessment.healthy);
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("success heartbeat age")));
     }
 }
 

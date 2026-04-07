@@ -6,7 +6,9 @@ STATE_DIR="${INDEXER_MONITOR_STATE_DIR:-/var/lib/cipherscan-rust-monitor}"
 STATE_FILE="${STATE_DIR}/health-alert-state.env"
 MAX_LAG="${INDEXER_MAX_LAG:-3}"
 MAX_CONSECUTIVE_FAILURES="${INDEXER_MAX_CONSECUTIVE_FAILURES:-0}"
+MAX_HEARTBEAT_AGE_SECONDS="${INDEXER_MAX_HEARTBEAT_AGE_SECONDS:-600}"
 ALERT_COOLDOWN_SECONDS="${INDEXER_ALERT_COOLDOWN_SECONDS:-1800}"
+INDEXER_SERVICE_NAME="${INDEXER_SERVICE_NAME:-cipherscan-rust.service}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 TELEGRAM_API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
@@ -59,13 +61,17 @@ EOF
 now="$(date +%s)"
 timestamp="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-status_output="$("${INDEXER_BIN}" status --json 2>&1)" || status_rc=$?
-status_rc="${status_rc:-0}"
+service_status="$(systemctl is-active "${INDEXER_SERVICE_NAME}" 2>&1 || true)"
 
-health_output="$("${INDEXER_BIN}" health --max-lag "${MAX_LAG}" --max-consecutive-failures "${MAX_CONSECUTIVE_FAILURES}" --json 2>&1)" || health_rc=$?
-health_rc="${health_rc:-0}"
+if [[ "${service_status}" == "active" ]]; then
+  health_output="$("${INDEXER_BIN}" health --max-lag "${MAX_LAG}" --max-consecutive-failures "${MAX_CONSECUTIVE_FAILURES}" --max-heartbeat-age "${MAX_HEARTBEAT_AGE_SECONDS}" --json 2>&1)" || health_rc=$?
+  health_rc="${health_rc:-0}"
+else
+  health_output="service ${INDEXER_SERVICE_NAME} is not active: ${service_status}"
+  health_rc=1
+fi
 
-combined_output="$(printf 'status rc=%s\n%s\n\nhealth rc=%s\n%s\n' "${status_rc}" "${status_output}" "${health_rc}" "${health_output}")"
+combined_output="$(printf 'service=%s\nhealth rc=%s\n%s\n' "${service_status}" "${health_rc}" "${health_output}")"
 fingerprint="$(printf '%s' "${combined_output}" | shasum -a 256 | awk '{print $1}')"
 summary="$(printf '%s' "${combined_output}" | tail -n 40 | cut -c1-3500)"
 
@@ -77,6 +83,7 @@ Host: ${HOST_LABEL}
 Time: ${timestamp}
 Lag threshold: ${MAX_LAG}
 Failure threshold: ${MAX_CONSECUTIVE_FAILURES}
+Heartbeat threshold seconds: ${MAX_HEARTBEAT_AGE_SECONDS}
 EOF
 )"
   fi
@@ -101,6 +108,7 @@ Host: ${HOST_LABEL}
 Time: ${timestamp}
 Lag threshold: ${MAX_LAG}
 Failure threshold: ${MAX_CONSECUTIVE_FAILURES}
+Heartbeat threshold seconds: ${MAX_HEARTBEAT_AGE_SECONDS}
 Cooldown seconds: ${ALERT_COOLDOWN_SECONDS}
 
 ${summary}

@@ -45,7 +45,6 @@ impl Indexer {
         "last_failed_at",
         "consecutive_failure_count",
     ];
-
     /// Create new indexer
     pub async fn new(config: Config) -> Result<Self, String> {
         let zebra = ZebraState::open(&config)?;
@@ -104,6 +103,32 @@ impl Indexer {
                 .await
                 .map_err(|e| format!("Failure state cleanup error: {}", e))?;
         }
+
+        Ok(())
+    }
+
+    async fn record_tip_heartbeat(&self, rpc_tip: u32) -> Result<(), String> {
+        let now = unix_timestamp_secs().to_string();
+
+        self.postgres
+            .update_checkpoint("last_seen_rpc_tip", &rpc_tip.to_string())
+            .await
+            .map_err(|e| format!("Heartbeat write error: {}", e))?;
+        self.postgres
+            .update_checkpoint("last_tip_check_at", &now)
+            .await
+            .map_err(|e| format!("Heartbeat write error: {}", e))?;
+
+        Ok(())
+    }
+
+    async fn record_success_heartbeat(&self) -> Result<(), String> {
+        let now = unix_timestamp_secs().to_string();
+
+        self.postgres
+            .update_checkpoint("last_success_at", &now)
+            .await
+            .map_err(|e| format!("Heartbeat write error: {}", e))?;
 
         Ok(())
     }
@@ -218,6 +243,7 @@ impl Indexer {
                     total_flows += flow_count as u64;
                     total_blocks += 1;
                     last_successful_height = Some(current);
+                    self.record_success_heartbeat().await?;
                     if failure_state_active {
                         self.clear_failure_state().await?;
                         failure_state_active = false;
@@ -484,6 +510,8 @@ impl Indexer {
                 }
             };
 
+            self.record_tip_heartbeat(rpc_tip).await?;
+
             let last_indexed = self
                 .postgres
                 .get_checkpoint()
@@ -510,6 +538,7 @@ impl Indexer {
                                 height, tx_count, flow_count
                             );
                             last_success = height;
+                            self.record_success_heartbeat().await?;
                             if failure_state_active {
                                 self.clear_failure_state().await?;
                                 failure_state_active = false;
