@@ -401,6 +401,7 @@ struct FailureState {
 struct IndexerStatus {
     network: String,
     chain_tip: u32,
+    chain_tip_source: String,
     block_count: u64,
     last_indexed_height: Option<u32>,
     backfill_height: Option<u32>,
@@ -437,6 +438,15 @@ fn assess_health(
         reasons.push("live checkpoint missing".to_string());
     }
 
+    if let Some(last_indexed) = status.last_indexed_height {
+        if last_indexed > status.chain_tip {
+            reasons.push(format!(
+                "last indexed height {} exceeds chain tip {}",
+                last_indexed, status.chain_tip
+            ));
+        }
+    }
+
     if status.failure.consecutive_failures > max_consecutive_failures {
         reasons.push(format!(
             "consecutive failures {} exceeds threshold {}",
@@ -452,7 +462,16 @@ fn assess_health(
 
 async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
     let zebra = ZebraState::open(config)?;
+    let _ = zebra.try_catch_up();
     let stats = zebra.get_stats();
+
+    let (chain_tip, chain_tip_source) = match crate::db::ZebraRpc::from_env() {
+        Ok(rpc) => match rpc.get_block_count().await {
+            Ok(tip) => (tip as u32, "rpc".to_string()),
+            Err(_) => (stats.tip_height, "rocksdb".to_string()),
+        },
+        Err(_) => (stats.tip_height, "rocksdb".to_string()),
+    };
 
     let mut last_indexed_height = None;
     let mut backfill_height = None;
@@ -511,12 +530,13 @@ async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
         .unwrap_or(0);
     }
 
-    let lag_blocks = last_indexed_height.map(|indexed| stats.tip_height.saturating_sub(indexed));
+    let lag_blocks = last_indexed_height.map(|indexed| chain_tip.saturating_sub(indexed));
 
     Ok(IndexerStatus {
         network: stats.network.to_string(),
-        chain_tip: stats.tip_height,
-        block_count: stats.block_count as u64,
+        chain_tip,
+        chain_tip_source,
+        block_count: chain_tip as u64 + 1,
         last_indexed_height,
         backfill_height,
         lag_blocks,
@@ -540,6 +560,7 @@ async fn show_status(config: &Config, json: bool) -> Result<(), String> {
     println!("────────────────────────────────────────────────────────────");
     println!("   Network:           {}", status.network);
     println!("   Chain tip:         {}", status.chain_tip);
+    println!("   Tip source:        {}", status.chain_tip_source);
     println!("   Block count:       {}", status.block_count);
     println!(
         "   Last indexed:      {}",
@@ -667,6 +688,7 @@ mod health_tests {
         IndexerStatus {
             network: "mainnet".to_string(),
             chain_tip: 100,
+            chain_tip_source: "rpc".to_string(),
             block_count: 101,
             last_indexed_height: Some(100u32.saturating_sub(lag_blocks.unwrap_or(0))),
             backfill_height: Some(100),
@@ -706,6 +728,21 @@ mod health_tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("consecutive failures")));
+    }
+
+    #[test]
+    fn health_fails_when_indexed_height_exceeds_tip() {
+        let mut status = sample_status(Some(0), 0);
+        status.chain_tip = 90;
+        status.last_indexed_height = Some(100);
+        status.lag_blocks = Some(0);
+
+        let assessment = assess_health(&status, 3, 0);
+        assert!(!assessment.healthy);
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("exceeds chain tip")));
     }
 }
 
