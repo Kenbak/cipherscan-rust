@@ -11,10 +11,11 @@
 
 mod config;
 mod db;
-mod models;
 mod indexer;
+mod models;
 
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use std::time::Instant;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -63,7 +64,26 @@ enum Commands {
     Live,
 
     /// Show indexer status
-    Status,
+    Status {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Return non-zero when indexer health is degraded
+    Health {
+        /// Maximum acceptable lag behind the local chain tip
+        #[arg(long, default_value = "3")]
+        max_lag: u32,
+
+        /// Maximum acceptable consecutive failures before unhealthy
+        #[arg(long, default_value = "0")]
+        max_consecutive_failures: u32,
+
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Decode and show specific block
     Block {
@@ -86,7 +106,11 @@ enum Commands {
         rpc_url: String,
 
         /// Cookie file path for auth
-        #[arg(long, env = "ZEBRA_RPC_COOKIE_FILE", default_value = "/root/.cache/zebra/.cookie")]
+        #[arg(
+            long,
+            env = "ZEBRA_RPC_COOKIE_FILE",
+            default_value = "/root/.cache/zebra/.cookie"
+        )]
         cookie_file: String,
     },
 
@@ -143,8 +167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive("cipherscan_indexer=info".parse()?))
+        .with(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("cipherscan_indexer=info".parse()?),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -159,12 +185,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     config.batch_size = cli.batch_size;
 
-    println!("════════════════════════════════════════════════════════════");
-    println!("🚀 CipherScan Rust Indexer v0.1.0");
-    println!("════════════════════════════════════════════════════════════");
-    println!("📂 Zebra state: {:?}", config.zebra_state_path);
-    println!("🌐 Network: {}", config.network_name());
-    println!();
+    let suppress_banner = matches!(
+        &cli.command,
+        Commands::Status { json: true } | Commands::Health { json: true, .. }
+    );
+
+    if !suppress_banner {
+        println!("════════════════════════════════════════════════════════════");
+        println!("🚀 CipherScan Rust Indexer v0.1.0");
+        println!("════════════════════════════════════════════════════════════");
+        println!("📂 Zebra state: {:?}", config.zebra_state_path);
+        println!("🌐 Network: {}", config.network_name());
+        println!();
+    }
 
     match cli.command {
         Commands::Analyze => {
@@ -176,23 +209,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Live => {
             run_live(&config).await?;
         }
-        Commands::Status => {
-            show_status(&config).await?;
+        Commands::Status { json } => {
+            show_status(&config, json).await?;
+        }
+        Commands::Health {
+            max_lag,
+            max_consecutive_failures,
+            json,
+        } => {
+            check_health(&config, max_lag, max_consecutive_failures, json).await?;
         }
         Commands::Block { height } => {
             show_block(&config, height)?;
         }
-        Commands::Verify { height, count, rpc_url, cookie_file } => {
+        Commands::Verify {
+            height,
+            count,
+            rpc_url,
+            cookie_file,
+        } => {
             verify_parsing(&config, height, count, &rpc_url, &cookie_file).await?;
         }
         Commands::Tx { height, index } => {
             show_transaction(&config, height, index)?;
         }
-        Commands::Compare { sample, from_height, database_url } => {
+        Commands::Compare {
+            sample,
+            from_height,
+            database_url,
+        } => {
             let db_url = database_url.unwrap_or_else(|| config.database_url.clone());
             compare_with_postgres(&config, &db_url, sample, from_height).await?;
         }
-        Commands::Validate { prod_db, test_db, from_height, to_height } => {
+        Commands::Validate {
+            prod_db,
+            test_db,
+            from_height,
+            to_height,
+        } => {
             let prod_url = prod_db.unwrap_or_else(|| config.database_url.clone());
             validate_full(&config, &prod_url, &test_db, from_height, to_height).await?;
         }
@@ -203,14 +257,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Analyze database structure (original PoC functionality)
 fn analyze_database(config: &Config) -> Result<(), String> {
-    use rocksdb::{DB, Options, IteratorMode};
+    use rocksdb::{IteratorMode, Options, DB};
 
     let path = &config.zebra_state_path;
 
     // List column families
     println!("🔍 Listing column families...");
-    let cf_names = DB::list_cf(&Options::default(), path)
-        .map_err(|e| format!("Failed to list CFs: {}", e))?;
+    let cf_names =
+        DB::list_cf(&Options::default(), path).map_err(|e| format!("Failed to list CFs: {}", e))?;
 
     println!("   Found {} column families:", cf_names.len());
     for cf in &cf_names {
@@ -256,8 +310,12 @@ fn analyze_database(config: &Config) -> Result<(), String> {
 
             let sample = sample_key.unwrap_or_else(|| "N/A".to_string());
             if count > 0 {
-                println!("   ✅ {:35} → {:>7} entries (sample: {}...)",
-                    cf_name, count, &sample[..std::cmp::min(12, sample.len())]);
+                println!(
+                    "   ✅ {:35} → {:>7} entries (sample: {}...)",
+                    cf_name,
+                    count,
+                    &sample[..std::cmp::min(12, sample.len())]
+                );
             } else {
                 println!("   ⬚ {:35} → empty", cf_name);
             }
@@ -271,7 +329,8 @@ fn analyze_database(config: &Config) -> Result<(), String> {
         for item in db.iterator_cf(cf, IteratorMode::End) {
             if let Ok((key, _)) = item {
                 if key.len() >= 3 {
-                    last_height = ((key[0] as u32) << 16) | ((key[1] as u32) << 8) | (key[2] as u32);
+                    last_height =
+                        ((key[0] as u32) << 16) | ((key[1] as u32) << 8) | (key[2] as u32);
                 }
                 break;
             }
@@ -292,7 +351,9 @@ async fn run_backfill(config: &Config, from: Option<u32>, to: Option<u32>) -> Re
 
     // Check if DATABASE_URL is configured
     if config.database_url.is_empty() {
-        return Err("DATABASE_URL not configured. Set it in .env or pass --database-url".to_string());
+        return Err(
+            "DATABASE_URL not configured. Set it in .env or pass --database-url".to_string(),
+        );
     }
 
     println!("🔗 Connecting to PostgreSQL...");
@@ -311,7 +372,9 @@ async fn run_live(config: &Config) -> Result<(), String> {
 
     // Check if DATABASE_URL is configured
     if config.database_url.is_empty() {
-        return Err("DATABASE_URL not configured. Set it in .env or pass --database-url".to_string());
+        return Err(
+            "DATABASE_URL not configured. Set it in .env or pass --database-url".to_string(),
+        );
     }
 
     println!("🔗 Connecting to PostgreSQL...");
@@ -325,22 +388,325 @@ async fn run_live(config: &Config) -> Result<(), String> {
 }
 
 /// Show indexer status
-async fn show_status(config: &Config) -> Result<(), String> {
+#[derive(Debug, Serialize)]
+struct FailureState {
+    height: Option<u32>,
+    mode: Option<String>,
+    error: Option<String>,
+    timestamp: Option<u64>,
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct IndexerStatus {
+    network: String,
+    chain_tip: u32,
+    block_count: u64,
+    last_indexed_height: Option<u32>,
+    backfill_height: Option<u32>,
+    lag_blocks: Option<u32>,
+    failure: FailureState,
+}
+
+#[derive(Debug)]
+struct HealthAssessment {
+    healthy: bool,
+    reasons: Vec<String>,
+}
+
+fn parse_optional_u32(value: Option<String>) -> Option<u32> {
+    value.and_then(|v| v.parse::<u32>().ok())
+}
+
+fn parse_optional_u64(value: Option<String>) -> Option<u64> {
+    value.and_then(|v| v.parse::<u64>().ok())
+}
+
+fn assess_health(
+    status: &IndexerStatus,
+    max_lag: u32,
+    max_consecutive_failures: u32,
+) -> HealthAssessment {
+    let mut reasons = Vec::new();
+
+    if let Some(lag) = status.lag_blocks {
+        if lag > max_lag {
+            reasons.push(format!("lag {} exceeds threshold {}", lag, max_lag));
+        }
+    } else {
+        reasons.push("live checkpoint missing".to_string());
+    }
+
+    if status.failure.consecutive_failures > max_consecutive_failures {
+        reasons.push(format!(
+            "consecutive failures {} exceeds threshold {}",
+            status.failure.consecutive_failures, max_consecutive_failures
+        ));
+    }
+
+    HealthAssessment {
+        healthy: reasons.is_empty(),
+        reasons,
+    }
+}
+
+async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
     let zebra = ZebraState::open(config)?;
     let stats = zebra.get_stats();
 
+    let mut last_indexed_height = None;
+    let mut backfill_height = None;
+    let mut failure = FailureState {
+        height: None,
+        mode: None,
+        error: None,
+        timestamp: None,
+        consecutive_failures: 0,
+    };
+
+    if !config.database_url.is_empty() {
+        let postgres = crate::db::PostgresWriter::connect(&config.database_url)
+            .await
+            .map_err(|e| format!("PostgreSQL status error: {}", e))?;
+
+        last_indexed_height = parse_optional_u32(
+            postgres
+                .get_state("last_indexed_height")
+                .await
+                .map_err(|e| format!("Status read error: {}", e))?,
+        );
+        backfill_height = parse_optional_u32(
+            postgres
+                .get_state("backfill_height")
+                .await
+                .map_err(|e| format!("Status read error: {}", e))?,
+        );
+
+        failure.height = parse_optional_u32(
+            postgres
+                .get_state("last_failed_height")
+                .await
+                .map_err(|e| format!("Status read error: {}", e))?,
+        );
+        failure.mode = postgres
+            .get_state("last_failed_mode")
+            .await
+            .map_err(|e| format!("Status read error: {}", e))?;
+        failure.error = postgres
+            .get_state("last_failed_error")
+            .await
+            .map_err(|e| format!("Status read error: {}", e))?;
+        failure.timestamp = parse_optional_u64(
+            postgres
+                .get_state("last_failed_at")
+                .await
+                .map_err(|e| format!("Status read error: {}", e))?,
+        );
+        failure.consecutive_failures = parse_optional_u32(
+            postgres
+                .get_state("consecutive_failure_count")
+                .await
+                .map_err(|e| format!("Status read error: {}", e))?,
+        )
+        .unwrap_or(0);
+    }
+
+    let lag_blocks = last_indexed_height.map(|indexed| stats.tip_height.saturating_sub(indexed));
+
+    Ok(IndexerStatus {
+        network: stats.network.to_string(),
+        chain_tip: stats.tip_height,
+        block_count: stats.block_count as u64,
+        last_indexed_height,
+        backfill_height,
+        lag_blocks,
+        failure,
+    })
+}
+
+async fn show_status(config: &Config, json: bool) -> Result<(), String> {
+    let status = collect_status(config).await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status)
+                .map_err(|e| format!("Status serialization error: {}", e))?
+        );
+        return Ok(());
+    }
+
     println!("📊 Indexer Status");
     println!("────────────────────────────────────────────────────────────");
-    println!("   Network:     {}", stats.network);
-    println!("   Chain tip:   {}", stats.tip_height);
-    println!("   Block count: {}", stats.block_count);
+    println!("   Network:           {}", status.network);
+    println!("   Chain tip:         {}", status.chain_tip);
+    println!("   Block count:       {}", status.block_count);
+    println!(
+        "   Last indexed:      {}",
+        status
+            .last_indexed_height
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "   Backfill checkpoint:{}",
+        status
+            .backfill_height
+            .map(|v| format!(" {}", v))
+            .unwrap_or_else(|| " unknown".to_string())
+    );
+    println!(
+        "   Live lag:          {}",
+        status
+            .lag_blocks
+            .map(|v| format!("{} blocks", v))
+            .unwrap_or_else(|| "unknown".to_string())
+    );
     println!();
 
-    // TODO: Show PostgreSQL status when connected
+    if status.failure.consecutive_failures > 0 {
+        println!("⚠️  Active failure");
+        println!(
+            "   Mode:              {}",
+            status
+                .failure
+                .mode
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        println!(
+            "   Height:            {}",
+            status
+                .failure
+                .height
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        println!(
+            "   Consecutive fails: {}",
+            status.failure.consecutive_failures
+        );
+        println!(
+            "   Last failure at:   {}",
+            status
+                .failure
+                .timestamp
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        println!(
+            "   Error:             {}",
+            status
+                .failure
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        println!();
+    }
 
     println!("════════════════════════════════════════════════════════════");
 
     Ok(())
+}
+
+async fn check_health(
+    config: &Config,
+    max_lag: u32,
+    max_consecutive_failures: u32,
+    json: bool,
+) -> Result<(), String> {
+    let status = collect_status(config).await?;
+    let assessment = assess_health(&status, max_lag, max_consecutive_failures);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "healthy": assessment.healthy,
+                "reasons": assessment.reasons,
+                "status": status,
+            }))
+            .map_err(|e| format!("Health serialization error: {}", e))?
+        );
+    } else if assessment.healthy {
+        println!(
+            "✅ Healthy | last indexed {} | tip {} | lag {}",
+            status
+                .last_indexed_height
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            status.chain_tip,
+            status
+                .lag_blocks
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    } else {
+        println!("❌ Unhealthy");
+        for reason in &assessment.reasons {
+            println!("   - {}", reason);
+        }
+    }
+
+    if assessment.healthy {
+        Ok(())
+    } else {
+        Err(format!(
+            "Indexer health check failed: {}",
+            assessment.reasons.join("; ")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::{assess_health, FailureState, IndexerStatus};
+
+    fn sample_status(lag_blocks: Option<u32>, consecutive_failures: u32) -> IndexerStatus {
+        IndexerStatus {
+            network: "mainnet".to_string(),
+            chain_tip: 100,
+            block_count: 101,
+            last_indexed_height: Some(100u32.saturating_sub(lag_blocks.unwrap_or(0))),
+            backfill_height: Some(100),
+            lag_blocks,
+            failure: FailureState {
+                height: None,
+                mode: None,
+                error: None,
+                timestamp: None,
+                consecutive_failures,
+            },
+        }
+    }
+
+    #[test]
+    fn health_passes_when_lag_and_failures_are_within_threshold() {
+        let assessment = assess_health(&sample_status(Some(2), 0), 3, 0);
+        assert!(assessment.healthy);
+        assert!(assessment.reasons.is_empty());
+    }
+
+    #[test]
+    fn health_fails_when_lag_exceeds_threshold() {
+        let assessment = assess_health(&sample_status(Some(5), 0), 3, 0);
+        assert!(!assessment.healthy);
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("lag")));
+    }
+
+    #[test]
+    fn health_fails_when_failure_count_exceeds_threshold() {
+        let assessment = assess_health(&sample_status(Some(1), 2), 3, 0);
+        assert!(!assessment.healthy);
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("consecutive failures")));
+    }
 }
 
 /// Show a specific block with all its transactions
@@ -381,17 +747,18 @@ fn show_block(config: &Config, height: u32) -> Result<(), String> {
                 total_sapling_outputs += tx.sapling_outputs as u32;
 
                 // Brief summary line
-                let shielded = if tx.orchard_actions > 0 || tx.sapling_spends > 0 || tx.sapling_outputs > 0 {
-                    format!("🔒O:{} S:{}/{}",
-                        tx.orchard_actions,
-                        tx.sapling_spends,
-                        tx.sapling_outputs
-                    )
-                } else {
-                    "".to_string()
-                };
+                let shielded =
+                    if tx.orchard_actions > 0 || tx.sapling_spends > 0 || tx.sapling_outputs > 0 {
+                        format!(
+                            "🔒O:{} S:{}/{}",
+                            tx.orchard_actions, tx.sapling_spends, tx.sapling_outputs
+                        )
+                    } else {
+                        "".to_string()
+                    };
 
-                println!("   [{:3}] {} v{} | {} vout | {:.4} ZEC {}",
+                println!(
+                    "   [{:3}] {} v{} | {} vout | {:.4} ZEC {}",
                     idx,
                     &tx.txid[..16],
                     tx.version,
@@ -408,7 +775,10 @@ fn show_block(config: &Config, height: u32) -> Result<(), String> {
 
     println!();
     println!("   📊 Block Totals:");
-    println!("      Transparent value: {:.8} ZEC", total_transparent_out as f64 / 100_000_000.0);
+    println!(
+        "      Transparent value: {:.8} ZEC",
+        total_transparent_out as f64 / 100_000_000.0
+    );
     println!("      Orchard actions:   {}", total_orchard_actions);
     println!("      Sapling spends:    {}", total_sapling_spends);
     println!("      Sapling outputs:   {}", total_sapling_outputs);
@@ -452,7 +822,10 @@ fn show_transaction(config: &Config, height: u32, index: u16) -> Result<(), Stri
             println!();
             println!("   📥 Transparent Inputs:  {}", tx.vin_count);
             println!("   📤 Transparent Outputs: {}", tx.vout_count);
-            println!("   💰 Value out: {} ZEC", tx.transparent_value_out as f64 / 100_000_000.0);
+            println!(
+                "   💰 Value out: {} ZEC",
+                tx.transparent_value_out as f64 / 100_000_000.0
+            );
             println!();
             println!("   🔒 Shielded:");
             println!("      Sprout JoinSplits: {}", tx.joinsplit_count);
@@ -461,8 +834,14 @@ fn show_transaction(config: &Config, height: u32, index: u16) -> Result<(), Stri
             println!("      Orchard Actions:   {}", tx.orchard_actions);
             println!();
             println!("   💱 Value Balances:");
-            println!("      Sapling: {} ZEC", tx.sapling_value_balance as f64 / 100_000_000.0);
-            println!("      Orchard: {} ZEC", tx.orchard_value_balance as f64 / 100_000_000.0);
+            println!(
+                "      Sapling: {} ZEC",
+                tx.sapling_value_balance as f64 / 100_000_000.0
+            );
+            println!(
+                "      Orchard: {} ZEC",
+                tx.orchard_value_balance as f64 / 100_000_000.0
+            );
 
             // Show transparent outputs
             if !tx.vout.is_empty() {
@@ -470,7 +849,8 @@ fn show_transaction(config: &Config, height: u32, index: u16) -> Result<(), Stri
                 println!("   📤 Outputs:");
                 for vout in &tx.vout {
                     let addr = vout.address.as_deref().unwrap_or("(unknown)");
-                    println!("      [{}] {} ZEC → {}",
+                    println!(
+                        "      [{}] {} ZEC → {}",
                         vout.n,
                         vout.value as f64 / 100_000_000.0,
                         addr
@@ -498,14 +878,24 @@ fn show_transaction(config: &Config, height: u32, index: u16) -> Result<(), Stri
 }
 
 /// Verify parsing by comparing RocksDB data with Zebra RPC
-async fn verify_parsing(config: &Config, start_height: u32, count: u32, rpc_url: &str, cookie_file: &str) -> Result<(), String> {
+async fn verify_parsing(
+    config: &Config,
+    start_height: u32,
+    count: u32,
+    rpc_url: &str,
+    cookie_file: &str,
+) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use serde_json::{json, Value};
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
     println!("🔍 Verifying RocksDB parsing against RPC...");
     println!("   RPC URL: {}", rpc_url);
     println!("   Cookie file: {}", cookie_file);
-    println!("   Heights: {} to {}", start_height, start_height + count - 1);
+    println!(
+        "   Heights: {} to {}",
+        start_height,
+        start_height + count - 1
+    );
     println!("────────────────────────────────────────────────────────────");
 
     // Read cookie for auth
@@ -516,7 +906,11 @@ async fn verify_parsing(config: &Config, start_height: u32, count: u32, rpc_url:
 
     // Use cookie content directly (already has __cookie__:password format)
     let auth = BASE64.encode(cookie_trimmed);
-    println!("   Auth: {}...{}", &cookie_trimmed[..15], &cookie_trimmed[cookie_trimmed.len()-5..]);
+    println!(
+        "   Auth: {}...{}",
+        &cookie_trimmed[..15],
+        &cookie_trimmed[cookie_trimmed.len() - 5..]
+    );
     println!();
 
     let zebra = ZebraState::open(config)?;
@@ -560,10 +954,7 @@ async fn verify_parsing(config: &Config, start_height: u32, count: u32, rpc_url:
             .await
             .map_err(|e| format!("RPC response parse failed: {}", e))?;
 
-        let rpc_hash = rpc_json["result"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let rpc_hash = rpc_json["result"].as_str().unwrap_or("").to_string();
 
         if rocks_hash == rpc_hash {
             println!("   ✅ Height {:>8}: {}", height, &rocks_hash[..16]);
@@ -644,7 +1035,8 @@ async fn verify_transaction(
         if !error.is_null() {
             println!("   ⚠️  RPC error, trying with verbosity 0...");
             // Fallback to simpler block info
-            return verify_transaction_simple(zebra, client, rpc_url, auth, height, &block_hash).await;
+            return verify_transaction_simple(zebra, client, rpc_url, auth, height, &block_hash)
+                .await;
         }
     }
 
@@ -664,11 +1056,13 @@ async fn verify_transaction(
     if let Some(txs) = block["tx"].as_array() {
         for (i, tx) in txs.iter().take(3).enumerate() {
             // Zebra returns txid as string directly, zcashd returns object with txid field
-            let rpc_txid = tx.as_str()
-                .or_else(|| tx["txid"].as_str())
-                .unwrap_or("?");
+            let rpc_txid = tx.as_str().or_else(|| tx["txid"].as_str()).unwrap_or("?");
 
-            let rpc_txid_short = if rpc_txid.len() > 16 { &rpc_txid[..16] } else { rpc_txid };
+            let rpc_txid_short = if rpc_txid.len() > 16 {
+                &rpc_txid[..16]
+            } else {
+                rpc_txid
+            };
             println!("   TX {}: {} (RPC)", i, rpc_txid_short);
 
             // Get txid from RocksDB and compare
@@ -677,7 +1071,11 @@ async fn verify_transaction(
                     let mut rev = hash;
                     rev.reverse();
                     let rocks_txid = hex::encode(&rev);
-                    let rocks_short = if rocks_txid.len() > 16 { &rocks_txid[..16] } else { &rocks_txid };
+                    let rocks_short = if rocks_txid.len() > 16 {
+                        &rocks_txid[..16]
+                    } else {
+                        &rocks_txid
+                    };
 
                     if rocks_txid == rpc_txid {
                         println!("      ✅ RocksDB matches: {}", rocks_short);
@@ -700,7 +1098,12 @@ async fn verify_transaction(
                         let header = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
                         let parsed_version = (header & 0x7FFFFFFF) as i32;
                         let overwintered = (header >> 31) == 1;
-                        println!("      📋 {} bytes, v{}, overwintered={}", raw.len(), parsed_version, overwintered);
+                        println!(
+                            "      📋 {} bytes, v{}, overwintered={}",
+                            raw.len(),
+                            parsed_version,
+                            overwintered
+                        );
                     } else {
                         println!("      📋 {} bytes", raw.len());
                     }
@@ -790,7 +1193,11 @@ async fn verify_transaction_simple(
                     if rocks_txid == txid {
                         println!("      ✅ Matches RocksDB");
                     } else {
-                        let rocks_short = if rocks_txid.len() > 16 { &rocks_txid[..16] } else { &rocks_txid };
+                        let rocks_short = if rocks_txid.len() > 16 {
+                            &rocks_txid[..16]
+                        } else {
+                            &rocks_txid
+                        };
                         println!("      ❌ RocksDB has: {}", rocks_short);
                     }
                 }
@@ -819,7 +1226,10 @@ async fn compare_with_postgres(
     use sqlx::Row;
 
     println!("🔍 Comparing Rust parsing with PostgreSQL data...");
-    println!("   Database: {}...", &database_url[..40.min(database_url.len())]);
+    println!(
+        "   Database: {}...",
+        &database_url[..40.min(database_url.len())]
+    );
     println!("   Sample size: {}", sample_count);
     println!("   From height: {}", from_height);
     println!("────────────────────────────────────────────────────────────");
@@ -911,7 +1321,11 @@ async fn compare_with_postgres(
 
         // Compare fields
         if rust_tx.txid != pg_txid {
-            diffs.push(format!("txid: rust={} pg={}", &rust_tx.txid[..16], &pg_txid[..16]));
+            diffs.push(format!(
+                "txid: rust={} pg={}",
+                &rust_tx.txid[..16],
+                &pg_txid[..16]
+            ));
             tx_matches = false;
         }
 
@@ -924,49 +1338,70 @@ async fn compare_with_postgres(
 
         if let Some(pg_vin) = pg_vin_count {
             if rust_tx.vin_count as i32 != pg_vin {
-                diffs.push(format!("vin_count: rust={} pg={}", rust_tx.vin_count, pg_vin));
+                diffs.push(format!(
+                    "vin_count: rust={} pg={}",
+                    rust_tx.vin_count, pg_vin
+                ));
                 tx_matches = false;
             }
         }
 
         if let Some(pg_vout) = pg_vout_count {
             if rust_tx.vout_count as i32 != pg_vout {
-                diffs.push(format!("vout_count: rust={} pg={}", rust_tx.vout_count, pg_vout));
+                diffs.push(format!(
+                    "vout_count: rust={} pg={}",
+                    rust_tx.vout_count, pg_vout
+                ));
                 tx_matches = false;
             }
         }
 
         if let Some(pg_ss) = pg_sapling_spends {
             if rust_tx.sapling_spends as i32 != pg_ss {
-                diffs.push(format!("sapling_spends: rust={} pg={}", rust_tx.sapling_spends, pg_ss));
+                diffs.push(format!(
+                    "sapling_spends: rust={} pg={}",
+                    rust_tx.sapling_spends, pg_ss
+                ));
                 tx_matches = false;
             }
         }
 
         if let Some(pg_so) = pg_sapling_outputs {
             if rust_tx.sapling_outputs as i32 != pg_so {
-                diffs.push(format!("sapling_outputs: rust={} pg={}", rust_tx.sapling_outputs, pg_so));
+                diffs.push(format!(
+                    "sapling_outputs: rust={} pg={}",
+                    rust_tx.sapling_outputs, pg_so
+                ));
                 tx_matches = false;
             }
         }
 
         if let Some(pg_oa) = pg_orchard_actions {
             if rust_tx.orchard_actions as i32 != pg_oa {
-                diffs.push(format!("orchard_actions: rust={} pg={}", rust_tx.orchard_actions, pg_oa));
+                diffs.push(format!(
+                    "orchard_actions: rust={} pg={}",
+                    rust_tx.orchard_actions, pg_oa
+                ));
                 tx_matches = false;
             }
         }
 
         if let Some(pg_vbs) = pg_value_balance_sapling {
             if rust_tx.sapling_value_balance != pg_vbs {
-                diffs.push(format!("sapling_balance: rust={} pg={}", rust_tx.sapling_value_balance, pg_vbs));
+                diffs.push(format!(
+                    "sapling_balance: rust={} pg={}",
+                    rust_tx.sapling_value_balance, pg_vbs
+                ));
                 tx_matches = false;
             }
         }
 
         if let Some(pg_vbo) = pg_value_balance_orchard {
             if rust_tx.orchard_value_balance != pg_vbo {
-                diffs.push(format!("orchard_balance: rust={} pg={}", rust_tx.orchard_value_balance, pg_vbo));
+                diffs.push(format!(
+                    "orchard_balance: rust={} pg={}",
+                    rust_tx.orchard_value_balance, pg_vbo
+                ));
                 tx_matches = false;
             }
         }
@@ -974,8 +1409,18 @@ async fn compare_with_postgres(
         if tx_matches {
             matches += 1;
         } else {
-            let txid_short = if pg_txid.len() > 16 { &pg_txid[..16] } else { &pg_txid };
-            let msg = format!("{}:{} {} - {}", height, tx_index, txid_short, diffs.join(", "));
+            let txid_short = if pg_txid.len() > 16 {
+                &pg_txid[..16]
+            } else {
+                &pg_txid
+            };
+            let msg = format!(
+                "{}:{} {} - {}",
+                height,
+                tx_index,
+                txid_short,
+                diffs.join(", ")
+            );
             mismatches.push(msg);
         }
     }
@@ -984,7 +1429,12 @@ async fn compare_with_postgres(
     println!();
     println!("────────────────────────────────────────────────────────────");
     println!("📊 Transaction Comparison:");
-    println!("   Total: {} | ✅ Matches: {} | ❌ Mismatches: {}", total, matches, mismatches.len());
+    println!(
+        "   Total: {} | ✅ Matches: {} | ❌ Mismatches: {}",
+        total,
+        matches,
+        mismatches.len()
+    );
 
     if !mismatches.is_empty() {
         println!("   First 10 mismatches:");
@@ -1058,7 +1508,12 @@ async fn compare_with_postgres(
         }
     }
 
-    println!("   Total: {} | ✅ Matches: {} | ❌ Mismatches: {}", block_total, block_matches, block_mismatches.len());
+    println!(
+        "   Total: {} | ✅ Matches: {} | ❌ Mismatches: {}",
+        block_total,
+        block_matches,
+        block_mismatches.len()
+    );
     for m in block_mismatches.iter().take(5) {
         println!("      {}", m);
     }
@@ -1081,7 +1536,7 @@ async fn compare_with_postgres(
 
     let vout_rows = sqlx::query(vout_query)
         .bind(from_height as i64)
-        .bind((sample_count * 3) as i64)  // More outputs than tx
+        .bind((sample_count * 3) as i64) // More outputs than tx
         .fetch_all(&pool)
         .await
         .map_err(|e| format!("Vout query failed: {}", e))?;
@@ -1135,19 +1590,34 @@ async fn compare_with_postgres(
                 let p = pg_addr.unwrap_or("(none)");
                 // Only report if both are Some but different
                 if rust_addr.is_some() && pg_addr.is_some() {
-                    diffs.push(format!("addr: rust={} pg={}", &r[..16.min(r.len())], &p[..16.min(p.len())]));
+                    diffs.push(format!(
+                        "addr: rust={} pg={}",
+                        &r[..16.min(r.len())],
+                        &p[..16.min(p.len())]
+                    ));
                 }
             }
 
             if diffs.is_empty() {
                 vout_matches += 1;
             } else {
-                vout_mismatches.push(format!("{}:{} vout[{}]: {}", height, tx_index, pg_vout_index, diffs.join(", ")));
+                vout_mismatches.push(format!(
+                    "{}:{} vout[{}]: {}",
+                    height,
+                    tx_index,
+                    pg_vout_index,
+                    diffs.join(", ")
+                ));
             }
         }
     }
 
-    println!("   Total: {} | ✅ Matches: {} | ❌ Mismatches: {}", vout_total, vout_matches, vout_mismatches.len());
+    println!(
+        "   Total: {} | ✅ Matches: {} | ❌ Mismatches: {}",
+        vout_total,
+        vout_matches,
+        vout_mismatches.len()
+    );
     for m in vout_mismatches.iter().take(5) {
         println!("      {}", m);
     }
@@ -1158,11 +1628,39 @@ async fn compare_with_postgres(
     println!();
     println!("════════════════════════════════════════════════════════════");
     println!("📊 FINAL COMPARISON SUMMARY:");
-    println!("   Transactions: {}/{} matched ({:.1}%)", matches, total, if total > 0 { matches as f64 / total as f64 * 100.0 } else { 0.0 });
-    println!("   Blocks:       {}/{} matched ({:.1}%)", block_matches, block_total, if block_total > 0 { block_matches as f64 / block_total as f64 * 100.0 } else { 0.0 });
-    println!("   Vouts:        {}/{} matched ({:.1}%)", vout_matches, vout_total, if vout_total > 0 { vout_matches as f64 / vout_total as f64 * 100.0 } else { 0.0 });
+    println!(
+        "   Transactions: {}/{} matched ({:.1}%)",
+        matches,
+        total,
+        if total > 0 {
+            matches as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "   Blocks:       {}/{} matched ({:.1}%)",
+        block_matches,
+        block_total,
+        if block_total > 0 {
+            block_matches as f64 / block_total as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "   Vouts:        {}/{} matched ({:.1}%)",
+        vout_matches,
+        vout_total,
+        if vout_total > 0 {
+            vout_matches as f64 / vout_total as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
 
-    let all_match = mismatches.is_empty() && block_mismatches.is_empty() && vout_mismatches.is_empty();
+    let all_match =
+        mismatches.is_empty() && block_mismatches.is_empty() && vout_mismatches.is_empty();
     if all_match {
         println!();
         println!("🎉 All data matches! Rust parser is validated.");
@@ -1181,8 +1679,8 @@ async fn validate_full(
     from_height: u32,
     to_height: u32,
 ) -> Result<(), String> {
-    use crate::indexer::TransactionParser;
     use crate::db::PostgresWriter;
+    use crate::indexer::TransactionParser;
     use crate::models::ShieldedFlow;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::Row;
@@ -1192,9 +1690,18 @@ async fn validate_full(
     println!("════════════════════════════════════════════════════════════");
     println!("🧪 FULL VALIDATION");
     println!("════════════════════════════════════════════════════════════");
-    println!("   Blocks: {} → {} ({} blocks)", from_height, to_height, block_count);
-    println!("   Prod DB: {}...", &prod_db_url[..40.min(prod_db_url.len())]);
-    println!("   Test DB: {}...", &test_db_url[..40.min(test_db_url.len())]);
+    println!(
+        "   Blocks: {} → {} ({} blocks)",
+        from_height, to_height, block_count
+    );
+    println!(
+        "   Prod DB: {}...",
+        &prod_db_url[..40.min(prod_db_url.len())]
+    );
+    println!(
+        "   Test DB: {}...",
+        &test_db_url[..40.min(test_db_url.len())]
+    );
     println!();
 
     // ========================================================================
@@ -1205,7 +1712,8 @@ async fn validate_full(
     println!("────────────────────────────────────────────────────────────");
 
     let zebra = ZebraState::open(config)?;
-    let test_writer = PostgresWriter::connect(test_db_url).await
+    let test_writer = PostgresWriter::connect(test_db_url)
+        .await
         .map_err(|e| format!("Failed to connect to test DB: {}", e))?;
 
     println!("✅ Connected to test database");
@@ -1245,23 +1753,31 @@ async fn validate_full(
         }
 
         // Get block header for timestamp and other fields
-        let header = zebra.get_block_header(height)
+        let header = zebra
+            .get_block_header(height)
             .map_err(|e| format!("Header error at {}: {}", height, e))?;
         let block_time = header.time;
 
-        // Write to test database with full header info
-        test_writer.batch_insert_with_header(height, &block_hash, block_time, &transactions, &header).await
+        // Write the block bundle atomically so verification matches the production indexer path.
+        test_writer
+            .batch_insert_with_header_and_flows(
+                height,
+                &block_hash,
+                block_time,
+                &transactions,
+                &all_flows,
+                &header,
+            )
+            .await
             .map_err(|e| format!("DB write error at {}: {}", height, e))?;
-
-        // Write flows
-        test_writer.batch_insert_flows(&all_flows, block_time).await
-            .map_err(|e| format!("Flow write error at {}: {}", height, e))?;
 
         if (height - from_height + 1) % 10 == 0 {
             let elapsed = rust_start.elapsed();
             let rate = (height - from_height + 1) as f64 / elapsed.as_secs_f64();
-            println!("   📦 {} / {} | {:.1} blk/s | {} txs",
-                height, to_height, rate, rust_tx_count);
+            println!(
+                "   📦 {} / {} | {:.1} blk/s | {} txs",
+                height, to_height, rate, rust_tx_count
+            );
         }
     }
 
@@ -1275,7 +1791,10 @@ async fn validate_full(
     println!("   Transactions: {}", rust_tx_count);
     println!("   Flows: {}", rust_flow_count);
     println!("   Time: {:.2}s", rust_elapsed.as_secs_f64());
-    println!("   Rate: {:.1} blocks/s, {:.1} tx/s", rust_rate, rust_tx_rate);
+    println!(
+        "   Rate: {:.1} blocks/s, {:.1} tx/s",
+        rust_rate, rust_tx_rate
+    );
 
     // ========================================================================
     // STEP 2: Compare test DB with production DB
@@ -1312,7 +1831,7 @@ async fn validate_full(
         FROM transactions
         WHERE block_height >= $1 AND block_height <= $2
         ORDER BY block_height, txid
-        "#
+        "#,
     )
     .bind(from_height as i64)
     .bind(to_height as i64)
@@ -1329,7 +1848,7 @@ async fn validate_full(
         FROM transactions
         WHERE block_height >= $1 AND block_height <= $2
         ORDER BY block_height, txid
-        "#
+        "#,
     )
     .bind(from_height as i64)
     .bind(to_height as i64)
@@ -1356,7 +1875,10 @@ async fn validate_full(
 
     // Fields where prod=0 and test=value is an IMPROVEMENT (Node.js doesn't calculate these)
     let improvement_fields: std::collections::HashSet<&str> =
-        ["fee", "total_input", "total_output", "is_coinbase"].iter().cloned().collect();
+        ["fee", "total_input", "total_output", "is_coinbase"]
+            .iter()
+            .cloned()
+            .collect();
 
     for prod_row in &prod_txs {
         let txid: String = prod_row.get("txid");
@@ -1376,7 +1898,8 @@ async fn validate_full(
                         (Some(p), Some(t)) if p != t => {
                             // Check if this is an "improvement" field where prod=0
                             let is_improvement = improvement_fields.contains($field);
-                            let prod_is_zero = format!("{:?}", p) == "0" || format!("{:?}", p) == "false";
+                            let prod_is_zero =
+                                format!("{:?}", p) == "0" || format!("{:?}", p) == "false";
 
                             if is_improvement && prod_is_zero {
                                 // This is an improvement, not a mismatch
@@ -1415,7 +1938,12 @@ async fn validate_full(
             if diffs.is_empty() {
                 tx_matches += 1;
                 if !improvements.is_empty() {
-                    tx_improvements.push(format!("{}:{} {}", height, &txid[..16], improvements.join(", ")));
+                    tx_improvements.push(format!(
+                        "{}:{} {}",
+                        height,
+                        &txid[..16],
+                        improvements.join(", ")
+                    ));
                 }
             } else {
                 tx_mismatches.push(format!("{}:{} {}", height, &txid[..16], diffs.join(", ")));
@@ -1423,7 +1951,11 @@ async fn validate_full(
         } else {
             tx_missing += 1;
             if tx_missing <= 5 {
-                println!("   ⚠️  Missing in test: {} at height {}", &txid[..16], height);
+                println!(
+                    "   ⚠️  Missing in test: {} at height {}",
+                    &txid[..16],
+                    height
+                );
             }
         }
     }
@@ -1431,7 +1963,10 @@ async fn validate_full(
     println!();
     println!("   ✅ Matches: {}", tx_matches);
     println!("   ❌ Real mismatches: {}", tx_mismatches.len());
-    println!("   ✨ Improvements (Rust adds data): {}", tx_improvements.len());
+    println!(
+        "   ✨ Improvements (Rust adds data): {}",
+        tx_improvements.len()
+    );
     println!("   ⚠️  Missing: {}", tx_missing);
 
     if !tx_mismatches.is_empty() {
@@ -1463,7 +1998,7 @@ async fn validate_full(
             WHERE block_height >= $1 AND block_height <= $2
         )
         ORDER BY txid, vout_index
-        "#
+        "#,
     )
     .bind(from_height as i64)
     .bind(to_height as i64)
@@ -1480,7 +2015,7 @@ async fn validate_full(
             WHERE block_height >= $1 AND block_height <= $2
         )
         ORDER BY txid, vout_index
-        "#
+        "#,
     )
     .bind(from_height as i64)
     .bind(to_height as i64)
@@ -1522,7 +2057,11 @@ async fn validate_full(
 
             match (&prod_addr, &test_addr) {
                 (Some(p), Some(t)) if p != t => {
-                    diffs.push(format!("addr: prod={} test={}", &p[..20.min(p.len())], &t[..20.min(t.len())]));
+                    diffs.push(format!(
+                        "addr: prod={} test={}",
+                        &p[..20.min(p.len())],
+                        &t[..20.min(t.len())]
+                    ));
                 }
                 (Some(p), None) => {
                     diffs.push(format!("addr: prod={} test=NULL", &p[..20.min(p.len())]));
@@ -1569,7 +2108,7 @@ async fn validate_full(
             WHERE block_height >= $1 AND block_height <= $2
         )
         ORDER BY txid, vout_index
-        "#
+        "#,
     )
     .bind(from_height as i64)
     .bind(to_height as i64)
@@ -1586,7 +2125,7 @@ async fn validate_full(
             WHERE block_height >= $1 AND block_height <= $2
         )
         ORDER BY txid, vout_index
-        "#
+        "#,
     )
     .bind(from_height as i64)
     .bind(to_height as i64)
@@ -1665,7 +2204,7 @@ async fn validate_full(
         FROM shielded_flows
         WHERE block_height >= $1 AND block_height <= $2
         ORDER BY txid, flow_type
-        "#
+        "#,
     )
     .bind(from_height as i32)
     .bind(to_height as i32)
@@ -1679,7 +2218,7 @@ async fn validate_full(
         FROM shielded_flows
         WHERE block_height >= $1 AND block_height <= $2
         ORDER BY txid, flow_type
-        "#
+        "#,
     )
     .bind(from_height as i32)
     .bind(to_height as i32)
@@ -1716,7 +2255,10 @@ async fn validate_full(
             let mut diffs: Vec<String> = Vec::new();
 
             if prod_pool_name != test_pool_name {
-                diffs.push(format!("pool: prod={} test={}", prod_pool_name, test_pool_name));
+                diffs.push(format!(
+                    "pool: prod={} test={}",
+                    prod_pool_name, test_pool_name
+                ));
             }
 
             if prod_amount != test_amount {
@@ -1726,13 +2268,21 @@ async fn validate_full(
             if diffs.is_empty() {
                 flow_matches += 1;
             } else {
-                flow_mismatches.push(format!("{} {}: {}", &txid[..12], flow_type, diffs.join(", ")));
+                flow_mismatches.push(format!(
+                    "{} {}: {}",
+                    &txid[..12],
+                    flow_type,
+                    diffs.join(", ")
+                ));
             }
         } else {
             flow_missing += 1;
             if flow_missing <= 3 {
                 let txid_short = if txid.len() > 16 { &txid[..16] } else { &txid };
-                println!("   ⚠️  Missing in test: {} {} (prod has it)", txid_short, flow_type);
+                println!(
+                    "   ⚠️  Missing in test: {} {} (prod has it)",
+                    txid_short, flow_type
+                );
             }
         }
     }
@@ -1753,7 +2303,10 @@ async fn validate_full(
             flow_extra += 1;
             if flow_extra <= 3 {
                 let txid_short = if txid.len() > 16 { &txid[..16] } else { &txid };
-                println!("   ℹ️  Extra in test: {} {} (prod doesn't have it)", txid_short, flow_type);
+                println!(
+                    "   ℹ️  Extra in test: {} {} (prod doesn't have it)",
+                    txid_short, flow_type
+                );
             }
         }
     }
@@ -1781,22 +2334,55 @@ async fn validate_full(
     println!("════════════════════════════════════════════════════════════");
     println!();
     println!("🚀 Performance:");
-    println!("   Rust: {:.2}s for {} blocks ({:.1} blk/s, {:.1} tx/s)",
-        rust_elapsed.as_secs_f64(), block_count, rust_rate, rust_tx_rate);
+    println!(
+        "   Rust: {:.2}s for {} blocks ({:.1} blk/s, {:.1} tx/s)",
+        rust_elapsed.as_secs_f64(),
+        block_count,
+        rust_rate,
+        rust_tx_rate
+    );
     println!();
     println!("🔍 Data Comparison:");
-    println!("   Transactions: {}/{} matched ({:.1}%)",
-        tx_matches, prod_txs.len(),
-        if !prod_txs.is_empty() { tx_matches as f64 / prod_txs.len() as f64 * 100.0 } else { 0.0 });
-    println!("   Outputs:      {}/{} matched ({:.1}%)",
-        out_matches, prod_outputs.len(),
-        if !prod_outputs.is_empty() { out_matches as f64 / prod_outputs.len() as f64 * 100.0 } else { 0.0 });
-    println!("   Inputs:       {}/{} matched ({:.1}%)",
-        in_matches, prod_inputs.len(),
-        if !prod_inputs.is_empty() { in_matches as f64 / prod_inputs.len() as f64 * 100.0 } else { 0.0 });
-    println!("   Flows:        {}/{} matched ({:.1}%)",
-        flow_matches, prod_flows.len(),
-        if !prod_flows.is_empty() { flow_matches as f64 / prod_flows.len() as f64 * 100.0 } else { 0.0 });
+    println!(
+        "   Transactions: {}/{} matched ({:.1}%)",
+        tx_matches,
+        prod_txs.len(),
+        if !prod_txs.is_empty() {
+            tx_matches as f64 / prod_txs.len() as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "   Outputs:      {}/{} matched ({:.1}%)",
+        out_matches,
+        prod_outputs.len(),
+        if !prod_outputs.is_empty() {
+            out_matches as f64 / prod_outputs.len() as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "   Inputs:       {}/{} matched ({:.1}%)",
+        in_matches,
+        prod_inputs.len(),
+        if !prod_inputs.is_empty() {
+            in_matches as f64 / prod_inputs.len() as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "   Flows:        {}/{} matched ({:.1}%)",
+        flow_matches,
+        prod_flows.len(),
+        if !prod_flows.is_empty() {
+            flow_matches as f64 / prod_flows.len() as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
 
     let all_ok = tx_mismatches.is_empty()
         && out_mismatches.is_empty()

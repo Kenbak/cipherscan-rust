@@ -1,0 +1,12 @@
+[Unit]
+Description=Run CipherScan Rust Indexer Health Check Every Minute
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=1m
+AccuracySec=15s
+Persistent=true
+Unit=cipherscan-rust-health.service
+
+[Install]
+WantedBy=timers.target

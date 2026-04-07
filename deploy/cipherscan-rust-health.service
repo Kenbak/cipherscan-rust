@@ -1,0 +1,21 @@
+[Unit]
+Description=CipherScan Rust Indexer Health Check
+After=network-online.target cipherscan-rust.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/cipherscan-rust
+
+# Reuse the same environment file as the indexer service.
+EnvironmentFile=/root/cipherscan-rust/.env
+
+# systemd creates /var/lib/cipherscan-rust-monitor automatically.
+StateDirectory=cipherscan-rust-monitor
+
+ExecStart=/root/cipherscan-rust/deploy/check-indexer-health.sh
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cipherscan-rust-health

@@ -43,6 +43,18 @@ DATABASE_URL=postgres://user:password@localhost/zcash_explorer
 
 # Optional: Network (mainnet or testnet)
 NETWORK=mainnet
+
+# Optional: Zebra gRPC for instant live notifications
+ZEBRA_GRPC_URL=http://127.0.0.1:8230
+
+# Optional: Telegram alerting for health checks
+TELEGRAM_BOT_TOKEN=123456:abc123
+TELEGRAM_CHAT_ID=123456789
+
+# Optional: health thresholds and repeat cooldown
+INDEXER_MAX_LAG=3
+INDEXER_MAX_CONSECUTIVE_FAILURES=0
+INDEXER_ALERT_COOLDOWN_SECONDS=1800
 ```
 
 ## Usage
@@ -58,6 +70,18 @@ NETWORK=mainnet
 
 # Show indexer status
 ./target/release/cipherscan-indexer status
+
+# Show machine-readable status for monitoring
+./target/release/cipherscan-indexer status --json
+
+# Return non-zero if lag or failures exceed thresholds
+./target/release/cipherscan-indexer health
+
+# Override thresholds explicitly
+./target/release/cipherscan-indexer health --max-lag 3 --max-consecutive-failures 0
+
+# Machine-readable health output
+./target/release/cipherscan-indexer health --json
 
 # Backfill from genesis (or checkpoint) to current tip
 ./target/release/cipherscan-indexer backfill
@@ -207,6 +231,63 @@ The Zebra state version may be different. Check `ZEBRA_STATE_PATH` points to the
 - Ensure NVMe SSD for both RocksDB and PostgreSQL
 - Increase PostgreSQL `shared_buffers` and `work_mem`
 - Use `--release` build (debug builds are 10x slower)
+
+## Health Monitoring
+
+The first production-ready monitoring path lives under `deploy/`:
+
+- `deploy/check-indexer-health.sh`
+- `deploy/cipherscan-rust-health.service`
+- `deploy/cipherscan-rust-health.timer`
+
+How it works:
+
+1. systemd runs the health check once per minute
+2. the script calls `cipherscan-indexer status --json` and `cipherscan-indexer health --json`
+3. healthy runs send no Telegram message
+4. unhealthy runs send one Telegram alert when the problem first appears
+5. repeated alerts are suppressed unless the failure fingerprint changes or the cooldown expires
+6. one recovery message is sent when the indexer becomes healthy again
+
+This does not spam every minute in normal operation. The steady-state cost is one local status/health check per minute and zero outbound Telegram calls while healthy.
+
+### Install The Timer
+
+```bash
+sudo cp deploy/cipherscan-rust-health.service /etc/systemd/system/
+sudo cp deploy/cipherscan-rust-health.timer /etc/systemd/system/
+sudo cp deploy/check-indexer-health.sh /root/cipherscan-rust/deploy/
+sudo chmod +x /root/cipherscan-rust/deploy/check-indexer-health.sh
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now cipherscan-rust-health.timer
+sudo systemctl status cipherscan-rust-health.timer
+```
+
+### Telegram Setup
+
+Add these to `/root/cipherscan-rust/.env`:
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:abc123
+TELEGRAM_CHAT_ID=123456789
+INDEXER_MAX_LAG=3
+INDEXER_MAX_CONSECUTIVE_FAILURES=0
+INDEXER_ALERT_COOLDOWN_SECONDS=1800
+```
+
+Recommended behavior for the first version:
+
+- `INDEXER_MAX_LAG=3` means alert if the live checkpoint falls more than 3 blocks behind the local Zebra tip
+- `INDEXER_MAX_CONSECUTIVE_FAILURES=0` means alert on the first persistent failure state
+- `INDEXER_ALERT_COOLDOWN_SECONDS=1800` means resend at most every 30 minutes unless the failure changes
+
+### Test It
+
+```bash
+sudo systemctl start cipherscan-rust-health.service
+sudo journalctl -u cipherscan-rust-health.service -n 50 --no-pager
+```
 
 ## Development
 
