@@ -834,4 +834,41 @@ impl PostgresWriter {
         db_tx.commit().await?;
         Ok(orphan_count)
     }
+
+    /// After re-indexing replacement blocks, backfill canonical_hash on orphaned_blocks
+    /// and remove false orphans (where the orphaned hash matches the new canonical hash,
+    /// which happens during double-reorgs: A->B->A).
+    pub async fn finalize_orphans_after_reindex(&self, fork_height: u32, last_height: u32) -> Result<(), sqlx::Error> {
+        // Backfill canonical_hash from the (now re-indexed) blocks table
+        sqlx::query(
+            r#"UPDATE orphaned_blocks ob
+               SET canonical_hash = b.hash
+               FROM blocks b
+               WHERE ob.height = b.height
+               AND ob.canonical_hash IS NULL
+               AND ob.height >= $1 AND ob.height <= $2"#
+        )
+        .bind(fork_height as i64)
+        .bind(last_height as i64)
+        .execute(&self.pool)
+        .await?;
+
+        // Remove false orphans: if orphaned hash == canonical hash, it was a double-reorg
+        let removed = sqlx::query(
+            r#"DELETE FROM orphaned_blocks
+               WHERE canonical_hash IS NOT NULL
+               AND hash = canonical_hash
+               AND height >= $1 AND height <= $2"#
+        )
+        .bind(fork_height as i64)
+        .bind(last_height as i64)
+        .execute(&self.pool)
+        .await?;
+
+        if removed.rows_affected() > 0 {
+            println!("   🧹 Cleaned {} false orphan(s) from double-reorg", removed.rows_affected());
+        }
+
+        Ok(())
+    }
 }

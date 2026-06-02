@@ -611,9 +611,11 @@ impl Indexer {
                 .unwrap_or(0);
 
             // Check for reorgs before indexing new blocks
+            let mut reorg_fork_height: Option<u32> = None;
             if last_indexed > 0 {
                 match self.detect_and_handle_reorg(&rpc, last_indexed).await {
                     Ok(Some(new_checkpoint)) => {
+                        reorg_fork_height = Some(new_checkpoint + 1);
                         println!("   🔄 Reorg handled, resuming from height {}", new_checkpoint + 1);
                         last_indexed = new_checkpoint;
                     }
@@ -666,6 +668,13 @@ impl Indexer {
                         .await
                         .map_err(|e| format!("Checkpoint error: {}", e))?;
                     println!("   ✅ Synced to block {}", last_success);
+
+                    // After re-indexing post-reorg, backfill canonical hashes and clean false orphans
+                    if let Some(fork_h) = reorg_fork_height {
+                        if let Err(e) = self.postgres.finalize_orphans_after_reindex(fork_h, last_success).await {
+                            println!("   ⚠️ Orphan finalization error: {}", e);
+                        }
+                    }
                 }
             }
         }
