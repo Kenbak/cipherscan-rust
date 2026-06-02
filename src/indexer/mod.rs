@@ -11,6 +11,8 @@ use crate::db::{PostgresWriter, ZebraState};
 use crate::models::ShieldedFlow;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+const MAX_REORG_DEPTH: u32 = 100;
+
 fn checkpoint_progress_height(
     current_height: u32,
     end_height: u32,
@@ -143,6 +145,95 @@ impl Indexer {
             .unwrap_or(0);
 
         Ok(failure_count > 0)
+    }
+
+    /// Detect chain reorganizations by comparing our stored block hash with the
+    /// canonical hash from Zebra RPC. Walks backward to find the fork point, then
+    /// rolls back all data from that height onward.
+    ///
+    /// Returns the fork height if a reorg was detected (caller should re-index from there),
+    /// or None if the chain is consistent.
+    async fn detect_and_handle_reorg(
+        &self,
+        rpc: &crate::db::ZebraRpc,
+        last_indexed: u32,
+    ) -> Result<Option<u32>, String> {
+        let db_hash = self
+            .postgres
+            .get_block_hash_at_height(last_indexed)
+            .await
+            .map_err(|e| format!("DB read error: {}", e))?;
+
+        let db_hash = match db_hash {
+            Some(h) => h,
+            None => return Ok(None), // no block at this height yet
+        };
+
+        let canonical_hash = rpc
+            .get_block_hash(last_indexed as u64)
+            .await
+            .map_err(|e| format!("RPC error checking hash at {}: {}", last_indexed, e))?;
+
+        if db_hash == canonical_hash {
+            return Ok(None); // chain is consistent
+        }
+
+        println!("🔄 REORG DETECTED at height {} — DB hash {} != canonical {}",
+            last_indexed, &db_hash[..16.min(db_hash.len())], &canonical_hash[..16.min(canonical_hash.len())]);
+
+        // Walk backward to find the fork point (common ancestor)
+        let mut fork_height = last_indexed;
+        for depth in 1..=MAX_REORG_DEPTH {
+            let check_height = last_indexed.saturating_sub(depth);
+            if check_height == 0 {
+                break;
+            }
+
+            let stored = self
+                .postgres
+                .get_block_hash_at_height(check_height)
+                .await
+                .map_err(|e| format!("DB read error at {}: {}", check_height, e))?;
+
+            let stored = match stored {
+                Some(h) => h,
+                None => break,
+            };
+
+            let canonical = rpc
+                .get_block_hash(check_height as u64)
+                .await
+                .map_err(|e| format!("RPC error at {}: {}", check_height, e))?;
+
+            if stored == canonical {
+                fork_height = check_height + 1;
+                println!("   📍 Fork point: height {} (common ancestor: {})", fork_height, check_height);
+                break;
+            }
+
+            if depth == MAX_REORG_DEPTH {
+                return Err(format!(
+                    "Reorg deeper than {} blocks — manual intervention required", MAX_REORG_DEPTH
+                ));
+            }
+        }
+
+        let reorg_depth = last_indexed - fork_height + 1;
+        let description = format!(
+            "Chain reorg detected: depth {}, rolling back heights {}-{}",
+            reorg_depth, fork_height, last_indexed
+        );
+        println!("   🗑️ Rolling back {} blocks from height {}", reorg_depth, fork_height);
+
+        let rolled_back = self
+            .postgres
+            .rollback_from_height(fork_height, &description)
+            .await
+            .map_err(|e| format!("Rollback error: {}", e))?;
+
+        println!("   ✅ Rolled back {} blocks, archived to orphaned_blocks", rolled_back);
+
+        Ok(Some(fork_height.saturating_sub(1)))
     }
 
     /// Index a single block and all its transactions
@@ -512,12 +603,28 @@ impl Indexer {
 
             self.record_tip_heartbeat(rpc_tip).await?;
 
-            let last_indexed = self
+            let mut last_indexed = self
                 .postgres
                 .get_checkpoint()
                 .await
                 .map_err(|e| format!("Checkpoint error: {}", e))?
                 .unwrap_or(0);
+
+            // Check for reorgs before indexing new blocks
+            if last_indexed > 0 {
+                match self.detect_and_handle_reorg(&rpc, last_indexed).await {
+                    Ok(Some(new_checkpoint)) => {
+                        println!("   🔄 Reorg handled, resuming from height {}", new_checkpoint + 1);
+                        last_indexed = new_checkpoint;
+                    }
+                    Ok(None) => {} // no reorg
+                    Err(e) => {
+                        println!("   ⚠️ Reorg detection error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        continue;
+                    }
+                }
+            }
 
             if rpc_tip > last_indexed {
                 let blocks_behind = rpc_tip - last_indexed;

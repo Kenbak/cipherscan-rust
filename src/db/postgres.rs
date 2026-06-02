@@ -700,4 +700,138 @@ impl PostgresWriter {
         db_tx.commit().await?;
         Ok(count)
     }
+
+    /// Get the stored block hash at a given height, if any.
+    pub async fn get_block_hash_at_height(&self, height: u32) -> Result<Option<String>, sqlx::Error> {
+        let result: Option<(String,)> =
+            sqlx::query_as("SELECT hash FROM blocks WHERE height = $1")
+                .bind(height as i64)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(result.map(|(h,)| h))
+    }
+
+    /// Roll back all data from `fork_height` onward, archiving orphaned blocks.
+    ///
+    /// Uses txid-indexed deletes for performance on large tables.
+    /// Reverses address balance deltas before deleting transaction data.
+    pub async fn rollback_from_height(&self, fork_height: u32, description: &str) -> Result<u32, sqlx::Error> {
+        let mut db_tx = self.pool.begin().await?;
+
+        // Count blocks being rolled back
+        let orphan_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM blocks WHERE height >= $1"
+        )
+        .bind(fork_height as i64)
+        .fetch_one(&mut *db_tx)
+        .await?;
+        let orphan_count = orphan_count.0 as u32;
+
+        if orphan_count == 0 {
+            db_tx.rollback().await?;
+            return Ok(0);
+        }
+
+        // Record fork event
+        let fork_event_id: (i32,) = sqlx::query_as(
+            r#"INSERT INTO fork_events (fork_height, depth, canonical_tip, orphaned_count, source, description, detected_at, resolved_at)
+               VALUES ($1, $2, $1, $3, 'indexer', $4, NOW(), NULL)
+               RETURNING id"#
+        )
+        .bind(fork_height as i64)
+        .bind(orphan_count as i32)
+        .bind(orphan_count as i32)
+        .bind(description)
+        .fetch_one(&mut *db_tx)
+        .await?;
+
+        // Archive orphaned blocks
+        sqlx::query(
+            r#"INSERT INTO orphaned_blocks (height, hash, timestamp, transaction_count, size, difficulty, miner_address, previous_block_hash, fork_event_id, source)
+               SELECT height, hash, timestamp, transaction_count, size, difficulty::text, miner_address, previous_block_hash, $1, 'indexer'
+               FROM blocks WHERE height >= $2
+               ON CONFLICT (hash) DO NOTHING"#
+        )
+        .bind(fork_event_id.0)
+        .bind(fork_height as i64)
+        .execute(&mut *db_tx)
+        .await?;
+
+        // Collect affected txids for indexed deletes
+        // Reverse address balance deltas before deleting
+        sqlx::query(
+            r#"UPDATE addresses SET
+                   balance = addresses.balance - sub.net_delta,
+                   total_received = GREATEST(0, addresses.total_received - sub.total_in),
+                   total_sent = GREATEST(0, addresses.total_sent - sub.total_out),
+                   tx_count = GREATEST(0, addresses.tx_count - sub.tx_count)
+               FROM (
+                   SELECT address,
+                          SUM(value_out) as total_in,
+                          SUM(value_in) as total_out,
+                          SUM(value_out - value_in) as net_delta,
+                          COUNT(DISTINCT txid) as tx_count
+                   FROM address_transactions
+                   WHERE block_height >= $1
+                   GROUP BY address
+               ) sub
+               WHERE addresses.address = sub.address"#
+        )
+        .bind(fork_height as i32)
+        .execute(&mut *db_tx)
+        .await?;
+
+        // Delete dependent rows using txid index (fast)
+        sqlx::query(
+            "DELETE FROM address_transactions WHERE txid IN (SELECT txid FROM transactions WHERE block_height >= $1)"
+        )
+        .bind(fork_height as i64)
+        .execute(&mut *db_tx)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM shielded_flows WHERE txid IN (SELECT txid FROM transactions WHERE block_height >= $1)"
+        )
+        .bind(fork_height as i64)
+        .execute(&mut *db_tx)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM transaction_inputs WHERE txid IN (SELECT txid FROM transactions WHERE block_height >= $1)"
+        )
+        .bind(fork_height as i64)
+        .execute(&mut *db_tx)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM transaction_outputs WHERE txid IN (SELECT txid FROM transactions WHERE block_height >= $1)"
+        )
+        .bind(fork_height as i64)
+        .execute(&mut *db_tx)
+        .await?;
+
+        // Delete transactions and blocks
+        sqlx::query("DELETE FROM transactions WHERE block_height >= $1")
+            .bind(fork_height as i64)
+            .execute(&mut *db_tx)
+            .await?;
+
+        sqlx::query("DELETE FROM blocks WHERE height >= $1")
+            .bind(fork_height as i64)
+            .execute(&mut *db_tx)
+            .await?;
+
+        // Reset checkpoint
+        let new_checkpoint = fork_height.saturating_sub(1);
+        sqlx::query(
+            r#"INSERT INTO indexer_state (key, value, updated_at) VALUES ('last_indexed_height', $1, NOW())
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()"#
+        )
+        .bind(new_checkpoint.to_string())
+        .execute(&mut *db_tx)
+        .await?;
+
+        db_tx.commit().await?;
+        Ok(orphan_count)
+    }
 }
