@@ -757,8 +757,7 @@ impl PostgresWriter {
         .execute(&mut *db_tx)
         .await?;
 
-        // Collect affected txids for indexed deletes
-        // Reverse address balance deltas before deleting
+        // Reverse address balance deltas using txid index (fast path)
         sqlx::query(
             r#"UPDATE addresses SET
                    balance = addresses.balance - sub.net_delta,
@@ -772,7 +771,7 @@ impl PostgresWriter {
                           SUM(value_out - value_in) as net_delta,
                           COUNT(DISTINCT txid) as tx_count
                    FROM address_transactions
-                   WHERE block_height >= $1
+                   WHERE txid IN (SELECT txid FROM transactions WHERE block_height >= $1)
                    GROUP BY address
                ) sub
                WHERE addresses.address = sub.address"#
