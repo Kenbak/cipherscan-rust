@@ -343,15 +343,26 @@ impl PostgresWriter {
             }
         });
 
+        // Coinbase hex = script_sig of the coinbase input (miner's embedded data)
+        let coinbase_hex: Option<String> = transactions.first().and_then(|coinbase| {
+            coinbase.vin.first().and_then(|input| {
+                if input.is_coinbase {
+                    input.script_sig.clone()
+                } else {
+                    None
+                }
+            })
+        });
+
         // Insert block with all header fields
         sqlx::query(
             r#"
             INSERT INTO blocks (
                 height, hash, timestamp, transaction_count, total_fees,
                 version, merkle_root, final_sapling_root, bits, nonce, solution,
-                difficulty, previous_block_hash, size, miner_address
+                difficulty, previous_block_hash, size, miner_address, coinbase_hex
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (height) DO UPDATE SET
                 hash = EXCLUDED.hash,
                 transaction_count = EXCLUDED.transaction_count,
@@ -365,7 +376,8 @@ impl PostgresWriter {
                 difficulty = EXCLUDED.difficulty,
                 previous_block_hash = EXCLUDED.previous_block_hash,
                 size = EXCLUDED.size,
-                miner_address = EXCLUDED.miner_address
+                miner_address = EXCLUDED.miner_address,
+                coinbase_hex = EXCLUDED.coinbase_hex
             "#,
         )
         .bind(height as i64)
@@ -383,6 +395,7 @@ impl PostgresWriter {
         .bind(&header.previous_block_hash)
         .bind(block_size)
         .bind(&miner_address)
+        .bind(&coinbase_hex)
         .execute(&mut *db_tx)
         .await?;
 

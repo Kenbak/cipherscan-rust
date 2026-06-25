@@ -66,7 +66,7 @@ impl TransactionParser {
         for (i, input) in inputs.iter().enumerate() {
             use zebra_chain::transparent::Input;
             match input {
-                Input::Coinbase { .. } => {
+                Input::Coinbase { data, .. } => {
                     is_coinbase = true;
                     vin.push(TransparentInput {
                         txid: "0".repeat(64),
@@ -74,7 +74,7 @@ impl TransactionParser {
                         address: None,
                         value: None,
                         is_coinbase: true,
-                        script_sig: None,
+                        script_sig: Some(hex::encode(data)),
                     });
                 }
                 Input::PrevOut { outpoint, unlock_script, .. } => {
