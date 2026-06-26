@@ -62,6 +62,8 @@ pub struct BlockInfo {
     #[serde(default)]
     pub finalsaplingroot: Option<String>,
     #[serde(default)]
+    pub finalorchardroot: Option<String>,
+    #[serde(default)]
     pub size: u64,
 }
 

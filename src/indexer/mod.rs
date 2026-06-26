@@ -496,6 +496,7 @@ impl Indexer {
             previous_block_hash: block_info.previousblockhash.clone().unwrap_or_default(),
             merkle_root: block_info.merkleroot.clone(),
             final_sapling_root: block_info.finalsaplingroot.clone().unwrap_or_default(),
+            final_orchard_root: block_info.finalorchardroot.clone(),
             time: block_info.time,
             bits: block_info.bits.clone(),
             nonce: block_info.nonce.clone(),

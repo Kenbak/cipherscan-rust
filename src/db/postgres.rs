@@ -301,6 +301,7 @@ impl PostgresWriter {
             previous_block_hash: String::new(),
             merkle_root: String::new(),
             final_sapling_root: String::new(),
+            final_orchard_root: None,
             time: timestamp,
             bits: String::new(),
             difficulty: 0.0,
@@ -359,10 +360,11 @@ impl PostgresWriter {
             r#"
             INSERT INTO blocks (
                 height, hash, timestamp, transaction_count, total_fees,
-                version, merkle_root, final_sapling_root, bits, nonce, solution,
+                version, merkle_root, final_sapling_root, final_orchard_root,
+                bits, nonce, solution,
                 difficulty, previous_block_hash, size, miner_address, coinbase_hex
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (height) DO UPDATE SET
                 hash = EXCLUDED.hash,
                 transaction_count = EXCLUDED.transaction_count,
@@ -370,6 +372,7 @@ impl PostgresWriter {
                 version = EXCLUDED.version,
                 merkle_root = EXCLUDED.merkle_root,
                 final_sapling_root = EXCLUDED.final_sapling_root,
+                final_orchard_root = EXCLUDED.final_orchard_root,
                 bits = EXCLUDED.bits,
                 nonce = EXCLUDED.nonce,
                 solution = EXCLUDED.solution,
@@ -388,6 +391,7 @@ impl PostgresWriter {
         .bind(header.version)
         .bind(&header.merkle_root)
         .bind(&header.final_sapling_root)
+        .bind(&header.final_orchard_root)
         .bind(&header.bits)
         .bind(&header.nonce)
         .bind(&header.solution)
@@ -758,10 +762,10 @@ impl PostgresWriter {
         .fetch_one(&mut *db_tx)
         .await?;
 
-        // Archive orphaned blocks
+        // Archive orphaned blocks (include roots for anchor debugging)
         sqlx::query(
-            r#"INSERT INTO orphaned_blocks (height, hash, timestamp, transaction_count, size, difficulty, miner_address, previous_block_hash, fork_event_id, source)
-               SELECT height, hash, timestamp, transaction_count, size, difficulty::text, miner_address, previous_block_hash, $1, 'indexer'
+            r#"INSERT INTO orphaned_blocks (height, hash, timestamp, transaction_count, size, difficulty, miner_address, previous_block_hash, final_sapling_root, final_orchard_root, fork_event_id, source)
+               SELECT height, hash, timestamp, transaction_count, size, difficulty::text, miner_address, previous_block_hash, final_sapling_root, final_orchard_root, $1, 'indexer'
                FROM blocks WHERE height >= $2
                ON CONFLICT (hash) DO NOTHING"#
         )
