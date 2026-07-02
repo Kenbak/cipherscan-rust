@@ -52,6 +52,8 @@ impl TransactionParser {
             V3 { expiry_height, .. } => (3, 0, Some(expiry_height.0)),
             V4 { expiry_height, .. } => (4, 0, Some(expiry_height.0)),
             V5 { expiry_height, .. } => (5, 0, Some(expiry_height.0)),
+            // NU6.3: v6 = v5 + Ironwood component (requires Ironwood zebra-chain fork)
+            V6 { expiry_height, .. } => (6, 0, Some(expiry_height.0)),
         };
 
         // Get transparent inputs/outputs
@@ -133,6 +135,26 @@ impl TransactionParser {
                     .unwrap_or(0);
                 (0, spends as u16, outputs as u16, actions as u16)
             }
+            // NU6.3 v6: same Sapling/Orchard shape as V5 (Ironwood counted separately below)
+            V6 { sapling_shielded_data, orchard_shielded_data, .. } => {
+                let (spends, outputs) = sapling_shielded_data.as_ref()
+                    .map(|d| (d.spends().count(), d.outputs().count()))
+                    .unwrap_or((0, 0));
+                let actions = orchard_shielded_data.as_ref()
+                    .map(|d| d.actions.len())
+                    .unwrap_or(0);
+                (0, spends as u16, outputs as u16, actions as u16)
+            }
+        };
+
+        // NU6.3 Ironwood actions (v6 only). Ironwood is an Orchard-shaped bundle.
+        let ironwood_actions: u16 = match &tx {
+            V6 { ironwood_shielded_data, .. } => {
+                ironwood_shielded_data.as_ref()
+                    .map(|d| d.actions.len())
+                    .unwrap_or(0) as u16
+            }
+            _ => 0,
         };
 
         // Get value balances
@@ -147,12 +169,33 @@ impl TransactionParser {
                     .map(|d| i64::from(d.value_balance))
                     .unwrap_or(0)
             }
+            V6 { sapling_shielded_data, .. } => {
+                sapling_shielded_data.as_ref()
+                    .map(|d| i64::from(d.value_balance))
+                    .unwrap_or(0)
+            }
             _ => 0,
         };
 
         let orchard_value_balance: i64 = match &tx {
             V5 { orchard_shielded_data, .. } => {
                 orchard_shielded_data.as_ref()
+                    .map(|d| i64::from(d.value_balance))
+                    .unwrap_or(0)
+            }
+            V6 { orchard_shielded_data, .. } => {
+                orchard_shielded_data.as_ref()
+                    .map(|d| i64::from(d.value_balance))
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        };
+
+        // NU6.3 Ironwood value balance (v6 only). Negative = into Ironwood,
+        // positive = out of Ironwood — same sign convention as Orchard.
+        let ironwood_value_balance: i64 = match &tx {
+            V6 { ironwood_shielded_data, .. } => {
+                ironwood_shielded_data.as_ref()
                     .map(|d| i64::from(d.value_balance))
                     .unwrap_or(0)
             }
@@ -184,8 +227,10 @@ impl TransactionParser {
             sapling_spends,
             sapling_outputs,
             orchard_actions,
+            ironwood_actions,
             sapling_value_balance,
             orchard_value_balance,
+            ironwood_value_balance,
             fee,
             vin,
             vout,

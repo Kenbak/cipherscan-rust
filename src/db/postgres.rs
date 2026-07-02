@@ -79,6 +79,7 @@ impl PostgresWriter {
         let has_sapling = tx.sapling_spends > 0 || tx.sapling_outputs > 0;
         let has_orchard = tx.orchard_actions > 0;
         let has_sprout = tx.joinsplit_count > 0;
+        let has_ironwood = tx.ironwood_actions > 0;
         let is_coinbase = tx.vin.first().map(|v| v.is_coinbase).unwrap_or(false);
 
         sqlx::query(
@@ -90,18 +91,23 @@ impl PostgresWriter {
                 value_balance, value_balance_sapling, value_balance_orchard,
                 is_coinbase, has_sapling, has_orchard, has_sprout,
                 vin_count, vout_count, tx_index, block_time,
-                expiry_height, sapling_spend_count, sapling_output_count, sprout_joinsplit_count
+                expiry_height, sapling_spend_count, sapling_output_count, sprout_joinsplit_count,
+                ironwood_actions, value_balance_ironwood, has_ironwood
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, $28
+                $21, $22, $23, $24, $25, $26, $27, $28,
+                $29, $30, $31
             )
             ON CONFLICT (txid) DO UPDATE SET
                 block_height = EXCLUDED.block_height,
                 expiry_height = EXCLUDED.expiry_height,
                 sapling_spend_count = EXCLUDED.sapling_spend_count,
                 sapling_output_count = EXCLUDED.sapling_output_count,
-                sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count
+                sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count,
+                ironwood_actions = EXCLUDED.ironwood_actions,
+                value_balance_ironwood = EXCLUDED.value_balance_ironwood,
+                has_ironwood = EXCLUDED.has_ironwood
             "#,
         )
         .bind(&tx.txid) // $1
@@ -117,7 +123,7 @@ impl PostgresWriter {
         .bind(tx.sapling_spends as i32) // $11
         .bind(tx.sapling_outputs as i32) // $12
         .bind(tx.orchard_actions as i32) // $13
-        .bind(tx.sapling_value_balance + tx.orchard_value_balance) // $14 value_balance
+        .bind(tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance) // $14 value_balance
         .bind(tx.sapling_value_balance) // $15
         .bind(tx.orchard_value_balance) // $16
         .bind(is_coinbase) // $17
@@ -132,6 +138,9 @@ impl PostgresWriter {
         .bind(tx.sapling_spends as i32) // $26
         .bind(tx.sapling_outputs as i32) // $27
         .bind(tx.joinsplit_count as i32) // $28
+        .bind(tx.ironwood_actions as i32) // $29
+        .bind(tx.ironwood_value_balance) // $30
+        .bind(has_ironwood) // $31
         .execute(&self.pool)
         .await?;
 

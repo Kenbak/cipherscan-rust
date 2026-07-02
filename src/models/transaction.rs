@@ -24,10 +24,12 @@ pub struct Transaction {
     pub sapling_spends: u16,
     pub sapling_outputs: u16,
     pub orchard_actions: u16,
+    pub ironwood_actions: u16,     // NU6.3 Ironwood pool (v6 tx)
 
     // Value balances (negative = into shielded, positive = out of shielded)
     pub sapling_value_balance: i64,
     pub orchard_value_balance: i64,
+    pub ironwood_value_balance: i64, // NU6.3 Ironwood pool (v6 tx)
 
     // Computed
     pub fee: Option<i64>,
@@ -51,18 +53,23 @@ impl Transaction {
             || self.sapling_spends > 0
             || self.sapling_outputs > 0
             || self.orchard_actions > 0
+            || self.ironwood_actions > 0
     }
 
     /// Check if this is a shielding transaction (transparent → shielded)
     pub fn is_shielding(&self) -> bool {
         self.vin_count > 0
-            && (self.sapling_value_balance < 0 || self.orchard_value_balance < 0)
+            && (self.sapling_value_balance < 0
+                || self.orchard_value_balance < 0
+                || self.ironwood_value_balance < 0)
     }
 
     /// Check if this is a deshielding transaction (shielded → transparent)
     pub fn is_deshielding(&self) -> bool {
         self.vout_count > 0
-            && (self.sapling_value_balance > 0 || self.orchard_value_balance > 0)
+            && (self.sapling_value_balance > 0
+                || self.orchard_value_balance > 0
+                || self.ironwood_value_balance > 0)
     }
 
     /// Check if this is fully shielded (no transparent involvement)
@@ -75,7 +82,9 @@ impl Transaction {
 
     /// Get the dominant pool for shielded activity
     pub fn dominant_pool(&self) -> Option<&'static str> {
-        if self.orchard_actions > 0 {
+        if self.ironwood_actions > 0 {
+            Some("ironwood")
+        } else if self.orchard_actions > 0 {
             Some("orchard")
         } else if self.sapling_spends > 0 || self.sapling_outputs > 0 {
             Some("sapling")

@@ -43,6 +43,7 @@ pub enum Pool {
     Sprout,
     Sapling,
     Orchard,
+    Ironwood,
 }
 
 impl Pool {
@@ -51,6 +52,7 @@ impl Pool {
             Pool::Sprout => "sprout",
             Pool::Sapling => "sapling",
             Pool::Orchard => "orchard",
+            Pool::Ironwood => "ironwood",
         }
     }
 }
@@ -87,8 +89,9 @@ impl ShieldedFlow {
             return flows;
         }
 
-        // Calculate NET total (exactly like Node.js)
-        let total_value_balance = tx.sapling_value_balance + tx.orchard_value_balance;
+        // Calculate NET total across all shielded pools (Sapling + Orchard + Ironwood)
+        let total_value_balance =
+            tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance;
 
         // Only create a flow if there's net movement
         if total_value_balance == 0 {
@@ -97,11 +100,17 @@ impl ShieldedFlow {
 
         // No transparent inputs or outputs — check if this is a pool migration
         // or just a fully shielded tx where the value balance is the fee.
-        // Pool migrations have opposing signs (one pool positive, the other negative).
+        // Pool migrations have opposing signs (one pool positive, another negative).
+        // Post-NU6.3 the canonical migration is Orchard(+) → Ironwood(-).
         if tx.vin_count == 0 && tx.vout_count == 0 {
-            let is_pool_migration =
-                (tx.sapling_value_balance > 0 && tx.orchard_value_balance < 0)
-                || (tx.orchard_value_balance > 0 && tx.sapling_value_balance < 0);
+            let balances = [
+                tx.sapling_value_balance,
+                tx.orchard_value_balance,
+                tx.ironwood_value_balance,
+            ];
+            let has_positive = balances.iter().any(|&b| b > 0);
+            let has_negative = balances.iter().any(|&b| b < 0);
+            let is_pool_migration = has_positive && has_negative;
             if !is_pool_migration {
                 return flows;
             }
@@ -120,10 +129,15 @@ impl ShieldedFlow {
             FlowType::Shield
         };
 
-        // Determine pool type (Node.js logic)
-        // "mixed" if BOTH pools have non-zero balance (regardless of sign)
-        let pool = if tx.sapling_value_balance != 0 && tx.orchard_value_balance != 0 {
+        // Determine pool type.
+        // "mixed" if 2+ pools have non-zero balance (regardless of sign).
+        let active_pools = (tx.sapling_value_balance != 0) as u8
+            + (tx.orchard_value_balance != 0) as u8
+            + (tx.ironwood_value_balance != 0) as u8;
+        let pool = if active_pools >= 2 {
             "mixed".to_string()
+        } else if tx.ironwood_value_balance != 0 {
+            Pool::Ironwood.to_string()
         } else if tx.orchard_value_balance != 0 {
             Pool::Orchard.to_string()
         } else {
@@ -172,8 +186,10 @@ mod tests {
             sapling_spends: 0,
             sapling_outputs: 0,
             orchard_actions: 2,
+            ironwood_actions: 0,
             sapling_value_balance: 0,
             orchard_value_balance: 10000, // fee only
+            ironwood_value_balance: 0,
             fee: Some(10000),
             vin: vec![],
             vout: vec![],
@@ -201,8 +217,10 @@ mod tests {
             sapling_spends: 2,
             sapling_outputs: 0,
             orchard_actions: 2,
+            ironwood_actions: 0,
             sapling_value_balance: 5000000,    // 0.05 ZEC leaving Sapling
             orchard_value_balance: -4990000,   // ~0.05 ZEC entering Orchard (minus fee)
+            ironwood_value_balance: 0,
             fee: Some(10000),
             vin: vec![],
             vout: vec![],
@@ -210,5 +228,39 @@ mod tests {
 
         let flows = ShieldedFlow::from_transaction(&tx);
         assert!(!flows.is_empty(), "Pool migration should still produce a flow");
+    }
+
+    #[test]
+    fn test_orchard_to_ironwood_migration_produces_flow() {
+        // NU6.3 canonical migration: value leaves Orchard, enters Ironwood,
+        // no transparent I/O. Should be detected as a pool migration.
+        let tx = Transaction {
+            txid: "orchard_to_ironwood".to_string(),
+            block_height: 4200000,
+            block_hash: "hash".to_string(),
+            version: 6,
+            lock_time: 0,
+            expiry_height: None,
+            size: 600,
+            vin_count: 0,
+            vout_count: 0,
+            transparent_value_in: 0,
+            transparent_value_out: 0,
+            joinsplit_count: 0,
+            sapling_spends: 0,
+            sapling_outputs: 0,
+            orchard_actions: 2,
+            ironwood_actions: 2,
+            sapling_value_balance: 0,
+            orchard_value_balance: 10010000,   // 0.1 ZEC + fee leaving Orchard
+            ironwood_value_balance: -10000000, // 0.1 ZEC entering Ironwood
+            fee: Some(10000),
+            vin: vec![],
+            vout: vec![],
+        };
+
+        let flows = ShieldedFlow::from_transaction(&tx);
+        assert!(!flows.is_empty(), "Orchard→Ironwood migration should produce a flow");
+        assert_eq!(flows[0].pool, "mixed", "Two active pools → mixed");
     }
 }

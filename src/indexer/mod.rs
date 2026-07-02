@@ -479,7 +479,8 @@ impl Indexer {
             if !tx.is_coinbase() {
                 let fee = tx.transparent_value_in - tx.transparent_value_out
                     + tx.sapling_value_balance
-                    + tx.orchard_value_balance;
+                    + tx.orchard_value_balance
+                    + tx.ironwood_value_balance;
                 if fee >= 0 {
                     tx.fee = Some(fee);
                 }
