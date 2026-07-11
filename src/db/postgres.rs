@@ -311,6 +311,7 @@ impl PostgresWriter {
             merkle_root: String::new(),
             final_sapling_root: String::new(),
             final_orchard_root: None,
+            final_ironwood_root: None,
             time: timestamp,
             bits: String::new(),
             difficulty: 0.0,
@@ -371,9 +372,10 @@ impl PostgresWriter {
                 height, hash, timestamp, transaction_count, total_fees,
                 version, merkle_root, final_sapling_root, final_orchard_root,
                 bits, nonce, solution,
-                difficulty, previous_block_hash, size, miner_address, coinbase_hex
+                difficulty, previous_block_hash, size, miner_address, coinbase_hex,
+                final_ironwood_root
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (height) DO UPDATE SET
                 hash = EXCLUDED.hash,
                 transaction_count = EXCLUDED.transaction_count,
@@ -389,7 +391,8 @@ impl PostgresWriter {
                 previous_block_hash = EXCLUDED.previous_block_hash,
                 size = EXCLUDED.size,
                 miner_address = EXCLUDED.miner_address,
-                coinbase_hex = EXCLUDED.coinbase_hex
+                coinbase_hex = EXCLUDED.coinbase_hex,
+                final_ironwood_root = EXCLUDED.final_ironwood_root
             "#,
         )
         .bind(height as i64)
@@ -409,6 +412,7 @@ impl PostgresWriter {
         .bind(block_size)
         .bind(&miner_address)
         .bind(&coinbase_hex)
+        .bind(&header.final_ironwood_root)
         .execute(&mut *db_tx)
         .await?;
 
@@ -417,6 +421,7 @@ impl PostgresWriter {
             // Insert transaction
             let has_sapling = tx.sapling_spends > 0 || tx.sapling_outputs > 0;
             let has_orchard = tx.orchard_actions > 0;
+            let has_ironwood = tx.ironwood_actions > 0;
             let is_coinbase = tx.vin.first().map(|v| v.is_coinbase).unwrap_or(false);
 
             sqlx::query(
@@ -427,10 +432,12 @@ impl PostgresWriter {
                     shielded_spends, shielded_outputs, orchard_actions,
                     value_balance_sapling, value_balance_orchard,
                     is_coinbase, has_sapling, has_orchard,
-                    vin_count, vout_count, block_time, tx_index
+                    vin_count, vout_count, block_time, tx_index,
+                    ironwood_actions, value_balance_ironwood, has_ironwood, value_balance
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                    $23, $24, $25, $26
                 )
                 ON CONFLICT (txid) DO UPDATE SET
                     block_height = EXCLUDED.block_height,
@@ -439,7 +446,11 @@ impl PostgresWriter {
                     total_input = EXCLUDED.total_input,
                     total_output = EXCLUDED.total_output,
                     is_coinbase = EXCLUDED.is_coinbase,
-                    tx_index = EXCLUDED.tx_index
+                    tx_index = EXCLUDED.tx_index,
+                    ironwood_actions = EXCLUDED.ironwood_actions,
+                    value_balance_ironwood = EXCLUDED.value_balance_ironwood,
+                    has_ironwood = EXCLUDED.has_ironwood,
+                    value_balance = EXCLUDED.value_balance
                 "#,
             )
             .bind(&tx.txid)
@@ -464,6 +475,10 @@ impl PostgresWriter {
             .bind(tx.vout_count as i32)
             .bind(timestamp as i64)
             .bind(tx_idx as i32) // $22 tx_index
+            .bind(tx.ironwood_actions as i32) // $23
+            .bind(tx.ironwood_value_balance) // $24
+            .bind(has_ironwood) // $25
+            .bind(tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance) // $26
             .execute(&mut *db_tx)
             .await?;
 

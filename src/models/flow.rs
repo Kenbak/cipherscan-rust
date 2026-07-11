@@ -111,9 +111,14 @@ impl ShieldedFlow {
             let has_positive = balances.iter().any(|&b| b > 0);
             let has_negative = balances.iter().any(|&b| b < 0);
             let is_pool_migration = has_positive && has_negative;
-            if !is_pool_migration {
+            // Pool migrations move value between shielded pools — no transparent
+            // involvement. The net positive balance is just the fee, not an unshield.
+            // Don't create a shield/deshield flow for these.
+            if is_pool_migration {
                 return flows;
             }
+            // Not a pool migration and no transparent I/O — fully shielded (fee only)
+            return flows;
         }
 
         // Collect transparent addresses for context
@@ -200,7 +205,9 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_migration_still_produces_flow() {
+    fn test_pool_migration_produces_no_flow() {
+        // Pool migrations move value between shielded pools — they should NOT
+        // create shield/deshield flows since no transparent value is involved.
         let tx = Transaction {
             txid: "pool_migration".to_string(),
             block_height: 3000000,
@@ -227,13 +234,13 @@ mod tests {
         };
 
         let flows = ShieldedFlow::from_transaction(&tx);
-        assert!(!flows.is_empty(), "Pool migration should still produce a flow");
+        assert!(flows.is_empty(), "Pool migration should NOT produce a shield/deshield flow");
     }
 
     #[test]
-    fn test_orchard_to_ironwood_migration_produces_flow() {
+    fn test_orchard_to_ironwood_migration_produces_no_flow() {
         // NU6.3 canonical migration: value leaves Orchard, enters Ironwood,
-        // no transparent I/O. Should be detected as a pool migration.
+        // no transparent I/O. The net positive balance is just the fee.
         let tx = Transaction {
             txid: "orchard_to_ironwood".to_string(),
             block_height: 4200000,
@@ -260,7 +267,6 @@ mod tests {
         };
 
         let flows = ShieldedFlow::from_transaction(&tx);
-        assert!(!flows.is_empty(), "Orchard→Ironwood migration should produce a flow");
-        assert_eq!(flows[0].pool, "mixed", "Two active pools → mixed");
+        assert!(flows.is_empty(), "Orchard→Ironwood migration should NOT produce a shield/deshield flow");
     }
 }

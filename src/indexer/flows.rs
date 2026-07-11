@@ -19,11 +19,17 @@ impl FlowAnalyzer {
             return None;
         }
 
-        // Check for pool migration first
+        // Check for pool migration first — any two shielded pools with
+        // opposing value balance signs and no transparent I/O.
         if tx.vin_count == 0 && tx.vout_count == 0 && tx.has_shielded() {
-            if (tx.sapling_value_balance > 0 && tx.orchard_value_balance < 0)
-                || (tx.orchard_value_balance > 0 && tx.sapling_value_balance < 0)
-            {
+            let balances = [
+                tx.sapling_value_balance,
+                tx.orchard_value_balance,
+                tx.ironwood_value_balance,
+            ];
+            let has_positive = balances.iter().any(|&b| b > 0);
+            let has_negative = balances.iter().any(|&b| b < 0);
+            if has_positive && has_negative {
                 return Some(FlowType::PoolMigration);
             }
         }
@@ -59,6 +65,9 @@ impl FlowAnalyzer {
         if tx.orchard_actions > 0 || tx.orchard_value_balance != 0 {
             pools.push(Pool::Orchard);
         }
+        if tx.ironwood_actions > 0 || tx.ironwood_value_balance != 0 {
+            pools.push(Pool::Ironwood);
+        }
 
         pools
     }
@@ -66,9 +75,10 @@ impl FlowAnalyzer {
     /// Calculate the net flow amount for a pool
     pub fn net_flow_amount(tx: &Transaction, pool: Pool) -> i64 {
         match pool {
-            Pool::Sprout => 0, // Would need JoinSplit parsing
+            Pool::Sprout => 0,
             Pool::Sapling => tx.sapling_value_balance,
             Pool::Orchard => tx.orchard_value_balance,
+            Pool::Ironwood => tx.ironwood_value_balance,
         }
     }
 
@@ -124,5 +134,35 @@ mod tests {
         let pools = FlowAnalyzer::involved_pools(&tx);
         assert!(pools.contains(&Pool::Sapling));
         assert!(pools.contains(&Pool::Orchard));
+    }
+
+    #[test]
+    fn test_classify_orchard_to_ironwood_migration() {
+        let tx = Transaction {
+            txid: "migration".to_string(),
+            block_height: 4200000,
+            block_hash: "hash".to_string(),
+            version: 6,
+            lock_time: 0,
+            expiry_height: None,
+            size: 600,
+            vin_count: 0,
+            vout_count: 0,
+            transparent_value_in: 0,
+            transparent_value_out: 0,
+            joinsplit_count: 0,
+            sapling_spends: 0,
+            sapling_outputs: 0,
+            orchard_actions: 2,
+            ironwood_actions: 2,
+            sapling_value_balance: 0,
+            orchard_value_balance: 10010000,
+            ironwood_value_balance: -10000000,
+            fee: Some(10000),
+            vin: vec![],
+            vout: vec![],
+        };
+
+        assert_eq!(FlowAnalyzer::classify(&tx), Some(FlowType::PoolMigration));
     }
 }

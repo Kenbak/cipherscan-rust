@@ -135,23 +135,26 @@ impl TransactionParser {
                     .unwrap_or(0);
                 (0, spends as u16, outputs as u16, actions as u16)
             }
-            // NU6.3 v6: same Sapling/Orchard shape as V5 (Ironwood counted separately below)
+            // NU6.3 v6: Sapling is V5-shaped; the v6 Orchard bundle is ShieldedDataV6,
+            // which exposes the underlying Orchard ShieldedData via .data(). Ironwood
+            // is counted separately below.
             V6 { sapling_shielded_data, orchard_shielded_data, .. } => {
                 let (spends, outputs) = sapling_shielded_data.as_ref()
                     .map(|d| (d.spends().count(), d.outputs().count()))
                     .unwrap_or((0, 0));
                 let actions = orchard_shielded_data.as_ref()
-                    .map(|d| d.actions.len())
+                    .map(|d| d.data().actions.len())
                     .unwrap_or(0);
                 (0, spends as u16, outputs as u16, actions as u16)
             }
         };
 
-        // NU6.3 Ironwood actions (v6 only). Ironwood is an Orchard-shaped bundle.
+        // NU6.3 Ironwood actions (v6 only). ironwood::ShieldedData wraps an Orchard
+        // v6 bundle; reach the Orchard actions through .data().
         let ironwood_actions: u16 = match &tx {
             V6 { ironwood_shielded_data, .. } => {
                 ironwood_shielded_data.as_ref()
-                    .map(|d| d.actions.len())
+                    .map(|d| d.data().actions.len())
                     .unwrap_or(0) as u16
             }
             _ => 0,
@@ -185,7 +188,7 @@ impl TransactionParser {
             }
             V6 { orchard_shielded_data, .. } => {
                 orchard_shielded_data.as_ref()
-                    .map(|d| i64::from(d.value_balance))
+                    .map(|d| i64::from(d.data().value_balance))
                     .unwrap_or(0)
             }
             _ => 0,
@@ -196,7 +199,7 @@ impl TransactionParser {
         let ironwood_value_balance: i64 = match &tx {
             V6 { ironwood_shielded_data, .. } => {
                 ironwood_shielded_data.as_ref()
-                    .map(|d| i64::from(d.value_balance))
+                    .map(|d| i64::from(d.data().value_balance))
                     .unwrap_or(0)
             }
             _ => 0,
