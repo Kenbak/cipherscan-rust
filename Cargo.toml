@@ -18,13 +18,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Zcash parsing (from Zebra)
-# NU6.3 / Ironwood: parsing v6 transactions (Ironwood shielded component) requires
-# the Ironwood-capable zebra-chain, which is not yet published to crates.io. Point at
-# the Ironwood fork branch. NOTE: verify on a build env — the fork may gate the V6 /
-# ironwood types behind a feature flag (e.g. `tx_v6`) that must be enabled here, and
-# confirm the final canonical repo (ZF may land an official ironwood branch).
-# zebra-chain = "9"  # pre-Ironwood (crates.io) — kept for reference
-zebra-chain = { git = "https://github.com/valargroup/zebra", branch = "ironwood-main" }
+# NU6.3 / Ironwood: Zebra 6.0.0 stable — first release with finalized Ironwood
+# crates and v6 transaction format support on mainnet.
+zebra-chain = { git = "https://github.com/ZcashFoundation/zebra", tag = "v6.0.0" }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
