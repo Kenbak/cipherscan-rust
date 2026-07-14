@@ -143,6 +143,22 @@ enum Commands {
         database_url: Option<String>,
     },
 
+    /// Backfill only metadata columns (locktime, expiry_height, sapling/sprout counts)
+    /// for existing transactions. Does NOT touch outputs, inputs, or flows.
+    BackfillMetadata {
+        /// Start from specific height (default: Overwinter activation = 347500)
+        #[arg(long, default_value = "347500")]
+        from: u32,
+
+        /// Stop at specific height (default: chain tip)
+        #[arg(long)]
+        to: Option<u32>,
+
+        /// Number of blocks to process per DB commit
+        #[arg(long, default_value = "5000")]
+        batch: u32,
+    },
+
     /// Full validation: index into test DB, compare with prod, benchmark
     Validate {
         /// Production database URL
@@ -252,6 +268,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let db_url = database_url.unwrap_or_else(|| config.database_url.clone());
             compare_with_postgres(&config, &db_url, sample, from_height).await?;
+        }
+        Commands::BackfillMetadata { from, to, batch } => {
+            run_backfill_metadata(&config, from, to, batch).await?;
         }
         Commands::Validate {
             prod_db,
@@ -376,6 +395,144 @@ async fn run_backfill(config: &Config, from: Option<u32>, to: Option<u32>) -> Re
     println!();
 
     indexer.backfill(from, to).await
+}
+
+/// Run metadata-only backfill (locktime, expiry_height, sapling/sprout counts).
+/// Reads raw txs from RocksDB, parses with the fixed parser, and issues targeted
+/// UPDATEs on the transactions table. Does NOT touch outputs, inputs, address_transactions, or flows.
+async fn run_backfill_metadata(
+    config: &Config,
+    from: u32,
+    to: Option<u32>,
+    batch_size: u32,
+) -> Result<(), String> {
+    use crate::db::PostgresWriter;
+    use crate::indexer::TransactionParser;
+
+    if config.database_url.is_empty() {
+        return Err(
+            "DATABASE_URL not configured. Set it in .env or pass --database-url".to_string(),
+        );
+    }
+
+    let zebra = ZebraState::open(config)?;
+    let postgres = PostgresWriter::connect(&config.database_url)
+        .await
+        .map_err(|e| format!("PostgreSQL error: {}", e))?;
+
+    let tip = zebra.get_tip_height()?;
+    let end = to.unwrap_or(tip);
+
+    let checkpoint_key = "metadata_backfill_height";
+    let start = match postgres
+        .get_checkpoint_key(checkpoint_key)
+        .await
+        .map_err(|e| format!("Checkpoint read error: {}", e))?
+    {
+        Some(saved) if saved >= from => {
+            println!("📍 Resuming metadata backfill from checkpoint: {}", saved + 1);
+            saved + 1
+        }
+        _ => from,
+    };
+
+    if start > end {
+        println!("✅ Metadata backfill already complete (start {} > end {})", start, end);
+        return Ok(());
+    }
+
+    let total_blocks = end - start + 1;
+    println!("🔧 Metadata backfill: {} → {} ({} blocks, batch={})", start, end, total_blocks, batch_size);
+    println!("   Only updating: locktime, expiry_height, sapling_spend_count,");
+    println!("                  sapling_output_count, sprout_joinsplit_count, has_sprout");
+    println!("────────────────────────────────────────────────────────────");
+
+    let overall_start = Instant::now();
+    let mut total_txs_updated = 0u64;
+    let mut total_txs_parsed = 0u64;
+    let mut current = start;
+
+    while current <= end {
+        let batch_end = (current + batch_size - 1).min(end);
+        let mut batch_txs = Vec::new();
+
+        for height in current..=batch_end {
+            let hash_bytes = match zebra.get_block_hash(height) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("Skipping height {} (no block hash): {}", height, e);
+                    continue;
+                }
+            };
+            let mut hash_rev = hash_bytes;
+            hash_rev.reverse();
+            let block_hash = hex::encode(&hash_rev);
+
+            let raw_txs = match zebra.iter_block_transactions(height) {
+                Ok(txs) => txs,
+                Err(e) => {
+                    tracing::warn!("Skipping height {} (no txs): {}", height, e);
+                    continue;
+                }
+            };
+
+            for (_tx_index, raw) in &raw_txs {
+                match TransactionParser::parse(raw, height, &block_hash, config.network) {
+                    Ok(tx) => {
+                        total_txs_parsed += 1;
+                        batch_txs.push(tx);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Parse error at {}:{}: {}", height, _tx_index, e);
+                    }
+                }
+            }
+        }
+
+        let updated = postgres
+            .batch_update_metadata(&batch_txs)
+            .await
+            .map_err(|e| format!("DB update error at heights {}-{}: {}", current, batch_end, e))?;
+        total_txs_updated += updated;
+
+        postgres
+            .update_checkpoint(checkpoint_key, &batch_end.to_string())
+            .await
+            .map_err(|e| format!("Checkpoint error: {}", e))?;
+
+        let elapsed = overall_start.elapsed();
+        let blocks_done = batch_end - start + 1;
+        let rate = blocks_done as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
+        let remaining = (end - batch_end) as f64;
+        let eta_secs = if rate > 0.0 { remaining / rate } else { 0.0 };
+
+        println!(
+            "📦 {} / {} ({:.1}%) | {:.0} blk/s | txs updated: {} | ETA: {:.0}s",
+            batch_end,
+            end,
+            blocks_done as f64 / total_blocks as f64 * 100.0,
+            rate,
+            total_txs_updated,
+            eta_secs
+        );
+
+        current = batch_end + 1;
+    }
+
+    let elapsed = overall_start.elapsed();
+    println!("────────────────────────────────────────────────────────────");
+    println!("✅ Metadata backfill complete!");
+    println!("   Blocks scanned: {}", total_blocks);
+    println!("   Transactions parsed: {}", total_txs_parsed);
+    println!("   Rows updated: {}", total_txs_updated);
+    println!("   Time: {:.1}s", elapsed.as_secs_f64());
+    println!(
+        "   Rate: {:.0} blocks/s, {:.0} tx/s",
+        total_blocks as f64 / elapsed.as_secs_f64(),
+        total_txs_parsed as f64 / elapsed.as_secs_f64()
+    );
+
+    Ok(())
 }
 
 /// Run live indexer (with PostgreSQL writes)

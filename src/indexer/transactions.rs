@@ -44,16 +44,15 @@ impl TransactionParser {
         // Get txid
         let txid = tx.hash().to_string();
 
-        // Extract data based on transaction version
-        // Use transmute-like conversion via serialization or raw access
-        let (version, lock_time_raw, expiry_height_raw): (i32, u32, Option<u32>) = match &tx {
-            V1 { .. } => (1, 0, None),
-            V2 { .. } => (2, 0, None),
-            V3 { expiry_height, .. } => (3, 0, Some(expiry_height.0)),
-            V4 { expiry_height, .. } => (4, 0, Some(expiry_height.0)),
-            V5 { expiry_height, .. } => (5, 0, Some(expiry_height.0)),
-            // NU6.3: v6 = v5 + Ironwood component (requires Ironwood zebra-chain fork)
-            V6 { expiry_height, .. } => (6, 0, Some(expiry_height.0)),
+        let lock_time_raw = tx.raw_lock_time();
+
+        let (version, expiry_height_raw): (i32, Option<u32>) = match &tx {
+            V1 { .. } => (1, None),
+            V2 { .. } => (2, None),
+            V3 { expiry_height, .. } => (3, Some(expiry_height.0)),
+            V4 { expiry_height, .. } => (4, Some(expiry_height.0)),
+            V5 { expiry_height, .. } => (5, Some(expiry_height.0)),
+            V6 { expiry_height, .. } => (6, Some(expiry_height.0)),
         };
 
         // Get transparent inputs/outputs
@@ -341,6 +340,9 @@ impl TransactionParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zebra_chain::transaction::LockTime;
+    use zebra_chain::block::Height;
+    use zebra_chain::serialization::ZcashSerialize;
 
     #[test]
     fn test_address_encoding_mainnet() {
@@ -356,5 +358,35 @@ mod tests {
         let (p2pkh, p2sh) = TransactionParser::addr_prefixes(Network::Testnet);
         assert!(TransactionParser::encode_address(&p2pkh, &hash).starts_with("tm"));
         assert!(TransactionParser::encode_address(&p2sh, &hash).starts_with("t2"));
+    }
+
+    fn lock_time_to_u32(lt: LockTime) -> u32 {
+        let mut buf = Vec::new();
+        lt.zcash_serialize(&mut buf).unwrap();
+        u32::from_le_bytes(buf.try_into().unwrap())
+    }
+
+    #[test]
+    fn lock_time_unlocked_is_zero() {
+        let lt = LockTime::unlocked();
+        assert_eq!(lock_time_to_u32(lt), 0);
+    }
+
+    #[test]
+    fn lock_time_height_preserves_value() {
+        let lt = LockTime::Height(Height(400_000));
+        assert_eq!(lock_time_to_u32(lt), 400_000);
+    }
+
+    #[test]
+    fn lock_time_high_height_below_threshold() {
+        let lt = LockTime::Height(Height(499_999_999));
+        assert_eq!(lock_time_to_u32(lt), 499_999_999);
+    }
+
+    #[test]
+    fn lock_time_time_above_threshold() {
+        let lt = LockTime::min_lock_time_timestamp();
+        assert_eq!(lock_time_to_u32(lt), 500_000_000);
     }
 }

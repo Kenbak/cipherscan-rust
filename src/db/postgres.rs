@@ -424,6 +424,8 @@ impl PostgresWriter {
             let has_ironwood = tx.ironwood_actions > 0;
             let is_coinbase = tx.vin.first().map(|v| v.is_coinbase).unwrap_or(false);
 
+            let has_sprout = tx.joinsplit_count > 0;
+
             sqlx::query(
                 r#"
                 INSERT INTO transactions (
@@ -433,11 +435,14 @@ impl PostgresWriter {
                     value_balance_sapling, value_balance_orchard,
                     is_coinbase, has_sapling, has_orchard,
                     vin_count, vout_count, block_time, tx_index,
-                    ironwood_actions, value_balance_ironwood, has_ironwood, value_balance
+                    ironwood_actions, value_balance_ironwood, has_ironwood, value_balance,
+                    expiry_height, sapling_spend_count, sapling_output_count,
+                    sprout_joinsplit_count, has_sprout
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                    $23, $24, $25, $26
+                    $23, $24, $25, $26,
+                    $27, $28, $29, $30, $31
                 )
                 ON CONFLICT (txid) DO UPDATE SET
                     block_height = EXCLUDED.block_height,
@@ -450,35 +455,46 @@ impl PostgresWriter {
                     ironwood_actions = EXCLUDED.ironwood_actions,
                     value_balance_ironwood = EXCLUDED.value_balance_ironwood,
                     has_ironwood = EXCLUDED.has_ironwood,
-                    value_balance = EXCLUDED.value_balance
+                    value_balance = EXCLUDED.value_balance,
+                    locktime = EXCLUDED.locktime,
+                    expiry_height = EXCLUDED.expiry_height,
+                    sapling_spend_count = EXCLUDED.sapling_spend_count,
+                    sapling_output_count = EXCLUDED.sapling_output_count,
+                    sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count,
+                    has_sprout = EXCLUDED.has_sprout
                 "#,
             )
-            .bind(&tx.txid)
-            .bind(tx.block_height as i64)
-            .bind(&tx.block_hash)
-            .bind(timestamp as i64)
-            .bind(tx.version)
-            .bind(tx.lock_time as i64)
-            .bind(tx.size as i32)
-            .bind(tx.fee.unwrap_or(0))
-            .bind(tx.transparent_value_in)
-            .bind(tx.transparent_value_out)
-            .bind(tx.sapling_spends as i32)
-            .bind(tx.sapling_outputs as i32)
-            .bind(tx.orchard_actions as i32)
-            .bind(tx.sapling_value_balance)
-            .bind(tx.orchard_value_balance)
-            .bind(is_coinbase)
-            .bind(has_sapling)
-            .bind(has_orchard)
-            .bind(tx.vin_count as i32)
-            .bind(tx.vout_count as i32)
-            .bind(timestamp as i64)
-            .bind(tx_idx as i32) // $22 tx_index
+            .bind(&tx.txid)                   // $1
+            .bind(tx.block_height as i64)     // $2
+            .bind(&tx.block_hash)             // $3
+            .bind(timestamp as i64)           // $4
+            .bind(tx.version)                 // $5
+            .bind(tx.lock_time as i64)        // $6
+            .bind(tx.size as i32)             // $7
+            .bind(tx.fee.unwrap_or(0))        // $8
+            .bind(tx.transparent_value_in)    // $9
+            .bind(tx.transparent_value_out)   // $10
+            .bind(tx.sapling_spends as i32)   // $11
+            .bind(tx.sapling_outputs as i32)  // $12
+            .bind(tx.orchard_actions as i32)  // $13
+            .bind(tx.sapling_value_balance)   // $14
+            .bind(tx.orchard_value_balance)   // $15
+            .bind(is_coinbase)                // $16
+            .bind(has_sapling)                // $17
+            .bind(has_orchard)                // $18
+            .bind(tx.vin_count as i32)        // $19
+            .bind(tx.vout_count as i32)       // $20
+            .bind(timestamp as i64)           // $21
+            .bind(tx_idx as i32)              // $22
             .bind(tx.ironwood_actions as i32) // $23
-            .bind(tx.ironwood_value_balance) // $24
-            .bind(has_ironwood) // $25
+            .bind(tx.ironwood_value_balance)  // $24
+            .bind(has_ironwood)               // $25
             .bind(tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance) // $26
+            .bind(tx.expiry_height.map(|h| h as i32)) // $27
+            .bind(tx.sapling_spends as i32)   // $28
+            .bind(tx.sapling_outputs as i32)  // $29
+            .bind(tx.joinsplit_count as i32)   // $30
+            .bind(has_sprout)                  // $31
             .execute(&mut *db_tx)
             .await?;
 
@@ -740,6 +756,52 @@ impl PostgresWriter {
         let count = self.insert_flows_tx(&mut db_tx, flows, block_time).await?;
         db_tx.commit().await?;
         Ok(count)
+    }
+
+    /// Batch-update only the metadata columns for a set of transactions.
+    /// Used by the backfill-metadata subcommand to fill in expiry_height, locktime,
+    /// sapling/sprout counts without touching outputs, inputs, or flows.
+    pub async fn batch_update_metadata(
+        &self,
+        txs: &[crate::models::Transaction],
+    ) -> Result<u64, sqlx::Error> {
+        if txs.is_empty() {
+            return Ok(0);
+        }
+
+        let mut db_tx = self.pool.begin().await?;
+        let mut updated = 0u64;
+
+        for tx in txs {
+            let has_sprout = tx.joinsplit_count > 0;
+
+            let result = sqlx::query(
+                r#"
+                UPDATE transactions SET
+                    locktime = $2,
+                    expiry_height = $3,
+                    sapling_spend_count = $4,
+                    sapling_output_count = $5,
+                    sprout_joinsplit_count = $6,
+                    has_sprout = $7
+                WHERE txid = $1
+                "#,
+            )
+            .bind(&tx.txid)                          // $1
+            .bind(tx.lock_time as i64)               // $2
+            .bind(tx.expiry_height.map(|h| h as i32)) // $3
+            .bind(tx.sapling_spends as i32)          // $4
+            .bind(tx.sapling_outputs as i32)         // $5
+            .bind(tx.joinsplit_count as i32)          // $6
+            .bind(has_sprout)                         // $7
+            .execute(&mut *db_tx)
+            .await?;
+
+            updated += result.rows_affected();
+        }
+
+        db_tx.commit().await?;
+        Ok(updated)
     }
 
     /// Get the stored block hash at a given height, if any.
