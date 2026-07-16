@@ -4,7 +4,7 @@
 //! Uses UPSERT (INSERT ON CONFLICT) to allow parallel backfill and live indexing.
 
 use crate::models::{ShieldedFlow, Transaction, TransparentInput, TransparentOutput};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 
 /// PostgreSQL connection and writer
 pub struct PostgresWriter {
@@ -416,18 +416,31 @@ impl PostgresWriter {
         .execute(&mut *db_tx)
         .await?;
 
-        // Insert transactions and their outputs
-        for (tx_idx, tx) in transactions.iter().enumerate() {
-            // Insert transaction
-            let has_sapling = tx.sapling_spends > 0 || tx.sapling_outputs > 0;
-            let has_orchard = tx.orchard_actions > 0;
-            let has_ironwood = tx.ironwood_actions > 0;
-            let is_coinbase = tx.vin.first().map(|v| v.is_coinbase).unwrap_or(false);
+        let use_rowwise_writes = std::env::var_os("CIPHERSCAN_ROWWISE_WRITES").is_some();
+        if !use_rowwise_writes {
+            // Collapse the transaction, input, output, and address-activity writes
+            // into chunked multi-row UPSERTs. The previous row-wise path incurred
+            // thousands of local client/server round trips for transparent blocks.
+            self.bulk_insert_transaction_data(&mut db_tx, transactions, timestamp)
+                .await?;
+            count = transactions.len() as u64;
+        }
 
-            let has_sprout = tx.joinsplit_count > 0;
+        // Keep an emergency rollback path while the bulk implementation is being
+        // introduced. Setting CIPHERSCAN_ROWWISE_WRITES restores the old behavior.
+        if use_rowwise_writes {
+            count = 0;
+            for (tx_idx, tx) in transactions.iter().enumerate() {
+                // Insert transaction
+                let has_sapling = tx.sapling_spends > 0 || tx.sapling_outputs > 0;
+                let has_orchard = tx.orchard_actions > 0;
+                let has_ironwood = tx.ironwood_actions > 0;
+                let is_coinbase = tx.vin.first().map(|v| v.is_coinbase).unwrap_or(false);
 
-            sqlx::query(
-                r#"
+                let has_sprout = tx.joinsplit_count > 0;
+
+                sqlx::query(
+                    r#"
                 INSERT INTO transactions (
                     txid, block_height, block_hash, timestamp, version, locktime,
                     size, fee, total_input, total_output,
@@ -463,45 +476,47 @@ impl PostgresWriter {
                     sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count,
                     has_sprout = EXCLUDED.has_sprout
                 "#,
-            )
-            .bind(&tx.txid)                   // $1
-            .bind(tx.block_height as i64)     // $2
-            .bind(&tx.block_hash)             // $3
-            .bind(timestamp as i64)           // $4
-            .bind(tx.version)                 // $5
-            .bind(tx.lock_time as i64)        // $6
-            .bind(tx.size as i32)             // $7
-            .bind(tx.fee.unwrap_or(0))        // $8
-            .bind(tx.transparent_value_in)    // $9
-            .bind(tx.transparent_value_out)   // $10
-            .bind(tx.sapling_spends as i32)   // $11
-            .bind(tx.sapling_outputs as i32)  // $12
-            .bind(tx.orchard_actions as i32)  // $13
-            .bind(tx.sapling_value_balance)   // $14
-            .bind(tx.orchard_value_balance)   // $15
-            .bind(is_coinbase)                // $16
-            .bind(has_sapling)                // $17
-            .bind(has_orchard)                // $18
-            .bind(tx.vin_count as i32)        // $19
-            .bind(tx.vout_count as i32)       // $20
-            .bind(timestamp as i64)           // $21
-            .bind(tx_idx as i32)              // $22
-            .bind(tx.ironwood_actions as i32) // $23
-            .bind(tx.ironwood_value_balance)  // $24
-            .bind(has_ironwood)               // $25
-            .bind(tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance) // $26
-            .bind(tx.expiry_height.map(|h| h as i32)) // $27
-            .bind(tx.sapling_spends as i32)   // $28
-            .bind(tx.sapling_outputs as i32)  // $29
-            .bind(tx.joinsplit_count as i32)   // $30
-            .bind(has_sprout)                  // $31
-            .execute(&mut *db_tx)
-            .await?;
+                )
+                .bind(&tx.txid) // $1
+                .bind(tx.block_height as i64) // $2
+                .bind(&tx.block_hash) // $3
+                .bind(timestamp as i64) // $4
+                .bind(tx.version) // $5
+                .bind(tx.lock_time as i64) // $6
+                .bind(tx.size as i32) // $7
+                .bind(tx.fee.unwrap_or(0)) // $8
+                .bind(tx.transparent_value_in) // $9
+                .bind(tx.transparent_value_out) // $10
+                .bind(tx.sapling_spends as i32) // $11
+                .bind(tx.sapling_outputs as i32) // $12
+                .bind(tx.orchard_actions as i32) // $13
+                .bind(tx.sapling_value_balance) // $14
+                .bind(tx.orchard_value_balance) // $15
+                .bind(is_coinbase) // $16
+                .bind(has_sapling) // $17
+                .bind(has_orchard) // $18
+                .bind(tx.vin_count as i32) // $19
+                .bind(tx.vout_count as i32) // $20
+                .bind(timestamp as i64) // $21
+                .bind(tx_idx as i32) // $22
+                .bind(tx.ironwood_actions as i32) // $23
+                .bind(tx.ironwood_value_balance) // $24
+                .bind(has_ironwood) // $25
+                .bind(
+                    tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance,
+                ) // $26
+                .bind(tx.expiry_height.map(|h| h as i32)) // $27
+                .bind(tx.sapling_spends as i32) // $28
+                .bind(tx.sapling_outputs as i32) // $29
+                .bind(tx.joinsplit_count as i32) // $30
+                .bind(has_sprout) // $31
+                .execute(&mut *db_tx)
+                .await?;
 
-            // Insert outputs
-            for output in &tx.vout {
-                sqlx::query(
-                    r#"
+                // Insert outputs
+                for output in &tx.vout {
+                    sqlx::query(
+                        r#"
                     INSERT INTO transaction_outputs (txid, vout_index, value, address, script_type)
                     VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (txid, vout_index) DO UPDATE SET
@@ -509,23 +524,23 @@ impl PostgresWriter {
                         address = EXCLUDED.address,
                         script_type = EXCLUDED.script_type
                     "#,
-                )
-                .bind(&tx.txid)
-                .bind(output.n as i32)
-                .bind(output.value)
-                .bind(&output.address)
-                .bind(&output.script_type)
-                .execute(&mut *db_tx)
-                .await?;
-            }
-
-            // Insert inputs (skip coinbase)
-            for (i, input) in tx.vin.iter().enumerate() {
-                if input.is_coinbase {
-                    continue;
+                    )
+                    .bind(&tx.txid)
+                    .bind(output.n as i32)
+                    .bind(output.value)
+                    .bind(&output.address)
+                    .bind(&output.script_type)
+                    .execute(&mut *db_tx)
+                    .await?;
                 }
 
-                sqlx::query(
+                // Insert inputs (skip coinbase)
+                for (i, input) in tx.vin.iter().enumerate() {
+                    if input.is_coinbase {
+                        continue;
+                    }
+
+                    sqlx::query(
                     r#"
                     INSERT INTO transaction_inputs (txid, vout_index, prev_txid, prev_vout, address, value)
                     VALUES ($1, $2, $3, $4, $5, $6)
@@ -542,31 +557,31 @@ impl PostgresWriter {
                 .bind(input.value)
                 .execute(&mut *db_tx)
                 .await?;
-            }
-
-            // Insert into address_transactions (denormalized lookup table)
-            {
-                use std::collections::HashMap;
-                let mut addr_map: HashMap<&str, (i64, i64)> = HashMap::new();
-
-                for output in &tx.vout {
-                    if let Some(ref addr) = output.address {
-                        let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
-                        entry.1 += output.value; // value_out
-                    }
-                }
-                for input in &tx.vin {
-                    if input.is_coinbase {
-                        continue;
-                    }
-                    if let Some(ref addr) = input.address {
-                        let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
-                        entry.0 += input.value.unwrap_or(0); // value_in
-                    }
                 }
 
-                for (addr, (val_in, val_out)) in &addr_map {
-                    sqlx::query(
+                // Insert into address_transactions (denormalized lookup table)
+                {
+                    use std::collections::HashMap;
+                    let mut addr_map: HashMap<&str, (i64, i64)> = HashMap::new();
+
+                    for output in &tx.vout {
+                        if let Some(ref addr) = output.address {
+                            let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
+                            entry.1 += output.value; // value_out
+                        }
+                    }
+                    for input in &tx.vin {
+                        if input.is_coinbase {
+                            continue;
+                        }
+                        if let Some(ref addr) = input.address {
+                            let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
+                            entry.0 += input.value.unwrap_or(0); // value_in
+                        }
+                    }
+
+                    for (addr, (val_in, val_out)) in &addr_map {
+                        sqlx::query(
                         r#"
                         INSERT INTO address_transactions (address, txid, block_height, tx_index, block_time, is_input, is_output, value_in, value_out)
                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -588,10 +603,11 @@ impl PostgresWriter {
                     .bind(*val_out)
                     .execute(&mut *db_tx)
                     .await?;
+                    }
                 }
-            }
 
-            count += 1;
+                count += 1;
+            }
         }
 
         let flow_count = self.insert_flows_tx(&mut db_tx, flows, timestamp).await?;
@@ -602,6 +618,230 @@ impl PostgresWriter {
 
         db_tx.commit().await?;
         Ok((count, flow_count))
+    }
+
+    async fn bulk_insert_transaction_data(
+        &self,
+        db_tx: &mut sqlx::Transaction<'_, Postgres>,
+        transactions: &[Transaction],
+        timestamp: u64,
+    ) -> Result<(), sqlx::Error> {
+        const TX_CHUNK_SIZE: usize = 2_000;
+        for (chunk_index, chunk) in transactions.chunks(TX_CHUNK_SIZE).enumerate() {
+            let tx_index_offset = chunk_index * TX_CHUNK_SIZE;
+            let mut query = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO transactions (
+                    txid, block_height, block_hash, timestamp, version, locktime,
+                    size, fee, total_input, total_output,
+                    shielded_spends, shielded_outputs, orchard_actions,
+                    value_balance_sapling, value_balance_orchard,
+                    is_coinbase, has_sapling, has_orchard,
+                    vin_count, vout_count, block_time, tx_index,
+                    ironwood_actions, value_balance_ironwood, has_ironwood, value_balance,
+                    expiry_height, sapling_spend_count, sapling_output_count,
+                    sprout_joinsplit_count, has_sprout
+                ) "#,
+            );
+            query.push_values(chunk.iter().enumerate(), |mut row, (index, tx)| {
+                let has_sapling = tx.sapling_spends > 0 || tx.sapling_outputs > 0;
+                let has_orchard = tx.orchard_actions > 0;
+                let has_ironwood = tx.ironwood_actions > 0;
+                let has_sprout = tx.joinsplit_count > 0;
+                let is_coinbase = tx.vin.first().map(|vin| vin.is_coinbase).unwrap_or(false);
+                let value_balance =
+                    tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance;
+
+                row.push_bind(&tx.txid)
+                    .push_bind(tx.block_height as i64)
+                    .push_bind(&tx.block_hash)
+                    .push_bind(timestamp as i64)
+                    .push_bind(tx.version)
+                    .push_bind(tx.lock_time as i64)
+                    .push_bind(tx.size as i32)
+                    .push_bind(tx.fee.unwrap_or(0))
+                    .push_bind(tx.transparent_value_in)
+                    .push_bind(tx.transparent_value_out)
+                    .push_bind(tx.sapling_spends as i32)
+                    .push_bind(tx.sapling_outputs as i32)
+                    .push_bind(tx.orchard_actions as i32)
+                    .push_bind(tx.sapling_value_balance)
+                    .push_bind(tx.orchard_value_balance)
+                    .push_bind(is_coinbase)
+                    .push_bind(has_sapling)
+                    .push_bind(has_orchard)
+                    .push_bind(tx.vin_count as i32)
+                    .push_bind(tx.vout_count as i32)
+                    .push_bind(timestamp as i64)
+                    .push_bind((tx_index_offset + index) as i32)
+                    .push_bind(tx.ironwood_actions as i32)
+                    .push_bind(tx.ironwood_value_balance)
+                    .push_bind(has_ironwood)
+                    .push_bind(value_balance)
+                    .push_bind(tx.expiry_height.map(|height| height as i32))
+                    .push_bind(tx.sapling_spends as i32)
+                    .push_bind(tx.sapling_outputs as i32)
+                    .push_bind(tx.joinsplit_count as i32)
+                    .push_bind(has_sprout);
+            });
+            query.push(
+                r#"
+                ON CONFLICT (txid) DO UPDATE SET
+                    block_height = EXCLUDED.block_height,
+                    block_hash = EXCLUDED.block_hash,
+                    fee = EXCLUDED.fee,
+                    total_input = EXCLUDED.total_input,
+                    total_output = EXCLUDED.total_output,
+                    is_coinbase = EXCLUDED.is_coinbase,
+                    tx_index = EXCLUDED.tx_index,
+                    ironwood_actions = EXCLUDED.ironwood_actions,
+                    value_balance_ironwood = EXCLUDED.value_balance_ironwood,
+                    has_ironwood = EXCLUDED.has_ironwood,
+                    value_balance = EXCLUDED.value_balance,
+                    locktime = EXCLUDED.locktime,
+                    expiry_height = EXCLUDED.expiry_height,
+                    sapling_spend_count = EXCLUDED.sapling_spend_count,
+                    sapling_output_count = EXCLUDED.sapling_output_count,
+                    sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count,
+                    has_sprout = EXCLUDED.has_sprout
+                "#,
+            );
+            query.build().execute(&mut **db_tx).await?;
+        }
+
+        let outputs: Vec<_> = transactions
+            .iter()
+            .flat_map(|tx| tx.vout.iter().map(move |output| (&tx.txid, output)))
+            .collect();
+        const OUTPUT_CHUNK_SIZE: usize = 10_000;
+        for chunk in outputs.chunks(OUTPUT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO transaction_outputs (txid, vout_index, value, address, script_type) ",
+            );
+            query.push_values(chunk, |mut row, (txid, output)| {
+                row.push_bind(*txid)
+                    .push_bind(output.n as i32)
+                    .push_bind(output.value)
+                    .push_bind(&output.address)
+                    .push_bind(&output.script_type);
+            });
+            query.push(
+                r#"
+                ON CONFLICT (txid, vout_index) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    address = EXCLUDED.address,
+                    script_type = EXCLUDED.script_type
+                "#,
+            );
+            query.build().execute(&mut **db_tx).await?;
+        }
+
+        let inputs: Vec<_> = transactions
+            .iter()
+            .flat_map(|tx| {
+                tx.vin
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, input)| !input.is_coinbase)
+                    .map(move |(index, input)| (&tx.txid, index, input))
+            })
+            .collect();
+        const INPUT_CHUNK_SIZE: usize = 10_000;
+        for chunk in inputs.chunks(INPUT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO transaction_inputs (txid, vout_index, prev_txid, prev_vout, address, value) ",
+            );
+            query.push_values(chunk, |mut row, (txid, index, input)| {
+                row.push_bind(*txid)
+                    .push_bind(*index as i32)
+                    .push_bind(&input.txid)
+                    .push_bind(input.vout as i32)
+                    .push_bind(&input.address)
+                    .push_bind(input.value);
+            });
+            query.push(
+                r#"
+                ON CONFLICT (txid, vout_index) DO UPDATE SET
+                    address = EXCLUDED.address,
+                    value = EXCLUDED.value
+                "#,
+            );
+            query.build().execute(&mut **db_tx).await?;
+        }
+
+        struct AddressTransactionRow<'a> {
+            address: &'a str,
+            txid: &'a str,
+            block_height: i32,
+            tx_index: i32,
+            value_in: i64,
+            value_out: i64,
+        }
+
+        let mut address_transactions = Vec::new();
+        for (tx_index, tx) in transactions.iter().enumerate() {
+            use std::collections::HashMap;
+            let mut addresses: HashMap<&str, (i64, i64)> = HashMap::new();
+
+            for output in &tx.vout {
+                if let Some(address) = output.address.as_deref() {
+                    addresses.entry(address).or_insert((0, 0)).1 += output.value;
+                }
+            }
+            for input in &tx.vin {
+                if !input.is_coinbase {
+                    if let Some(address) = input.address.as_deref() {
+                        addresses.entry(address).or_insert((0, 0)).0 += input.value.unwrap_or(0);
+                    }
+                }
+            }
+
+            address_transactions.extend(addresses.into_iter().map(
+                |(address, (value_in, value_out))| AddressTransactionRow {
+                    address,
+                    txid: &tx.txid,
+                    block_height: tx.block_height as i32,
+                    tx_index: tx_index as i32,
+                    value_in,
+                    value_out,
+                },
+            ));
+        }
+
+        const ADDRESS_TX_CHUNK_SIZE: usize = 7_000;
+        for chunk in address_transactions.chunks(ADDRESS_TX_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO address_transactions (
+                    address, txid, block_height, tx_index, block_time,
+                    is_input, is_output, value_in, value_out
+                ) "#,
+            );
+            query.push_values(chunk, |mut row, item| {
+                row.push_bind(item.address)
+                    .push_bind(item.txid)
+                    .push_bind(item.block_height)
+                    .push_bind(item.tx_index)
+                    .push_bind(timestamp as i64)
+                    .push_bind(item.value_in > 0)
+                    .push_bind(item.value_out > 0)
+                    .push_bind(item.value_in)
+                    .push_bind(item.value_out);
+            });
+            query.push(
+                r#"
+                ON CONFLICT (address, block_height, tx_index, txid)
+                DO UPDATE SET
+                    is_input = EXCLUDED.is_input OR address_transactions.is_input,
+                    is_output = EXCLUDED.is_output OR address_transactions.is_output,
+                    value_in = EXCLUDED.value_in,
+                    value_out = EXCLUDED.value_out
+                "#,
+            );
+            query.build().execute(&mut **db_tx).await?;
+        }
+
+        Ok(())
     }
 
     /// Batch insert with full block header info.
@@ -674,32 +914,39 @@ impl PostgresWriter {
             }
         }
 
-        // Upsert each address
-        for (address, stats) in &addr_map {
-            let tx_count = stats.txids.len() as i64;
-            let balance_delta = stats.total_received - stats.total_sent;
-
-            sqlx::query(
+        const ADDRESS_CHUNK_SIZE: usize = 8_000;
+        let address_rows: Vec<_> = addr_map.iter().collect();
+        for chunk in address_rows.chunks(ADDRESS_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
                 r#"
-                INSERT INTO addresses (address, balance, total_received, total_sent, tx_count, first_seen, last_seen, address_type)
-                VALUES ($1, $2, $3, $4, $5, $6, $6, 'transparent')
+                INSERT INTO addresses (
+                    address, balance, total_received, total_sent,
+                    tx_count, first_seen, last_seen, address_type
+                ) "#,
+            );
+            query.push_values(chunk, |mut row, (address, stats)| {
+                row.push_bind(*address)
+                    .push_bind(stats.total_received - stats.total_sent)
+                    .push_bind(stats.total_received)
+                    .push_bind(stats.total_sent)
+                    .push_bind(stats.txids.len() as i64)
+                    .push_bind(block_time as i64)
+                    .push_bind(block_time as i64)
+                    .push_bind("transparent");
+            });
+            query.push(
+                r#"
                 ON CONFLICT (address) DO UPDATE SET
-                    balance = addresses.balance + $2,
-                    total_received = addresses.total_received + $3,
-                    total_sent = addresses.total_sent + $4,
-                    tx_count = addresses.tx_count + $5,
-                    last_seen = $6,
+                    balance = addresses.balance + EXCLUDED.balance,
+                    total_received = addresses.total_received + EXCLUDED.total_received,
+                    total_sent = addresses.total_sent + EXCLUDED.total_sent,
+                    tx_count = addresses.tx_count + EXCLUDED.tx_count,
+                    first_seen = LEAST(addresses.first_seen, EXCLUDED.first_seen),
+                    last_seen = GREATEST(addresses.last_seen, EXCLUDED.last_seen),
                     updated_at = NOW()
-                "#
-            )
-            .bind(address)             // $1
-            .bind(balance_delta)       // $2 balance delta
-            .bind(stats.total_received) // $3
-            .bind(stats.total_sent)     // $4
-            .bind(tx_count)             // $5
-            .bind(block_time as i64)    // $6
-            .execute(&mut **db_tx)
-            .await?;
+                "#,
+            );
+            query.build().execute(&mut **db_tx).await?;
         }
 
         Ok(())
@@ -715,35 +962,36 @@ impl PostgresWriter {
             return Ok(0);
         }
 
-        let mut count = 0u64;
-
-        for flow in flows {
-            sqlx::query(
+        const FLOW_CHUNK_SIZE: usize = 8_000;
+        for chunk in flows.chunks(FLOW_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
                 r#"
                 INSERT INTO shielded_flows (
                     txid, block_height, block_time, flow_type, amount_zat, pool,
                     transparent_addresses, transparent_value_zat
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ) "#,
+            );
+            query.push_values(chunk, |mut row, flow| {
+                row.push_bind(&flow.txid)
+                    .push_bind(flow.block_height as i32)
+                    .push_bind(block_time as i32)
+                    .push_bind(&flow.flow_type)
+                    .push_bind(flow.amount)
+                    .push_bind(&flow.pool)
+                    .push_bind(&flow.transparent_addresses)
+                    .push_bind(flow.amount);
+            });
+            query.push(
+                r#"
                 ON CONFLICT (txid, flow_type) DO UPDATE SET
                     amount_zat = EXCLUDED.amount_zat,
                     transparent_addresses = EXCLUDED.transparent_addresses
                 "#,
-            )
-            .bind(&flow.txid)
-            .bind(flow.block_height as i32)
-            .bind(block_time as i32)
-            .bind(&flow.flow_type)
-            .bind(flow.amount)
-            .bind(&flow.pool)
-            .bind(&flow.transparent_addresses)
-            .bind(flow.amount)
-            .execute(&mut **db_tx)
-            .await?;
-
-            count += 1;
+            );
+            query.build().execute(&mut **db_tx).await?;
         }
 
-        Ok(count)
+        Ok(flows.len() as u64)
     }
 
     /// Batch insert flows.
@@ -787,13 +1035,13 @@ impl PostgresWriter {
                 WHERE txid = $1
                 "#,
             )
-            .bind(&tx.txid)                          // $1
-            .bind(tx.lock_time as i64)               // $2
+            .bind(&tx.txid) // $1
+            .bind(tx.lock_time as i64) // $2
             .bind(tx.expiry_height.map(|h| h as i32)) // $3
-            .bind(tx.sapling_spends as i32)          // $4
-            .bind(tx.sapling_outputs as i32)         // $5
-            .bind(tx.joinsplit_count as i32)          // $6
-            .bind(has_sprout)                         // $7
+            .bind(tx.sapling_spends as i32) // $4
+            .bind(tx.sapling_outputs as i32) // $5
+            .bind(tx.joinsplit_count as i32) // $6
+            .bind(has_sprout) // $7
             .execute(&mut *db_tx)
             .await?;
 
@@ -805,12 +1053,14 @@ impl PostgresWriter {
     }
 
     /// Get the stored block hash at a given height, if any.
-    pub async fn get_block_hash_at_height(&self, height: u32) -> Result<Option<String>, sqlx::Error> {
-        let result: Option<(String,)> =
-            sqlx::query_as("SELECT hash FROM blocks WHERE height = $1")
-                .bind(height as i64)
-                .fetch_optional(&self.pool)
-                .await?;
+    pub async fn get_block_hash_at_height(
+        &self,
+        height: u32,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let result: Option<(String,)> = sqlx::query_as("SELECT hash FROM blocks WHERE height = $1")
+            .bind(height as i64)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(result.map(|(h,)| h))
     }
 
@@ -818,16 +1068,18 @@ impl PostgresWriter {
     ///
     /// Uses txid-indexed deletes for performance on large tables.
     /// Reverses address balance deltas before deleting transaction data.
-    pub async fn rollback_from_height(&self, fork_height: u32, description: &str) -> Result<u32, sqlx::Error> {
+    pub async fn rollback_from_height(
+        &self,
+        fork_height: u32,
+        description: &str,
+    ) -> Result<u32, sqlx::Error> {
         let mut db_tx = self.pool.begin().await?;
 
         // Count blocks being rolled back
-        let orphan_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM blocks WHERE height >= $1"
-        )
-        .bind(fork_height as i64)
-        .fetch_one(&mut *db_tx)
-        .await?;
+        let orphan_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blocks WHERE height >= $1")
+            .bind(fork_height as i64)
+            .fetch_one(&mut *db_tx)
+            .await?;
         let orphan_count = orphan_count.0 as u32;
 
         if orphan_count == 0 {
@@ -877,7 +1129,7 @@ impl PostgresWriter {
                    WHERE txid IN (SELECT txid FROM transactions WHERE block_height >= $1)
                    GROUP BY address
                ) sub
-               WHERE addresses.address = sub.address"#
+               WHERE addresses.address = sub.address"#,
         )
         .bind(fork_height as i32)
         .execute(&mut *db_tx)
@@ -940,7 +1192,11 @@ impl PostgresWriter {
     /// After re-indexing replacement blocks, backfill canonical_hash on orphaned_blocks
     /// and remove false orphans (where the orphaned hash matches the new canonical hash,
     /// which happens during double-reorgs: A->B->A).
-    pub async fn finalize_orphans_after_reindex(&self, fork_height: u32, last_height: u32) -> Result<(), sqlx::Error> {
+    pub async fn finalize_orphans_after_reindex(
+        &self,
+        fork_height: u32,
+        last_height: u32,
+    ) -> Result<(), sqlx::Error> {
         // Backfill canonical_hash from the (now re-indexed) blocks table
         sqlx::query(
             r#"UPDATE orphaned_blocks ob
@@ -948,7 +1204,7 @@ impl PostgresWriter {
                FROM blocks b
                WHERE ob.height = b.height
                AND ob.canonical_hash IS NULL
-               AND ob.height >= $1 AND ob.height <= $2"#
+               AND ob.height >= $1 AND ob.height <= $2"#,
         )
         .bind(fork_height as i64)
         .bind(last_height as i64)
@@ -960,7 +1216,7 @@ impl PostgresWriter {
             r#"DELETE FROM orphaned_blocks
                WHERE canonical_hash IS NOT NULL
                AND hash = canonical_hash
-               AND height >= $1 AND height <= $2"#
+               AND height >= $1 AND height <= $2"#,
         )
         .bind(fork_height as i64)
         .bind(last_height as i64)
@@ -968,7 +1224,10 @@ impl PostgresWriter {
         .await?;
 
         if removed.rows_affected() > 0 {
-            println!("   🧹 Cleaned {} false orphan(s) from double-reorg", removed.rows_affected());
+            println!(
+                "   🧹 Cleaned {} false orphan(s) from double-reorg",
+                removed.rows_affected()
+            );
         }
 
         Ok(())
