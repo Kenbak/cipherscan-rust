@@ -915,7 +915,10 @@ impl PostgresWriter {
         }
 
         const ADDRESS_CHUNK_SIZE: usize = 8_000;
-        let address_rows: Vec<_> = addr_map.iter().collect();
+        let mut address_rows: Vec<_> = addr_map.iter().collect();
+        // Concurrent backfill workers can touch popular addresses in different
+        // blocks. A stable lock order prevents cross-block UPSERT deadlocks.
+        address_rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         for chunk in address_rows.chunks(ADDRESS_CHUNK_SIZE) {
             let mut query = QueryBuilder::<Postgres>::new(
                 r#"
