@@ -8,7 +8,7 @@ fi
 
 readonly START_HEIGHT="$1"
 readonly END_HEIGHT="$2"
-readonly WORKERS="${WORKERS:-8}"
+readonly WORKERS="${WORKERS:-12}"
 readonly CHUNK_SIZE="${CHUNK_SIZE:-50000}"
 readonly ROOT="${CIPHERSCAN_ROOT:-/root/cipherscan-rust}"
 readonly BINARY="${INDEXER_BINARY:-$ROOT/target/release/cipherscan-indexer}"

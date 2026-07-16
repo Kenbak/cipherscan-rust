@@ -1,0 +1,11 @@
+CREATE INDEX idx_shielded_flows_txid ON public.shielded_flows USING btree (txid);
+CREATE INDEX idx_transactions_block_tx ON public.transactions USING btree (block_height, tx_index);
+CREATE INDEX idx_tx_inputs_address ON public.transaction_inputs USING btree (address);
+CREATE INDEX idx_tx_inputs_txid ON public.transaction_inputs USING btree (txid);
+CREATE INDEX idx_tx_outputs_address ON public.transaction_outputs USING btree (address);
+CREATE INDEX idx_tx_outputs_txid ON public.transaction_outputs USING btree (txid);
+CREATE INDEX idx_tx_inputs_addr_created ON public.transaction_inputs USING btree (address, created_at DESC);
+CREATE INDEX idx_tx_inputs_prev_tx ON public.transaction_inputs USING btree (prev_txid, prev_vout);
+CREATE INDEX idx_tx_outputs_addr_created ON public.transaction_outputs USING btree (address, created_at DESC);
+CREATE INDEX idx_tx_outputs_address_unspent ON public.transaction_outputs USING btree (address, spent) WHERE (spent = false);
+CREATE INDEX idx_tx_outputs_spent ON public.transaction_outputs USING btree (spent);

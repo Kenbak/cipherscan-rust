@@ -1,7 +1,7 @@
 [Unit]
 Description=CipherScan Rust Indexer (Mainnet)
-After=network.target zebrad.service postgresql.service
-Wants=zebrad.service
+After=network-online.target postgresql.service zebrad-mainnet.service
+Wants=network-online.target zebrad-mainnet.service
 
 [Service]
 Type=simple
@@ -13,8 +13,9 @@ EnvironmentFile=/root/cipherscan-rust/.env
 
 ExecStart=/root/cipherscan-rust/target/release/cipherscan-indexer live
 
-Restart=always
-RestartSec=10
+Restart=on-failure
+RestartSec=30
+LimitNOFILE=65536
 
 # Logging
 StandardOutput=journal
