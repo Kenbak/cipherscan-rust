@@ -58,8 +58,13 @@ impl ZebraState {
         let cf_names = DB::list_cf(&Options::default(), path)
             .map_err(|e| format!("Failed to list column families: {}", e))?;
 
-        // Create secondary path for RocksDB secondary instance
-        let secondary_path = std::env::temp_dir().join("cipherscan-rocks-secondary");
+        // RocksDB secondary instances require an exclusive secondary directory.
+        // Include the PID so bounded parallel backfill workers can safely read the
+        // same Zebra primary without sharing lock or catch-up state.
+        let secondary_path = std::env::temp_dir().join(format!(
+            "cipherscan-rocks-secondary-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&secondary_path)
             .map_err(|e| format!("Failed to create secondary path: {}", e))?;
 
