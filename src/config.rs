@@ -24,6 +24,11 @@ pub struct Config {
     /// Zebra gRPC indexer URL (e.g. "http://127.0.0.1:8230")
     /// When set, enables instant block notifications instead of 30s polling
     pub zebra_grpc_url: Option<String>,
+
+    /// Maximum reorg depth the indexer will handle automatically.
+    /// Reorgs deeper than this require manual intervention (mainnet safety).
+    /// Testnet should use a higher value since deep reorgs are routine.
+    pub max_reorg_depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +46,7 @@ impl Default for Config {
             network: Network::Mainnet,
             max_open_files: 256,
             zebra_grpc_url: None,
+            max_reorg_depth: 100,
         }
     }
 }
@@ -85,6 +91,12 @@ impl Config {
                 } else {
                     format!("http://{}", url)
                 });
+            }
+        }
+
+        if let Ok(val) = env::var("MAX_REORG_DEPTH") {
+            if let Ok(n) = val.parse::<u32>() {
+                config.max_reorg_depth = n;
             }
         }
 

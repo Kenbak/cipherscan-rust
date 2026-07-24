@@ -11,7 +11,6 @@ use crate::db::{PostgresWriter, ZebraState};
 use crate::models::ShieldedFlow;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_REORG_DEPTH: u32 = 100;
 
 fn checkpoint_progress_height(
     current_height: u32,
@@ -182,8 +181,9 @@ impl Indexer {
             last_indexed, &db_hash[..16.min(db_hash.len())], &canonical_hash[..16.min(canonical_hash.len())]);
 
         // Walk backward to find the fork point (common ancestor)
+        let max_depth = self.config.max_reorg_depth;
         let mut fork_height = last_indexed;
-        for depth in 1..=MAX_REORG_DEPTH {
+        for depth in 1..=max_depth {
             let check_height = last_indexed.saturating_sub(depth);
             if check_height == 0 {
                 break;
@@ -211,9 +211,9 @@ impl Indexer {
                 break;
             }
 
-            if depth == MAX_REORG_DEPTH {
+            if depth == max_depth {
                 return Err(format!(
-                    "Reorg deeper than {} blocks — manual intervention required", MAX_REORG_DEPTH
+                    "Reorg deeper than {} blocks — manual intervention required", max_depth
                 ));
             }
         }

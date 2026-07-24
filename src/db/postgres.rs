@@ -1103,11 +1103,11 @@ impl PostgresWriter {
         .fetch_one(&mut *db_tx)
         .await?;
 
-        // Archive orphaned blocks (include roots for anchor debugging)
+        // Archive orphaned blocks (include roots for anchor debugging + coinbase for miner fingerprinting)
         sqlx::query(
-            r#"INSERT INTO orphaned_blocks (height, hash, timestamp, transaction_count, size, difficulty, miner_address, previous_block_hash, final_sapling_root, final_orchard_root, fork_event_id, source)
-               SELECT height, hash, timestamp, transaction_count, size, difficulty::text, miner_address, previous_block_hash, final_sapling_root, final_orchard_root, $1, 'indexer'
-               FROM blocks WHERE height >= $2
+            r#"INSERT INTO orphaned_blocks (height, hash, timestamp, transaction_count, size, difficulty, miner_address, previous_block_hash, final_sapling_root, final_orchard_root, coinbase_hex, fork_event_id, source)
+               SELECT b.height, b.hash, b.timestamp, b.transaction_count, b.size, b.difficulty::text, b.miner_address, b.previous_block_hash, b.final_sapling_root, b.final_orchard_root, b.coinbase_hex, $1, 'indexer'
+               FROM blocks b WHERE b.height >= $2
                ON CONFLICT (hash) DO NOTHING"#
         )
         .bind(fork_event_id.0)
