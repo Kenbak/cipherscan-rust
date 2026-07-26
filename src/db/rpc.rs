@@ -192,4 +192,9 @@ impl ZebraRpc {
         self.call("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
             .await
     }
+
+    /// Get blockchain info (includes valuePools with authoritative pool balances)
+    pub async fn get_blockchain_info(&self) -> Result<serde_json::Value, String> {
+        self.call("getblockchaininfo", vec![]).await
+    }
 }

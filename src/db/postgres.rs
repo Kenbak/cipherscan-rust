@@ -1235,4 +1235,45 @@ impl PostgresWriter {
 
         Ok(())
     }
+
+    /// Insert a boundary pool snapshot (authoritative Zebra pool sizes at a 256-block boundary).
+    /// Uses ON CONFLICT to allow idempotent re-inserts (e.g. after reorg re-indexing).
+    pub async fn insert_boundary_pool_snapshot(
+        &self,
+        boundary_height: u32,
+        block_time: i64,
+        orchard_zat: i64,
+        ironwood_zat: i64,
+        sapling_zat: i64,
+        sprout_zat: i64,
+        transparent_zat: Option<i64>,
+        chain_supply_zat: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"INSERT INTO boundary_pool_snapshots
+                 (boundary_height, block_time, orchard_zat, ironwood_zat,
+                  sapling_zat, sprout_zat, transparent_zat, chain_supply_zat)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (boundary_height)
+               DO UPDATE SET
+                 block_time = EXCLUDED.block_time,
+                 orchard_zat = EXCLUDED.orchard_zat,
+                 ironwood_zat = EXCLUDED.ironwood_zat,
+                 sapling_zat = EXCLUDED.sapling_zat,
+                 sprout_zat = EXCLUDED.sprout_zat,
+                 transparent_zat = EXCLUDED.transparent_zat,
+                 chain_supply_zat = EXCLUDED.chain_supply_zat"#,
+        )
+        .bind(boundary_height as i64)
+        .bind(block_time)
+        .bind(orchard_zat)
+        .bind(ironwood_zat)
+        .bind(sapling_zat)
+        .bind(sprout_zat)
+        .bind(transparent_zat)
+        .bind(chain_supply_zat)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }

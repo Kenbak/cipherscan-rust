@@ -523,6 +523,69 @@ impl Indexer {
         Ok((tx_count, flow_count as u32))
     }
 
+    /// Capture authoritative Zebra pool sizes at a 256-block boundary height.
+    async fn capture_boundary_snapshot(
+        &self,
+        rpc: &crate::db::ZebraRpc,
+        height: u32,
+    ) -> Result<(), String> {
+        let info = rpc.get_blockchain_info().await?;
+        let value_pools = info.get("valuePools")
+            .and_then(|v| v.as_array())
+            .ok_or("Missing valuePools in getblockchaininfo")?;
+
+        let mut orchard: i64 = 0;
+        let mut ironwood: i64 = 0;
+        let mut sapling: i64 = 0;
+        let mut sprout: i64 = 0;
+        let mut transparent: Option<i64> = None;
+
+        for pool in value_pools {
+            let id = pool.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let zat = pool.get("chainValueZat")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            match id {
+                "orchard" => orchard = zat,
+                "ironwood" => ironwood = zat,
+                "sapling" => sapling = zat,
+                "sprout" => sprout = zat,
+                "transparent" => transparent = Some(zat),
+                _ => {}
+            }
+        }
+
+        let chain_supply = info.get("chainSupply")
+            .and_then(|v| v.get("chainValueZat"))
+            .and_then(|v| v.as_i64());
+
+        // Get block time for this boundary height
+        let block_info = rpc.get_block_by_height(height as u64).await?;
+
+        self.postgres
+            .insert_boundary_pool_snapshot(
+                height,
+                block_info.time as i64,
+                orchard,
+                ironwood,
+                sapling,
+                sprout,
+                transparent,
+                chain_supply,
+            )
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
+
+        println!("   📊 Boundary snapshot at {} | O:{} I:{} S:{} Sp:{}",
+            height,
+            orchard / 100_000_000,
+            ironwood / 100_000_000,
+            sapling / 100_000_000,
+            sprout / 100_000_000,
+        );
+        Ok(())
+    }
+
     /// Run live mode (follow chain tip)
     /// Uses gRPC streaming for instant block notifications when available,
     /// falls back to 30s JSON-RPC polling otherwise.
@@ -654,6 +717,12 @@ impl Indexer {
                             if failure_state_active {
                                 self.clear_failure_state().await?;
                                 failure_state_active = false;
+                            }
+                            // Capture authoritative pool snapshot at 256-block boundaries
+                            if height % 256 == 0 {
+                                if let Err(e) = self.capture_boundary_snapshot(&rpc, height).await {
+                                    println!("   ⚠️ Boundary snapshot error at {}: {}", height, e);
+                                }
                             }
                         }
                         Err(e) => {
