@@ -1115,6 +1115,59 @@ impl PostgresWriter {
         .execute(&mut *db_tx)
         .await?;
 
+        // Archive orphaned transactions before deletion
+        sqlx::query(
+            r#"INSERT INTO orphaned_transactions (
+                   txid, block_height, block_hash, "timestamp", tx_index, version, locktime,
+                   expiry_height, size, fee, is_coinbase,
+                   vin_count, vout_count, total_input, total_output,
+                   has_sapling, has_orchard, has_sprout, has_ironwood, has_shielded_data,
+                   sapling_spend_count, sapling_output_count, orchard_actions, ironwood_actions,
+                   sprout_joinsplit_count,
+                   value_balance, value_balance_sapling, value_balance_orchard, value_balance_ironwood,
+                   flow_type, privacy_score, fork_event_id
+               )
+               SELECT
+                   t.txid, t.block_height, t.block_hash, t.timestamp, t.tx_index, t.version, t.locktime,
+                   t.expiry_height, t.size, t.fee, t.is_coinbase,
+                   t.vin_count, t.vout_count, t.total_input, t.total_output,
+                   t.has_sapling, t.has_orchard, t.has_sprout, t.has_ironwood, t.has_shielded_data,
+                   t.sapling_spend_count, t.sapling_output_count, t.orchard_actions, t.ironwood_actions,
+                   t.sprout_joinsplit_count,
+                   t.value_balance, t.value_balance_sapling, t.value_balance_orchard, t.value_balance_ironwood,
+                   t.flow_type, t.privacy_score, $1
+               FROM transactions t WHERE t.block_height >= $2
+               ON CONFLICT (txid, block_hash) DO NOTHING"#
+        )
+        .bind(fork_event_id.0)
+        .bind(fork_height as i64)
+        .execute(&mut *db_tx)
+        .await?;
+
+        // Archive transparent inputs for orphaned transactions
+        sqlx::query(
+            r#"INSERT INTO orphaned_transaction_inputs (txid, block_hash, vout_index, prev_txid, prev_vout, address, value, coinbase)
+               SELECT ti.txid, t.block_hash, ti.vout_index, ti.prev_txid, ti.prev_vout, ti.address, ti.value, ti.coinbase
+               FROM transaction_inputs ti
+               JOIN transactions t ON ti.txid = t.txid
+               WHERE t.block_height >= $1"#
+        )
+        .bind(fork_height as i64)
+        .execute(&mut *db_tx)
+        .await?;
+
+        // Archive transparent outputs for orphaned transactions
+        sqlx::query(
+            r#"INSERT INTO orphaned_transaction_outputs (txid, block_hash, vout_index, value, address, script_type)
+               SELECT to2.txid, t.block_hash, to2.vout_index, to2.value, to2.address, to2.script_type
+               FROM transaction_outputs to2
+               JOIN transactions t ON to2.txid = t.txid
+               WHERE t.block_height >= $1"#
+        )
+        .bind(fork_height as i64)
+        .execute(&mut *db_tx)
+        .await?;
+
         // Reverse address balance deltas using txid index (fast path)
         sqlx::query(
             r#"UPDATE addresses SET
