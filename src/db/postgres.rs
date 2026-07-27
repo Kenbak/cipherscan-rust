@@ -1105,8 +1105,8 @@ impl PostgresWriter {
 
         // Archive orphaned blocks (include roots for anchor debugging + coinbase for miner fingerprinting)
         sqlx::query(
-            r#"INSERT INTO orphaned_blocks (height, hash, timestamp, transaction_count, size, difficulty, miner_address, previous_block_hash, final_sapling_root, final_orchard_root, coinbase_hex, fork_event_id, source)
-               SELECT b.height, b.hash, b.timestamp, b.transaction_count, b.size, b.difficulty::text, b.miner_address, b.previous_block_hash, b.final_sapling_root, b.final_orchard_root, b.coinbase_hex, $1, 'indexer'
+            r#"INSERT INTO orphaned_blocks (height, hash, timestamp, transaction_count, size, difficulty, miner_address, previous_block_hash, final_sapling_root, final_orchard_root, coinbase_hex, fork_event_id, source, first_indexed_at)
+               SELECT b.height, b.hash, b.timestamp, b.transaction_count, b.size, b.difficulty::text, b.miner_address, b.previous_block_hash, b.final_sapling_root, b.final_orchard_root, b.coinbase_hex, $1, 'indexer', b.created_at
                FROM blocks b WHERE b.height >= $2
                ON CONFLICT (hash) DO NOTHING"#
         )
@@ -1125,7 +1125,7 @@ impl PostgresWriter {
                    sapling_spend_count, sapling_output_count, orchard_actions, ironwood_actions,
                    sprout_joinsplit_count,
                    value_balance, value_balance_sapling, value_balance_orchard, value_balance_ironwood,
-                   flow_type, privacy_score, fork_event_id
+                   flow_type, privacy_score, fork_event_id, first_indexed_at
                )
                SELECT
                    t.txid, t.block_height, t.block_hash, t.timestamp, t.tx_index, t.version, t.locktime,
@@ -1135,7 +1135,7 @@ impl PostgresWriter {
                    t.sapling_spend_count, t.sapling_output_count, t.orchard_actions, t.ironwood_actions,
                    t.sprout_joinsplit_count,
                    t.value_balance, t.value_balance_sapling, t.value_balance_orchard, t.value_balance_ironwood,
-                   t.flow_type, t.privacy_score, $1
+                   t.flow_type, t.privacy_score, $1, t.created_at
                FROM transactions t WHERE t.block_height >= $2
                ON CONFLICT (txid, block_hash) DO NOTHING"#
         )
