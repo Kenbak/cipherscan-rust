@@ -35,8 +35,8 @@ cargo build --release
 Create a `.env` file or set environment variables:
 
 ```bash
-# Required: Path to Zebra's RocksDB state
-ZEBRA_STATE_PATH=/root/.cache/zebra/state/v27/mainnet
+# Required: Path to Zebra/Zakura's RocksDB state
+ZEBRA_STATE_PATH=~/.cache/zebra/state/v28/mainnet
 
 # Required: PostgreSQL connection URL
 DATABASE_URL=postgres://user:password@localhost/zcash_explorer
@@ -48,8 +48,8 @@ NETWORK=mainnet
 ZEBRA_GRPC_URL=http://127.0.0.1:8230
 
 # Optional: Telegram alerting for health checks
-TELEGRAM_BOT_TOKEN=123456:abc123
-TELEGRAM_CHAT_ID=123456789
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
 
 # Optional: health thresholds and repeat cooldown
 INDEXER_MAX_LAG=3
@@ -257,8 +257,8 @@ The monitoring path is optimized to avoid reopening RocksDB on each run. `health
 ```bash
 sudo cp deploy/cipherscan-rust-health.service /etc/systemd/system/
 sudo cp deploy/cipherscan-rust-health.timer /etc/systemd/system/
-sudo cp deploy/check-indexer-health.sh /root/cipherscan-rust/deploy/
-sudo chmod +x /root/cipherscan-rust/deploy/check-indexer-health.sh
+sudo cp deploy/check-indexer-health.sh $INSTALL_DIR/deploy/
+sudo chmod +x $INSTALL_DIR/deploy/check-indexer-health.sh
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now cipherscan-rust-health.timer
@@ -267,11 +267,11 @@ sudo systemctl status cipherscan-rust-health.timer
 
 ### Telegram Setup
 
-Add these to `/root/cipherscan-rust/.env`:
+Add these to your `.env` file:
 
 ```bash
-TELEGRAM_BOT_TOKEN=123456:abc123
-TELEGRAM_CHAT_ID=123456789
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
 INDEXER_MAX_LAG=3
 INDEXER_MAX_CONSECUTIVE_FAILURES=0
 INDEXER_MAX_HEARTBEAT_AGE_SECONDS=600
@@ -311,7 +311,7 @@ RUST_LOG=debug cargo run -- status
 
 ## License
 
-MIT License - see LICENSE file.
+AGPL-3.0 + Commons Clause - see [LICENSE](LICENSE) file.
 
 ## Related Projects
 

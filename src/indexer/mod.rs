@@ -1,6 +1,5 @@
 //! Indexer module - main indexing logic
 
-mod blocks;
 mod flows;
 mod transactions;
 

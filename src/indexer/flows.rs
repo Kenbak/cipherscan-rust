@@ -1,99 +1,14 @@
 //! Flow analysis logic
 //!
-//! Analyzes transactions to detect and classify shielded flows.
-
-use crate::models::{Transaction, ShieldedFlow, FlowType, Pool};
-
-/// Flow analyzer
-pub struct FlowAnalyzer;
-
-impl FlowAnalyzer {
-    /// Analyze a transaction and extract all flows
-    pub fn analyze(tx: &Transaction) -> Vec<ShieldedFlow> {
-        ShieldedFlow::from_transaction(tx)
-    }
-
-    /// Classify a transaction's primary flow type
-    pub fn classify(tx: &Transaction) -> Option<FlowType> {
-        if tx.is_coinbase() {
-            return None;
-        }
-
-        // Check for pool migration first — any two shielded pools with
-        // opposing value balance signs and no transparent I/O.
-        if tx.vin_count == 0 && tx.vout_count == 0 && tx.has_shielded() {
-            let balances = [
-                tx.sapling_value_balance,
-                tx.orchard_value_balance,
-                tx.ironwood_value_balance,
-            ];
-            let has_positive = balances.iter().any(|&b| b > 0);
-            let has_negative = balances.iter().any(|&b| b < 0);
-            if has_positive && has_negative {
-                return Some(FlowType::PoolMigration);
-            }
-        }
-
-        // Fully shielded
-        if tx.is_fully_shielded() {
-            return Some(FlowType::FullyShielded);
-        }
-
-        // Shielding
-        if tx.is_shielding() {
-            return Some(FlowType::Shield);
-        }
-
-        // Deshielding
-        if tx.is_deshielding() {
-            return Some(FlowType::Deshield);
-        }
-
-        None
-    }
-
-    /// Determine which pools are involved in a transaction
-    pub fn involved_pools(tx: &Transaction) -> Vec<Pool> {
-        let mut pools = Vec::new();
-
-        if tx.joinsplit_count > 0 {
-            pools.push(Pool::Sprout);
-        }
-        if tx.sapling_spends > 0 || tx.sapling_outputs > 0 || tx.sapling_value_balance != 0 {
-            pools.push(Pool::Sapling);
-        }
-        if tx.orchard_actions > 0 || tx.orchard_value_balance != 0 {
-            pools.push(Pool::Orchard);
-        }
-        if tx.ironwood_actions > 0 || tx.ironwood_value_balance != 0 {
-            pools.push(Pool::Ironwood);
-        }
-
-        pools
-    }
-
-    /// Calculate the net flow amount for a pool
-    pub fn net_flow_amount(tx: &Transaction, pool: Pool) -> i64 {
-        match pool {
-            Pool::Sprout => 0,
-            Pool::Sapling => tx.sapling_value_balance,
-            Pool::Orchard => tx.orchard_value_balance,
-            Pool::Ironwood => tx.ironwood_value_balance,
-        }
-    }
-
-    /// Check if a transaction involves cross-pool activity
-    pub fn is_cross_pool(tx: &Transaction) -> bool {
-        let pools = Self::involved_pools(tx);
-        pools.len() > 1
-    }
-}
+//! Flow extraction is handled by `ShieldedFlow::from_transaction` in the
+//! models layer. This module is retained for tests that exercise the flow
+//! classification pipeline end-to-end.
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::models::{FlowType, ShieldedFlow, Transaction, TransparentInput};
 
-    fn create_test_tx() -> Transaction {
+    fn create_shielding_tx() -> Transaction {
         Transaction {
             txid: "test".to_string(),
             block_height: 1000,
@@ -115,29 +30,28 @@ mod tests {
             orchard_value_balance: 0,
             ironwood_value_balance: 0,
             fee: Some(1000),
-            vin: vec![],
+            vin: vec![TransparentInput {
+                txid: "prev".to_string(),
+                vout: 0,
+                script_sig: None,
+                address: Some("t1addr".to_string()),
+                value: Some(10000000),
+                is_coinbase: false,
+            }],
             vout: vec![],
         }
     }
 
     #[test]
-    fn test_classify_shielding() {
-        let tx = create_test_tx();
-        assert_eq!(FlowAnalyzer::classify(&tx), Some(FlowType::Shield));
+    fn shielding_tx_produces_shield_flow() {
+        let tx = create_shielding_tx();
+        let flows = ShieldedFlow::from_transaction(&tx);
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].flow_type, FlowType::Shield.as_str());
     }
 
     #[test]
-    fn test_involved_pools() {
-        let mut tx = create_test_tx();
-        tx.orchard_actions = 2;
-
-        let pools = FlowAnalyzer::involved_pools(&tx);
-        assert!(pools.contains(&Pool::Sapling));
-        assert!(pools.contains(&Pool::Orchard));
-    }
-
-    #[test]
-    fn test_classify_orchard_to_ironwood_migration() {
+    fn orchard_to_ironwood_migration_produces_no_flow() {
         let tx = Transaction {
             txid: "migration".to_string(),
             block_height: 4200000,
@@ -163,6 +77,7 @@ mod tests {
             vout: vec![],
         };
 
-        assert_eq!(FlowAnalyzer::classify(&tx), Some(FlowType::PoolMigration));
+        let flows = ShieldedFlow::from_transaction(&tx);
+        assert!(flows.is_empty());
     }
 }

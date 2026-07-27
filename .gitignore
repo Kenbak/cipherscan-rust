@@ -13,11 +13,15 @@
 
 # Environment
 .env
-.env.local
+.env.*
+!.env.example
+
+# Secrets
+*.pem
+*.key
 
 # macOS
 .DS_Store
-
 
 # Cursor IDE
 .cursor/

@@ -61,10 +61,10 @@ impl TransactionParser {
 
         // Parse transparent inputs
         let mut vin: Vec<TransparentInput> = Vec::new();
-        let mut transparent_value_in: i64 = 0;
+        let transparent_value_in: i64 = 0;
         let mut is_coinbase = false;
 
-        for (i, input) in inputs.iter().enumerate() {
+        for input in inputs.iter() {
             use zebra_chain::transparent::Input;
             match input {
                 Input::Coinbase { data, .. } => {
@@ -97,7 +97,9 @@ impl TransactionParser {
 
         for (n, output) in outputs.iter().enumerate() {
             let value_zat = i64::from(output.value);
-            transparent_value_out += value_zat;
+            transparent_value_out = transparent_value_out
+                .checked_add(value_zat)
+                .ok_or_else(|| format!("Overflow in transparent_value_out at output {}", n))?;
 
             // Try to get address from lock script
             let (address, script_type) = Self::parse_output_script(&output.lock_script, network);

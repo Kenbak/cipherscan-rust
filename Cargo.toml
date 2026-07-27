@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Fast Rust indexer for CipherScan - reads directly from Zebra's RocksDB"
 authors = ["CipherScan"]
+license = "AGPL-3.0"
 
 [dependencies]
 # Async runtime
@@ -26,9 +27,7 @@ zebra-chain = { git = "https://github.com/ZcashFoundation/zebra", tag = "v6.0.0"
 clap = { version = "4", features = ["derive", "env"] }
 
 # Utils
-chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
-thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

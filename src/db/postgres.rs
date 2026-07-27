@@ -3,7 +3,7 @@
 //! Writes processed blockchain data to PostgreSQL for querying.
 //! Uses UPSERT (INSERT ON CONFLICT) to allow parallel backfill and live indexing.
 
-use crate::models::{ShieldedFlow, Transaction, TransparentInput, TransparentOutput};
+use crate::models::{ShieldedFlow, Transaction};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 
 /// PostgreSQL connection and writer
@@ -22,222 +22,6 @@ impl PostgresWriter {
         tracing::info!("Connected to PostgreSQL");
 
         Ok(Self { pool })
-    }
-
-    /// Get the connection pool
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
-    /// Get the last indexed block height
-    pub async fn get_last_indexed_height(&self) -> Result<Option<u32>, sqlx::Error> {
-        let result: Option<(i64,)> = sqlx::query_as("SELECT MAX(height) FROM blocks")
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(result.and_then(|(h,)| Some(h as u32)))
-    }
-
-    /// Insert or update a block (matches actual schema)
-    pub async fn upsert_block(
-        &self,
-        height: u32,
-        hash: &str,
-        timestamp: u64,
-        tx_count: u32,
-        size: Option<u32>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            INSERT INTO blocks (height, hash, timestamp, transaction_count, size)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (height) DO UPDATE SET
-                hash = EXCLUDED.hash,
-                timestamp = EXCLUDED.timestamp,
-                transaction_count = EXCLUDED.transaction_count,
-                size = COALESCE(EXCLUDED.size, blocks.size)
-            "#,
-        )
-        .bind(height as i64)
-        .bind(hash)
-        .bind(timestamp as i64)
-        .bind(tx_count as i32)
-        .bind(size.map(|s| s as i32))
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Insert or update a transaction (matches actual schema)
-    pub async fn upsert_transaction(
-        &self,
-        tx: &Transaction,
-        block_time: u64,
-    ) -> Result<(), sqlx::Error> {
-        // Determine flags
-        let has_sapling = tx.sapling_spends > 0 || tx.sapling_outputs > 0;
-        let has_orchard = tx.orchard_actions > 0;
-        let has_sprout = tx.joinsplit_count > 0;
-        let has_ironwood = tx.ironwood_actions > 0;
-        let is_coinbase = tx.vin.first().map(|v| v.is_coinbase).unwrap_or(false);
-
-        sqlx::query(
-            r#"
-            INSERT INTO transactions (
-                txid, block_height, block_hash, timestamp, version, locktime,
-                size, fee, total_input, total_output,
-                shielded_spends, shielded_outputs, orchard_actions,
-                value_balance, value_balance_sapling, value_balance_orchard,
-                is_coinbase, has_sapling, has_orchard, has_sprout,
-                vin_count, vout_count, tx_index, block_time,
-                expiry_height, sapling_spend_count, sapling_output_count, sprout_joinsplit_count,
-                ironwood_actions, value_balance_ironwood, has_ironwood
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, $28,
-                $29, $30, $31
-            )
-            ON CONFLICT (txid) DO UPDATE SET
-                block_height = EXCLUDED.block_height,
-                expiry_height = EXCLUDED.expiry_height,
-                sapling_spend_count = EXCLUDED.sapling_spend_count,
-                sapling_output_count = EXCLUDED.sapling_output_count,
-                sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count,
-                ironwood_actions = EXCLUDED.ironwood_actions,
-                value_balance_ironwood = EXCLUDED.value_balance_ironwood,
-                has_ironwood = EXCLUDED.has_ironwood
-            "#,
-        )
-        .bind(&tx.txid) // $1
-        .bind(tx.block_height as i64) // $2
-        .bind(&tx.block_hash) // $3
-        .bind(block_time as i64) // $4
-        .bind(tx.version) // $5
-        .bind(tx.lock_time as i64) // $6
-        .bind(tx.size as i32) // $7
-        .bind(tx.fee.unwrap_or(0)) // $8
-        .bind(tx.transparent_value_in) // $9
-        .bind(tx.transparent_value_out) // $10
-        .bind(tx.sapling_spends as i32) // $11
-        .bind(tx.sapling_outputs as i32) // $12
-        .bind(tx.orchard_actions as i32) // $13
-        .bind(tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance) // $14 value_balance
-        .bind(tx.sapling_value_balance) // $15
-        .bind(tx.orchard_value_balance) // $16
-        .bind(is_coinbase) // $17
-        .bind(has_sapling) // $18
-        .bind(has_orchard) // $19
-        .bind(has_sprout) // $20
-        .bind(tx.vin_count as i32) // $21
-        .bind(tx.vout_count as i32) // $22
-        .bind::<Option<i32>>(None) // $23 tx_index (not stored in our model yet)
-        .bind(block_time as i64) // $24
-        .bind(tx.expiry_height.map(|h| h as i32)) // $25
-        .bind(tx.sapling_spends as i32) // $26
-        .bind(tx.sapling_outputs as i32) // $27
-        .bind(tx.joinsplit_count as i32) // $28
-        .bind(tx.ironwood_actions as i32) // $29
-        .bind(tx.ironwood_value_balance) // $30
-        .bind(has_ironwood) // $31
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Insert transaction outputs (vout)
-    pub async fn insert_outputs(
-        &self,
-        txid: &str,
-        outputs: &[TransparentOutput],
-    ) -> Result<(), sqlx::Error> {
-        for output in outputs {
-            sqlx::query(
-                r#"
-                INSERT INTO transaction_outputs (txid, vout_index, value, address, script_pubkey, script_type)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (txid, vout_index) DO UPDATE SET
-                    value = EXCLUDED.value,
-                    address = EXCLUDED.address,
-                    script_type = EXCLUDED.script_type
-                "#
-            )
-            .bind(txid)
-            .bind(output.n as i32)
-            .bind(output.value)
-            .bind(&output.address)
-            .bind(&output.script_pub_key)
-            .bind(&output.script_type)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Insert transaction inputs (vin)
-    pub async fn insert_inputs(
-        &self,
-        txid: &str,
-        inputs: &[TransparentInput],
-    ) -> Result<(), sqlx::Error> {
-        for (i, input) in inputs.iter().enumerate() {
-            if input.is_coinbase {
-                // Skip coinbase inputs or insert with special handling
-                continue;
-            }
-
-            sqlx::query(
-                r#"
-                INSERT INTO transaction_inputs (txid, vout_index, prev_txid, prev_vout, address, value)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT DO NOTHING
-                "#
-            )
-            .bind(txid)
-            .bind(i as i32)
-            .bind(&input.txid)
-            .bind(input.vout as i32)
-            .bind(&input.address)
-            .bind(input.value)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Insert or update a shielded flow (matches actual schema)
-    pub async fn upsert_flow(
-        &self,
-        flow: &ShieldedFlow,
-        block_time: u64,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            INSERT INTO shielded_flows (
-                txid, block_height, block_time, flow_type, amount_zat, pool,
-                transparent_addresses, transparent_value_zat
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (txid, flow_type) DO UPDATE SET
-                amount_zat = EXCLUDED.amount_zat,
-                transparent_addresses = EXCLUDED.transparent_addresses
-            "#,
-        )
-        .bind(&flow.txid)
-        .bind(flow.block_height as i32)
-        .bind(block_time as i32)
-        .bind(&flow.flow_type)
-        .bind(flow.amount)
-        .bind(&flow.pool)
-        .bind(&flow.transparent_addresses)
-        .bind(flow.amount) // transparent_value_zat = amount for now
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
     }
 
     /// Update indexer state (checkpoint)
@@ -294,32 +78,6 @@ impl PostgresWriter {
             Some(v) => Ok(v.parse().ok()),
             None => Ok(None),
         }
-    }
-
-    /// Batch insert for better performance (transactions in a DB transaction)
-    pub async fn batch_insert(
-        &self,
-        height: u32,
-        hash: &str,
-        timestamp: u64,
-        transactions: &[Transaction],
-    ) -> Result<u64, sqlx::Error> {
-        // Use default header (for backwards compatibility)
-        let header = crate::db::ParsedBlockHeader {
-            version: 4,
-            previous_block_hash: String::new(),
-            merkle_root: String::new(),
-            final_sapling_root: String::new(),
-            final_orchard_root: None,
-            final_ironwood_root: None,
-            time: timestamp,
-            bits: String::new(),
-            difficulty: 0.0,
-            nonce: String::new(),
-            solution: String::new(),
-        };
-        self.batch_insert_with_header(height, hash, timestamp, transactions, &header)
-            .await
     }
 
     /// Batch insert with full block header info and optional flows in one DB transaction.
@@ -442,7 +200,7 @@ impl PostgresWriter {
                 sqlx::query(
                     r#"
                 INSERT INTO transactions (
-                    txid, block_height, block_hash, timestamp, version, locktime,
+                    txid, block_height, block_hash, version, locktime,
                     size, fee, total_input, total_output,
                     shielded_spends, shielded_outputs, orchard_actions,
                     value_balance_sapling, value_balance_orchard,
@@ -452,10 +210,10 @@ impl PostgresWriter {
                     expiry_height, sapling_spend_count, sapling_output_count,
                     sprout_joinsplit_count, has_sprout
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                    $23, $24, $25, $26,
-                    $27, $28, $29, $30, $31
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                    $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
+                    $22, $23, $24, $25,
+                    $26, $27, $28, $29, $30
                 )
                 ON CONFLICT (txid) DO UPDATE SET
                     block_height = EXCLUDED.block_height,
@@ -480,36 +238,35 @@ impl PostgresWriter {
                 .bind(&tx.txid) // $1
                 .bind(tx.block_height as i64) // $2
                 .bind(&tx.block_hash) // $3
-                .bind(timestamp as i64) // $4
-                .bind(tx.version) // $5
-                .bind(tx.lock_time as i64) // $6
-                .bind(tx.size as i32) // $7
-                .bind(tx.fee.unwrap_or(0)) // $8
-                .bind(tx.transparent_value_in) // $9
-                .bind(tx.transparent_value_out) // $10
-                .bind(tx.sapling_spends as i32) // $11
-                .bind(tx.sapling_outputs as i32) // $12
-                .bind(tx.orchard_actions as i32) // $13
-                .bind(tx.sapling_value_balance) // $14
-                .bind(tx.orchard_value_balance) // $15
-                .bind(is_coinbase) // $16
-                .bind(has_sapling) // $17
-                .bind(has_orchard) // $18
-                .bind(tx.vin_count as i32) // $19
-                .bind(tx.vout_count as i32) // $20
-                .bind(timestamp as i64) // $21
-                .bind(tx_idx as i32) // $22
-                .bind(tx.ironwood_actions as i32) // $23
-                .bind(tx.ironwood_value_balance) // $24
-                .bind(has_ironwood) // $25
+                .bind(tx.version) // $4
+                .bind(tx.lock_time as i64) // $5
+                .bind(tx.size as i32) // $6
+                .bind(tx.fee.unwrap_or(0)) // $7
+                .bind(tx.transparent_value_in) // $8
+                .bind(tx.transparent_value_out) // $9
+                .bind(tx.sapling_spends as i32) // $10
+                .bind(tx.sapling_outputs as i32) // $11
+                .bind(tx.orchard_actions as i32) // $12
+                .bind(tx.sapling_value_balance) // $13
+                .bind(tx.orchard_value_balance) // $14
+                .bind(is_coinbase) // $15
+                .bind(has_sapling) // $16
+                .bind(has_orchard) // $17
+                .bind(tx.vin_count as i32) // $18
+                .bind(tx.vout_count as i32) // $19
+                .bind(timestamp as i64) // $20
+                .bind(tx_idx as i32) // $21
+                .bind(tx.ironwood_actions as i32) // $22
+                .bind(tx.ironwood_value_balance) // $23
+                .bind(has_ironwood) // $24
                 .bind(
                     tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance,
-                ) // $26
-                .bind(tx.expiry_height.map(|h| h as i32)) // $27
-                .bind(tx.sapling_spends as i32) // $28
-                .bind(tx.sapling_outputs as i32) // $29
-                .bind(tx.joinsplit_count as i32) // $30
-                .bind(has_sprout) // $31
+                ) // $25
+                .bind(tx.expiry_height.map(|h| h as i32)) // $26
+                .bind(tx.sapling_spends as i32) // $27
+                .bind(tx.sapling_outputs as i32) // $28
+                .bind(tx.joinsplit_count as i32) // $29
+                .bind(has_sprout) // $30
                 .execute(&mut *db_tx)
                 .await?;
 
@@ -567,7 +324,7 @@ impl PostgresWriter {
                     for output in &tx.vout {
                         if let Some(ref addr) = output.address {
                             let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
-                            entry.1 += output.value; // value_out
+                            entry.1 = entry.1.checked_add(output.value).unwrap_or(i64::MAX);
                         }
                     }
                     for input in &tx.vin {
@@ -576,7 +333,7 @@ impl PostgresWriter {
                         }
                         if let Some(ref addr) = input.address {
                             let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
-                            entry.0 += input.value.unwrap_or(0); // value_in
+                            entry.0 = entry.0.checked_add(input.value.unwrap_or(0)).unwrap_or(i64::MAX);
                         }
                     }
 
@@ -632,7 +389,7 @@ impl PostgresWriter {
             let mut query = QueryBuilder::<Postgres>::new(
                 r#"
                 INSERT INTO transactions (
-                    txid, block_height, block_hash, timestamp, version, locktime,
+                    txid, block_height, block_hash, version, locktime,
                     size, fee, total_input, total_output,
                     shielded_spends, shielded_outputs, orchard_actions,
                     value_balance_sapling, value_balance_orchard,
@@ -655,7 +412,6 @@ impl PostgresWriter {
                 row.push_bind(&tx.txid)
                     .push_bind(tx.block_height as i64)
                     .push_bind(&tx.block_hash)
-                    .push_bind(timestamp as i64)
                     .push_bind(tx.version)
                     .push_bind(tx.lock_time as i64)
                     .push_bind(tx.size as i32)
@@ -785,13 +541,15 @@ impl PostgresWriter {
 
             for output in &tx.vout {
                 if let Some(address) = output.address.as_deref() {
-                    addresses.entry(address).or_insert((0, 0)).1 += output.value;
+                    let e = addresses.entry(address).or_insert((0, 0));
+                    e.1 = e.1.checked_add(output.value).unwrap_or(i64::MAX);
                 }
             }
             for input in &tx.vin {
                 if !input.is_coinbase {
                     if let Some(address) = input.address.as_deref() {
-                        addresses.entry(address).or_insert((0, 0)).0 += input.value.unwrap_or(0);
+                        let e = addresses.entry(address).or_insert((0, 0));
+                        e.0 = e.0.checked_add(input.value.unwrap_or(0)).unwrap_or(i64::MAX);
                     }
                 }
             }
@@ -845,20 +603,6 @@ impl PostgresWriter {
     }
 
     /// Batch insert with full block header info.
-    pub async fn batch_insert_with_header(
-        &self,
-        height: u32,
-        hash: &str,
-        timestamp: u64,
-        transactions: &[Transaction],
-        header: &crate::db::ParsedBlockHeader,
-    ) -> Result<u64, sqlx::Error> {
-        let (count, _) = self
-            .batch_insert_with_header_and_flows(height, hash, timestamp, transactions, &[], header)
-            .await?;
-        Ok(count)
-    }
-
     /// Update the addresses summary table for all addresses in a block's transactions
     async fn update_addresses_for_block(
         &self,
@@ -888,7 +632,9 @@ impl PostgresWriter {
                             total_sent: 0,
                             txids: std::collections::HashSet::new(),
                         });
-                    entry.total_received += output.value;
+                    entry.total_received = entry.total_received
+                        .checked_add(output.value)
+                        .unwrap_or(i64::MAX);
                     entry.txids.insert(tx.txid.clone());
                 }
             }
@@ -907,7 +653,9 @@ impl PostgresWriter {
                                 total_sent: 0,
                                 txids: std::collections::HashSet::new(),
                             });
-                        entry.total_sent += value;
+                        entry.total_sent = entry.total_sent
+                            .checked_add(value)
+                            .unwrap_or(i64::MAX);
                         entry.txids.insert(tx.txid.clone());
                     }
                 }
@@ -995,18 +743,6 @@ impl PostgresWriter {
         }
 
         Ok(flows.len() as u64)
-    }
-
-    /// Batch insert flows.
-    pub async fn batch_insert_flows(
-        &self,
-        flows: &[ShieldedFlow],
-        block_time: u64,
-    ) -> Result<u64, sqlx::Error> {
-        let mut db_tx = self.pool.begin().await?;
-        let count = self.insert_flows_tx(&mut db_tx, flows, block_time).await?;
-        db_tx.commit().await?;
-        Ok(count)
     }
 
     /// Batch-update only the metadata columns for a set of transactions.
@@ -1128,7 +864,7 @@ impl PostgresWriter {
                    flow_type, privacy_score, fork_event_id, first_indexed_at
                )
                SELECT
-                   t.txid, t.block_height, t.block_hash, t.timestamp, t.tx_index, t.version, t.locktime,
+                   t.txid, t.block_height, t.block_hash, t.block_time, t.tx_index, t.version, t.locktime,
                    t.expiry_height, t.size, t.fee, t.is_coinbase,
                    t.vin_count, t.vout_count, t.total_input, t.total_output,
                    t.has_sapling, t.has_orchard, t.has_sprout, t.has_ironwood, t.has_shielded_data,
@@ -1280,8 +1016,8 @@ impl PostgresWriter {
         .await?;
 
         if removed.rows_affected() > 0 {
-            println!(
-                "   🧹 Cleaned {} false orphan(s) from double-reorg",
+            tracing::info!(
+                "Cleaned {} false orphan(s) from double-reorg",
                 removed.rows_affected()
             );
         }

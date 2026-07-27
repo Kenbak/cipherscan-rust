@@ -1261,11 +1261,7 @@ async fn verify_parsing(
 
     // Use cookie content directly (already has __cookie__:password format)
     let auth = BASE64.encode(cookie_trimmed);
-    println!(
-        "   Auth: {}...{}",
-        &cookie_trimmed[..15],
-        &cookie_trimmed[cookie_trimmed.len() - 5..]
-    );
+    println!("   Auth: [cookie loaded, {} bytes]", cookie_trimmed.len());
     println!();
 
     let zebra = ZebraState::open(config)?;
@@ -1901,7 +1897,7 @@ async fn compare_with_postgres(
     let mut vout_mismatches: Vec<String> = Vec::new();
 
     for row in &vout_rows {
-        let pg_txid: String = row.get("txid");
+        let _pg_txid: String = row.get("txid");
         let pg_vout_index: i32 = row.get("vout_index");
         let pg_value: i64 = row.get("value");
         let pg_address: Option<String> = row.try_get("address").ok();
@@ -2226,7 +2222,7 @@ async fn validate_full(
     let mut tx_mismatches: Vec<String> = Vec::new();
     let mut tx_improvements: Vec<String> = Vec::new();
     let mut tx_missing = 0;
-    let mut tx_nulls_checked = 0;
+    let mut _tx_nulls_checked = 0;
 
     // Fields where prod=0 and test=value is an IMPROVEMENT (Node.js doesn't calculate these)
     let improvement_fields: std::collections::HashSet<&str> =
@@ -2270,7 +2266,7 @@ async fn validate_full(
                             diffs.push(format!("{}: prod=NULL test={:?}", $field, t));
                         }
                         (None, None) => {
-                            tx_nulls_checked += 1;
+                            _tx_nulls_checked += 1;
                         }
                         _ => {} // Match
                     }

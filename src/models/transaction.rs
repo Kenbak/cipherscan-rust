@@ -42,57 +42,8 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Check if this is a coinbase transaction
     pub fn is_coinbase(&self) -> bool {
         self.vin_count == 1 && self.vin.first().map(|v| v.is_coinbase).unwrap_or(false)
-    }
-
-    /// Check if transaction has shielded activity
-    pub fn has_shielded(&self) -> bool {
-        self.joinsplit_count > 0
-            || self.sapling_spends > 0
-            || self.sapling_outputs > 0
-            || self.orchard_actions > 0
-            || self.ironwood_actions > 0
-    }
-
-    /// Check if this is a shielding transaction (transparent → shielded)
-    pub fn is_shielding(&self) -> bool {
-        self.vin_count > 0
-            && (self.sapling_value_balance < 0
-                || self.orchard_value_balance < 0
-                || self.ironwood_value_balance < 0)
-    }
-
-    /// Check if this is a deshielding transaction (shielded → transparent)
-    pub fn is_deshielding(&self) -> bool {
-        self.vout_count > 0
-            && (self.sapling_value_balance > 0
-                || self.orchard_value_balance > 0
-                || self.ironwood_value_balance > 0)
-    }
-
-    /// Check if this is fully shielded (no transparent involvement)
-    pub fn is_fully_shielded(&self) -> bool {
-        self.vin_count == 0
-            && self.vout_count == 0
-            && self.has_shielded()
-            && !self.is_coinbase()
-    }
-
-    /// Get the dominant pool for shielded activity
-    pub fn dominant_pool(&self) -> Option<&'static str> {
-        if self.ironwood_actions > 0 {
-            Some("ironwood")
-        } else if self.orchard_actions > 0 {
-            Some("orchard")
-        } else if self.sapling_spends > 0 || self.sapling_outputs > 0 {
-            Some("sapling")
-        } else if self.joinsplit_count > 0 {
-            Some("sprout")
-        } else {
-            None
-        }
     }
 }
 
@@ -121,9 +72,3 @@ pub struct TransparentOutput {
     pub script_pub_key: Option<String>,
 }
 
-impl TransparentOutput {
-    /// Check if this is an OP_RETURN output
-    pub fn is_op_return(&self) -> bool {
-        self.script_type == "nulldata" || self.script_type == "op_return"
-    }
-}

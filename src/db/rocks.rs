@@ -9,35 +9,14 @@ use rocksdb::{DB, Options, IteratorMode};
 use std::io::Cursor;
 use std::time::Instant;
 use crate::config::Config;
-use crate::models::{Block, Transaction, TransparentInput, TransparentOutput};
 use zebra_chain::block::Header as ZebraHeader;
 use zebra_chain::serialization::ZcashDeserialize;
-
-/// Zebra column families we care about
-pub const COLUMN_FAMILIES: &[&str] = &[
-    "hash_by_height",
-    "height_by_hash",
-    "block_header_by_height",
-    "tx_by_loc",
-    "hash_by_tx_loc",
-    "tx_loc_by_hash",
-    "balance_by_transparent_addr",
-    "tx_loc_by_transparent_addr_loc",
-    "utxo_by_out_loc",
-    "utxo_loc_by_transparent_addr_loc",
-    "sprout_nullifiers",
-    "sapling_nullifiers",
-    "orchard_nullifiers",
-    "sprout_anchors",
-    "sapling_anchors",
-    "orchard_anchors",
-];
 
 /// Wrapper around Zebra's RocksDB state
 pub struct ZebraState {
     db: DB,
     config: Config,
-    secondary_path: std::path::PathBuf,
+    _secondary_path: std::path::PathBuf,
 }
 
 impl ZebraState {
@@ -77,14 +56,8 @@ impl ZebraState {
         Ok(Self {
             db,
             config: config.clone(),
-            secondary_path,
+            _secondary_path: secondary_path,
         })
-    }
-
-    /// Catch up with primary (Zebra) to see latest blocks
-    pub fn try_catch_up(&self) -> Result<(), String> {
-        self.db.try_catch_up_with_primary()
-            .map_err(|e| format!("Failed to catch up with primary: {}", e))
     }
 
     /// Get current chain tip height
@@ -289,61 +262,6 @@ impl ZebraState {
         let current_target = mantissa * 256.0_f64.powi(exponent - 3);
 
         max_target / current_target
-    }
-
-    /// Iterate over all blocks from start_height to end_height
-    pub fn iter_blocks(&self, start_height: u32, end_height: u32)
-        -> impl Iterator<Item = Result<(u32, [u8; 32]), String>> + '_
-    {
-        let cf = self.db.cf_handle("hash_by_height");
-
-        // Create starting key (3-byte big-endian)
-        let start_key = [
-            ((start_height >> 16) & 0xFF) as u8,
-            ((start_height >> 8) & 0xFF) as u8,
-            (start_height & 0xFF) as u8,
-        ];
-
-        let iter = if let Some(cf) = cf {
-            Some(self.db.iterator_cf(cf, IteratorMode::From(&start_key, rocksdb::Direction::Forward)))
-        } else {
-            None
-        };
-
-        iter.into_iter()
-            .flatten()
-            .take_while(move |result| {
-                match result {
-                    Ok((key, _)) => {
-                        if key.len() >= 3 {
-                            let height = ((key[0] as u32) << 16)
-                                | ((key[1] as u32) << 8)
-                                | (key[2] as u32);
-                            height <= end_height
-                        } else {
-                            false
-                        }
-                    }
-                    Err(_) => false,
-                }
-            })
-            .map(|result| {
-                match result {
-                    Ok((key, value)) => {
-                        if key.len() >= 3 && value.len() >= 32 {
-                            let height = ((key[0] as u32) << 16)
-                                | ((key[1] as u32) << 8)
-                                | (key[2] as u32);
-                            let mut hash = [0u8; 32];
-                            hash.copy_from_slice(&value[..32]);
-                            Ok((height, hash))
-                        } else {
-                            Err("Invalid key/value length".to_string())
-                        }
-                    }
-                    Err(e) => Err(format!("RocksDB error: {}", e)),
-                }
-            })
     }
 
     /// Get transaction by location (block height + tx index)
@@ -597,36 +515,6 @@ impl ZebraState {
         }
     }
 
-    /// Count entries in a column family
-    pub fn count_cf_entries(&self, cf_name: &str, limit: usize) -> usize {
-        let cf = match self.db.cf_handle(cf_name) {
-            Some(cf) => cf,
-            None => return 0,
-        };
-
-        self.db.iterator_cf(cf, IteratorMode::Start)
-            .take(limit)
-            .count()
-    }
-
-    /// Get statistics about the database
-    pub fn get_stats(&self) -> DbStats {
-        let tip_height = self.get_tip_height().unwrap_or(0);
-
-        DbStats {
-            tip_height,
-            block_count: tip_height + 1,
-            network: self.config.network_name().to_string(),
-        }
-    }
-}
-
-/// Database statistics
-#[derive(Debug)]
-pub struct DbStats {
-    pub tip_height: u32,
-    pub block_count: u32,
-    pub network: String,
 }
 
 /// Parsed block header with all fields
@@ -643,9 +531,4 @@ pub struct ParsedBlockHeader {
     pub difficulty: f64,
     pub nonce: String,
     pub solution: String,
-}
-
-#[cfg(test)]
-mod tests {
-    // Tests would go here
 }

@@ -35,15 +35,8 @@ struct RpcError {
 }
 
 #[derive(Deserialize, Debug)]
-struct BlockchainInfo {
-    blocks: u64,
-    bestblockhash: String,
-}
-
-#[derive(Deserialize, Debug)]
 pub struct BlockInfo {
     pub hash: String,
-    pub height: u64,
     pub time: u64,
     pub tx: Vec<String>,
     #[serde(default)]
@@ -65,8 +58,6 @@ pub struct BlockInfo {
     pub finalorchardroot: Option<String>,
     #[serde(default)]
     pub finalironwoodroot: Option<String>,
-    #[serde(default)]
-    pub size: u64,
 }
 
 impl ZebraRpc {
@@ -184,13 +175,6 @@ impl ZebraRpc {
             vec![serde_json::json!(txid), serde_json::json!(1)],
         )
         .await
-    }
-
-    /// Get raw block hex
-    pub async fn get_block_hex(&self, height: u64) -> Result<String, String> {
-        let hash = self.get_block_hash(height).await?;
-        self.call("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
-            .await
     }
 
     /// Get blockchain info (includes valuePools with authoritative pool balances)
