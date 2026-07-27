@@ -1603,7 +1603,7 @@ async fn compare_with_postgres(
         SELECT
             txid, block_height, tx_index, version, locktime,
             vin_count, vout_count, size, fee,
-            shielded_spends, shielded_outputs, orchard_actions,
+            sapling_spend_count, sapling_output_count, orchard_actions,
             value_balance_sapling, value_balance_orchard,
             is_coinbase, has_sapling, has_orchard
         FROM transactions
@@ -1634,8 +1634,8 @@ async fn compare_with_postgres(
         let pg_version: Option<i32> = row.try_get("version").ok();
         let pg_vin_count: Option<i32> = row.try_get("vin_count").ok();
         let pg_vout_count: Option<i32> = row.try_get("vout_count").ok();
-        let pg_sapling_spends: Option<i32> = row.try_get("shielded_spends").ok();
-        let pg_sapling_outputs: Option<i32> = row.try_get("shielded_outputs").ok();
+        let pg_sapling_spends: Option<i32> = row.try_get("sapling_spend_count").ok();
+        let pg_sapling_outputs: Option<i32> = row.try_get("sapling_output_count").ok();
         let pg_orchard_actions: Option<i32> = row.try_get("orchard_actions").ok();
         let pg_value_balance_sapling: Option<i64> = row.try_get("value_balance_sapling").ok();
         let pg_value_balance_orchard: Option<i64> = row.try_get("value_balance_orchard").ok();
@@ -2176,7 +2176,7 @@ async fn validate_full(
     let prod_txs: Vec<_> = sqlx::query(
         r#"
         SELECT txid, block_height, version, vin_count, vout_count,
-               shielded_spends, shielded_outputs, orchard_actions,
+               sapling_spend_count, sapling_output_count, orchard_actions,
                value_balance_sapling, value_balance_orchard, fee,
                total_input, total_output, is_coinbase
         FROM transactions
@@ -2193,7 +2193,7 @@ async fn validate_full(
     let test_txs: Vec<_> = sqlx::query(
         r#"
         SELECT txid, block_height, version, vin_count, vout_count,
-               shielded_spends, shielded_outputs, orchard_actions,
+               sapling_spend_count, sapling_output_count, orchard_actions,
                value_balance_sapling, value_balance_orchard, fee,
                total_input, total_output, is_coinbase
         FROM transactions
@@ -2276,8 +2276,8 @@ async fn validate_full(
             compare_field!("version", i32);
             compare_field!("vin_count", i32);
             compare_field!("vout_count", i32);
-            compare_field!("shielded_spends", i32);
-            compare_field!("shielded_outputs", i32);
+            compare_field!("sapling_spend_count", i32);
+            compare_field!("sapling_output_count", i32);
             compare_field!("orchard_actions", i32);
             compare_field!("value_balance_sapling", i64);
             compare_field!("value_balance_orchard", i64);

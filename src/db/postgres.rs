@@ -202,7 +202,7 @@ impl PostgresWriter {
                 INSERT INTO transactions (
                     txid, block_height, block_hash, version, locktime,
                     size, fee, total_input, total_output,
-                    shielded_spends, shielded_outputs, orchard_actions,
+                    orchard_actions,
                     value_balance_sapling, value_balance_orchard,
                     is_coinbase, has_sapling, has_orchard,
                     vin_count, vout_count, block_time, tx_index,
@@ -211,9 +211,9 @@ impl PostgresWriter {
                     sprout_joinsplit_count, has_sprout
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                    $22, $23, $24, $25,
-                    $26, $27, $28, $29, $30
+                    $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                    $20, $21, $22, $23,
+                    $24, $25, $26, $27, $28
                 )
                 ON CONFLICT (txid) DO UPDATE SET
                     block_height = EXCLUDED.block_height,
@@ -244,29 +244,27 @@ impl PostgresWriter {
                 .bind(tx.fee.unwrap_or(0)) // $7
                 .bind(tx.transparent_value_in) // $8
                 .bind(tx.transparent_value_out) // $9
-                .bind(tx.sapling_spends as i32) // $10
-                .bind(tx.sapling_outputs as i32) // $11
-                .bind(tx.orchard_actions as i32) // $12
-                .bind(tx.sapling_value_balance) // $13
-                .bind(tx.orchard_value_balance) // $14
-                .bind(is_coinbase) // $15
-                .bind(has_sapling) // $16
-                .bind(has_orchard) // $17
-                .bind(tx.vin_count as i32) // $18
-                .bind(tx.vout_count as i32) // $19
-                .bind(timestamp as i64) // $20
-                .bind(tx_idx as i32) // $21
-                .bind(tx.ironwood_actions as i32) // $22
-                .bind(tx.ironwood_value_balance) // $23
-                .bind(has_ironwood) // $24
+                .bind(tx.orchard_actions as i32) // $10
+                .bind(tx.sapling_value_balance) // $11
+                .bind(tx.orchard_value_balance) // $12
+                .bind(is_coinbase) // $13
+                .bind(has_sapling) // $14
+                .bind(has_orchard) // $15
+                .bind(tx.vin_count as i32) // $16
+                .bind(tx.vout_count as i32) // $17
+                .bind(timestamp as i64) // $18
+                .bind(tx_idx as i32) // $19
+                .bind(tx.ironwood_actions as i32) // $20
+                .bind(tx.ironwood_value_balance) // $21
+                .bind(has_ironwood) // $22
                 .bind(
                     tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance,
-                ) // $25
-                .bind(tx.expiry_height.map(|h| h as i32)) // $26
-                .bind(tx.sapling_spends as i32) // $27
-                .bind(tx.sapling_outputs as i32) // $28
-                .bind(tx.joinsplit_count as i32) // $29
-                .bind(has_sprout) // $30
+                ) // $23
+                .bind(tx.expiry_height.map(|h| h as i32)) // $24
+                .bind(tx.sapling_spends as i32) // $25
+                .bind(tx.sapling_outputs as i32) // $26
+                .bind(tx.joinsplit_count as i32) // $27
+                .bind(has_sprout) // $28
                 .execute(&mut *db_tx)
                 .await?;
 
@@ -391,7 +389,7 @@ impl PostgresWriter {
                 INSERT INTO transactions (
                     txid, block_height, block_hash, version, locktime,
                     size, fee, total_input, total_output,
-                    shielded_spends, shielded_outputs, orchard_actions,
+                    orchard_actions,
                     value_balance_sapling, value_balance_orchard,
                     is_coinbase, has_sapling, has_orchard,
                     vin_count, vout_count, block_time, tx_index,
@@ -418,8 +416,6 @@ impl PostgresWriter {
                     .push_bind(tx.fee.unwrap_or(0))
                     .push_bind(tx.transparent_value_in)
                     .push_bind(tx.transparent_value_out)
-                    .push_bind(tx.sapling_spends as i32)
-                    .push_bind(tx.sapling_outputs as i32)
                     .push_bind(tx.orchard_actions as i32)
                     .push_bind(tx.sapling_value_balance)
                     .push_bind(tx.orchard_value_balance)
