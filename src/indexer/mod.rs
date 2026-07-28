@@ -753,27 +753,17 @@ impl Indexer {
                                 }
                             }
 
-                            // Archive raw block hex within activation window
-                            if let Some(act_h) = self.config.archive_window_height {
-                                let window = 500u32;
-                                if height >= act_h.saturating_sub(window) && height <= act_h + window {
-                                    let hash_result = rpc.get_block_hash(height as u64).await;
-                                    if let Ok(hash) = hash_result {
-                                        match rpc.get_raw_block_hex(&hash).await {
-                                            Ok(hex) => {
-                                                let reason = if height == act_h {
-                                                    "activation_block"
-                                                } else if height < act_h {
-                                                    "pre_activation"
-                                                } else {
-                                                    "post_activation"
-                                                };
-                                                if let Err(e) = self.postgres.archive_raw_block(height, &hash, &hex, reason).await {
-                                                    println!("   ⚠️ Block archive error at {}: {}", height, e);
-                                                }
+                            // Archive raw block hex for every block (forensic safety net)
+                            {
+                                let hash_result = rpc.get_block_hash(height as u64).await;
+                                if let Ok(hash) = hash_result {
+                                    match rpc.get_raw_block_hex(&hash).await {
+                                        Ok(hex) => {
+                                            if let Err(e) = self.postgres.archive_raw_block(height, &hash, &hex, "live").await {
+                                                println!("   ⚠️ Block archive error at {}: {}", height, e);
                                             }
-                                            Err(e) => println!("   ⚠️ Raw block fetch error at {}: {}", height, e),
                                         }
+                                        Err(e) => println!("   ⚠️ Raw block fetch error at {}: {}", height, e),
                                     }
                                 }
                             }
