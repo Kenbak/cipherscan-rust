@@ -31,6 +31,10 @@ pub struct Transaction {
     pub orchard_value_balance: i64,
     pub ironwood_value_balance: i64, // NU6.3 Ironwood pool (v6 tx)
 
+    // Anchor roots (hex-encoded 32-byte tree roots from shielded bundles)
+    pub orchard_anchor: Option<String>,
+    pub ironwood_anchor: Option<String>,
+
     // Computed
     pub fee: Option<i64>,
 

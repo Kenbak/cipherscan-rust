@@ -533,7 +533,9 @@ CREATE TABLE public.transactions (
     flow_type text,
     has_ironwood boolean DEFAULT false,
     ironwood_actions integer DEFAULT 0,
-    value_balance_ironwood bigint DEFAULT 0
+    value_balance_ironwood bigint DEFAULT 0,
+    orchard_anchor text,
+    ironwood_anchor text
 );
 
 
@@ -928,7 +930,9 @@ CREATE TABLE public.orphaned_transactions (
     privacy_score smallint,
     fork_event_id integer,
     archived_at timestamp without time zone DEFAULT now(),
-    first_indexed_at timestamp without time zone
+    first_indexed_at timestamp without time zone,
+    orchard_anchor text,
+    ironwood_anchor text
 );
 
 

@@ -208,12 +208,14 @@ impl PostgresWriter {
                     vin_count, vout_count, block_time, tx_index,
                     ironwood_actions, value_balance_ironwood, has_ironwood, value_balance,
                     expiry_height, sapling_spend_count, sapling_output_count,
-                    sprout_joinsplit_count, has_sprout
+                    sprout_joinsplit_count, has_sprout,
+                    orchard_anchor, ironwood_anchor
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
                     $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
                     $20, $21, $22, $23,
-                    $24, $25, $26, $27, $28
+                    $24, $25, $26, $27, $28,
+                    $29, $30
                 )
                 ON CONFLICT (txid) DO UPDATE SET
                     block_height = EXCLUDED.block_height,
@@ -232,7 +234,9 @@ impl PostgresWriter {
                     sapling_spend_count = EXCLUDED.sapling_spend_count,
                     sapling_output_count = EXCLUDED.sapling_output_count,
                     sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count,
-                    has_sprout = EXCLUDED.has_sprout
+                    has_sprout = EXCLUDED.has_sprout,
+                    orchard_anchor = EXCLUDED.orchard_anchor,
+                    ironwood_anchor = EXCLUDED.ironwood_anchor
                 "#,
                 )
                 .bind(&tx.txid) // $1
@@ -265,6 +269,8 @@ impl PostgresWriter {
                 .bind(tx.sapling_outputs as i32) // $26
                 .bind(tx.joinsplit_count as i32) // $27
                 .bind(has_sprout) // $28
+                .bind(&tx.orchard_anchor) // $29
+                .bind(&tx.ironwood_anchor) // $30
                 .execute(&mut *db_tx)
                 .await?;
 
@@ -395,7 +401,8 @@ impl PostgresWriter {
                     vin_count, vout_count, block_time, tx_index,
                     ironwood_actions, value_balance_ironwood, has_ironwood, value_balance,
                     expiry_height, sapling_spend_count, sapling_output_count,
-                    sprout_joinsplit_count, has_sprout
+                    sprout_joinsplit_count, has_sprout,
+                    orchard_anchor, ironwood_anchor
                 ) "#,
             );
             query.push_values(chunk.iter().enumerate(), |mut row, (index, tx)| {
@@ -434,7 +441,9 @@ impl PostgresWriter {
                     .push_bind(tx.sapling_spends as i32)
                     .push_bind(tx.sapling_outputs as i32)
                     .push_bind(tx.joinsplit_count as i32)
-                    .push_bind(has_sprout);
+                    .push_bind(has_sprout)
+                    .push_bind(&tx.orchard_anchor)
+                    .push_bind(&tx.ironwood_anchor);
             });
             query.push(
                 r#"
@@ -455,7 +464,9 @@ impl PostgresWriter {
                     sapling_spend_count = EXCLUDED.sapling_spend_count,
                     sapling_output_count = EXCLUDED.sapling_output_count,
                     sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count,
-                    has_sprout = EXCLUDED.has_sprout
+                    has_sprout = EXCLUDED.has_sprout,
+                    orchard_anchor = EXCLUDED.orchard_anchor,
+                    ironwood_anchor = EXCLUDED.ironwood_anchor
                 "#,
             );
             query.build().execute(&mut **db_tx).await?;
@@ -857,7 +868,8 @@ impl PostgresWriter {
                    sapling_spend_count, sapling_output_count, orchard_actions, ironwood_actions,
                    sprout_joinsplit_count,
                    value_balance, value_balance_sapling, value_balance_orchard, value_balance_ironwood,
-                   flow_type, privacy_score, fork_event_id, first_indexed_at
+                   flow_type, privacy_score, fork_event_id, first_indexed_at,
+                   orchard_anchor, ironwood_anchor
                )
                SELECT
                    t.txid, t.block_height, t.block_hash, t.block_time, t.tx_index, t.version, t.locktime,
@@ -867,7 +879,8 @@ impl PostgresWriter {
                    t.sapling_spend_count, t.sapling_output_count, t.orchard_actions, t.ironwood_actions,
                    t.sprout_joinsplit_count,
                    t.value_balance, t.value_balance_sapling, t.value_balance_orchard, t.value_balance_ironwood,
-                   t.flow_type, t.privacy_score, $1, t.created_at
+                   t.flow_type, t.privacy_score, $1, t.created_at,
+                   t.orchard_anchor, t.ironwood_anchor
                FROM transactions t WHERE t.block_height >= $2
                ON CONFLICT (txid, block_hash) DO NOTHING"#
         )
@@ -1058,6 +1071,41 @@ impl PostgresWriter {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Batch-update anchor roots for transactions that were indexed before anchors were stored.
+    /// Used by the backfill-anchors subcommand.
+    pub async fn batch_update_anchors(
+        &self,
+        updates: &[(String, Option<String>, Option<String>)], // (txid, orchard_anchor, ironwood_anchor)
+    ) -> Result<u64, sqlx::Error> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut db_tx = self.pool.begin().await?;
+        let mut updated = 0u64;
+
+        for (txid, orchard_anchor, ironwood_anchor) in updates {
+            let result = sqlx::query(
+                r#"
+                UPDATE transactions SET
+                    orchard_anchor = COALESCE($2, orchard_anchor),
+                    ironwood_anchor = COALESCE($3, ironwood_anchor)
+                WHERE txid = $1
+                "#,
+            )
+            .bind(txid)
+            .bind(orchard_anchor)
+            .bind(ironwood_anchor)
+            .execute(&mut *db_tx)
+            .await?;
+
+            updated += result.rows_affected();
+        }
+
+        db_tx.commit().await?;
+        Ok(updated)
     }
 
     /// Insert a boundary pool snapshot (authoritative Zebra pool sizes at a 256-block boundary).

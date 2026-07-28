@@ -159,6 +159,19 @@ enum Commands {
         batch: u32,
     },
 
+    /// Backfill anchor roots (orchard_anchor, ironwood_anchor) for existing
+    /// transactions. Fetches raw tx bytes via RPC, parses with zebra-chain,
+    /// and UPDATEs the transactions table.
+    BackfillAnchors {
+        /// Only process v6 transactions (Ironwood era). Faster but skips v5 Orchard anchors.
+        #[arg(long)]
+        v6_only: bool,
+
+        /// Number of transactions per DB commit batch
+        #[arg(long, default_value = "500")]
+        batch: usize,
+    },
+
     /// Full validation: index into test DB, compare with prod, benchmark
     Validate {
         /// Production database URL
@@ -271,6 +284,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::BackfillMetadata { from, to, batch } => {
             run_backfill_metadata(&config, from, to, batch).await?;
+        }
+        Commands::BackfillAnchors { v6_only, batch } => {
+            run_backfill_anchors(&config, v6_only, batch).await?;
         }
         Commands::Validate {
             prod_db,
@@ -531,6 +547,144 @@ async fn run_backfill_metadata(
         total_blocks as f64 / elapsed.as_secs_f64(),
         total_txs_parsed as f64 / elapsed.as_secs_f64()
     );
+
+    Ok(())
+}
+
+/// Backfill anchor roots for transactions that were indexed before anchors were stored.
+/// Queries transactions missing anchors, fetches raw bytes via RPC, parses, and batch-updates.
+async fn run_backfill_anchors(
+    config: &Config,
+    v6_only: bool,
+    batch_size: usize,
+) -> Result<(), String> {
+    use crate::db::PostgresWriter;
+    use crate::indexer::TransactionParser;
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::Row;
+
+    if config.database_url.is_empty() {
+        return Err(
+            "DATABASE_URL not configured. Set it in .env or pass --database-url".to_string(),
+        );
+    }
+
+    let rpc = crate::db::ZebraRpc::from_env()
+        .map_err(|e| format!("RPC not configured (needed for raw tx fetch): {}", e))?;
+    let postgres = PostgresWriter::connect(&config.database_url)
+        .await
+        .map_err(|e| format!("PostgreSQL error: {}", e))?;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&config.database_url)
+        .await
+        .map_err(|e| format!("Query pool error: {}", e))?;
+
+    let version_filter = if v6_only { "AND version = 6" } else { "AND version >= 5" };
+
+    let query = format!(
+        r#"SELECT txid, block_height, block_hash
+           FROM transactions
+           WHERE orchard_anchor IS NULL
+             AND (has_orchard = true OR has_ironwood = true)
+             {version_filter}
+           ORDER BY block_height ASC"#
+    );
+
+    let rows: Vec<_> = sqlx::query(&query)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("Query error: {}", e))?;
+
+    let total = rows.len();
+    if total == 0 {
+        println!("✅ No transactions need anchor backfill.");
+        return Ok(());
+    }
+
+    println!(
+        "🔧 Anchor backfill: {} transactions (batch={}, v6_only={})",
+        total, batch_size, v6_only
+    );
+    println!("────────────────────────────────────────────────────────────");
+
+    let overall_start = Instant::now();
+    let mut updated_total = 0u64;
+    let mut errors = 0u64;
+
+    for (chunk_idx, chunk) in rows.chunks(batch_size).enumerate() {
+        let mut updates: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+
+        for row in chunk {
+            let txid: String = row.get("txid");
+            let height: i64 = row.get("block_height");
+            let block_hash: String = row.get("block_hash");
+
+            match rpc.get_raw_transaction_hex(&txid).await {
+                Ok(raw_hex) => {
+                    let raw_bytes = match hex::decode(&raw_hex) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!("Hex decode error for {}: {}", &txid[..16], e);
+                            errors += 1;
+                            continue;
+                        }
+                    };
+
+                    match TransactionParser::parse(
+                        &raw_bytes,
+                        height as u32,
+                        &block_hash,
+                        config.network,
+                    ) {
+                        Ok(tx) => {
+                            updates.push((txid, tx.orchard_anchor, tx.ironwood_anchor));
+                        }
+                        Err(e) => {
+                            tracing::warn!("Parse error for {} at {}: {}", &txid[..16], height, e);
+                            errors += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("RPC error for {}: {}", &txid[..16], e);
+                    errors += 1;
+                }
+            }
+        }
+
+        let batch_updated = postgres
+            .batch_update_anchors(&updates)
+            .await
+            .map_err(|e| format!("DB update error: {}", e))?;
+        updated_total += batch_updated;
+
+        let done = (chunk_idx + 1) * batch_size;
+        let done = done.min(total);
+        let elapsed = overall_start.elapsed();
+        let rate = done as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
+        let eta = (total - done) as f64 / rate;
+
+        println!(
+            "📦 {}/{} ({:.1}%) | {:.0} tx/s | updated: {} | errors: {} | ETA: {:.0}s",
+            done,
+            total,
+            done as f64 / total as f64 * 100.0,
+            rate,
+            updated_total,
+            errors,
+            eta
+        );
+    }
+
+    let elapsed = overall_start.elapsed();
+    println!("────────────────────────────────────────────────────────────");
+    println!("✅ Anchor backfill complete!");
+    println!("   Transactions processed: {}", total);
+    println!("   Rows updated: {}", updated_total);
+    println!("   Errors: {}", errors);
+    println!("   Time: {:.1}s", elapsed.as_secs_f64());
 
     Ok(())
 }

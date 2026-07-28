@@ -206,6 +206,29 @@ impl TransactionParser {
             _ => 0,
         };
 
+        // Per-transaction anchor roots (hex-encoded Orchard note commitment tree roots).
+        // ZIP-318 compliance requires the Orchard anchor to reference a boundary-aligned
+        // block height (height % 144 == 0).
+        let orchard_anchor: Option<String> = match &tx {
+            V5 { orchard_shielded_data, .. } => {
+                orchard_shielded_data.as_ref()
+                    .map(|d| hex::encode(<[u8; 32]>::from(d.shared_anchor)))
+            }
+            V6 { orchard_shielded_data, .. } => {
+                orchard_shielded_data.as_ref()
+                    .map(|d| hex::encode(<[u8; 32]>::from(d.data().shared_anchor)))
+            }
+            _ => None,
+        };
+
+        let ironwood_anchor: Option<String> = match &tx {
+            V6 { ironwood_shielded_data, .. } => {
+                ironwood_shielded_data.as_ref()
+                    .map(|d| hex::encode(<[u8; 32]>::from(d.data().shared_anchor)))
+            }
+            _ => None,
+        };
+
         // Calculate fee (for non-coinbase)
         let fee = if is_coinbase {
             None
@@ -235,6 +258,8 @@ impl TransactionParser {
             sapling_value_balance,
             orchard_value_balance,
             ironwood_value_balance,
+            orchard_anchor,
+            ironwood_anchor,
             fee,
             vin,
             vout,
