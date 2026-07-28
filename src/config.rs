@@ -29,6 +29,10 @@ pub struct Config {
     /// Reorgs deeper than this require manual intervention (mainnet safety).
     /// Testnet should use a higher value since deep reorgs are routine.
     pub max_reorg_depth: u32,
+
+    /// When set, archive raw block hex for blocks within ±500 of this height.
+    /// Used to capture full block data around network upgrades (e.g. Ironwood).
+    pub archive_window_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +51,7 @@ impl Default for Config {
             max_open_files: 256,
             zebra_grpc_url: None,
             max_reorg_depth: 100,
+            archive_window_height: None,
         }
     }
 }
@@ -97,6 +102,12 @@ impl Config {
         if let Ok(val) = env::var("MAX_REORG_DEPTH") {
             if let Ok(n) = val.parse::<u32>() {
                 config.max_reorg_depth = n;
+            }
+        }
+
+        if let Ok(val) = env::var("ARCHIVE_WINDOW_HEIGHT") {
+            if let Ok(n) = val.parse::<u32>() {
+                config.archive_window_height = Some(n);
             }
         }
 

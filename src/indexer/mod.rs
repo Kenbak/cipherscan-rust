@@ -222,6 +222,27 @@ impl Indexer {
             "Chain reorg detected: depth {}, rolling back heights {}-{}",
             reorg_depth, fork_height, last_indexed
         );
+
+        // Best-effort: try to fetch raw hex of orphaned blocks via RPC.
+        // Zebra may NOT serve blocks from orphaned forks — this is a bonus attempt.
+        // The real safety net is the activation-window capture in block_archive,
+        // which stores raw hex as blocks are indexed (before any reorg occurs).
+        let mut raw_blocks: Vec<(String, String)> = Vec::new();
+        for h in fork_height..=last_indexed {
+            let hash = self.postgres.get_block_hash_at_height(h).await.ok().flatten();
+            if let Some(hash) = hash {
+                match rpc.get_raw_block_hex(&hash).await {
+                    Ok(hex) => {
+                        println!("   📦 Captured raw orphan block {} ({} bytes)", h, hex.len() / 2);
+                        raw_blocks.push((hash, hex));
+                    }
+                    Err(_) => {
+                        println!("   ℹ️ Orphan block {} not available via RPC (expected)", h);
+                    }
+                }
+            }
+        }
+
         println!("   🗑️ Rolling back {} blocks from height {}", reorg_depth, fork_height);
 
         let rolled_back = self
@@ -230,7 +251,15 @@ impl Indexer {
             .await
             .map_err(|e| format!("Rollback error: {}", e))?;
 
-        println!("   ✅ Rolled back {} blocks, archived to orphaned_blocks", rolled_back);
+        // Store captured raw hex on the archived orphaned_blocks rows
+        for (hash, hex) in &raw_blocks {
+            if let Err(e) = self.postgres.store_orphan_raw_hex(hash, hex).await {
+                println!("   ⚠️ Failed to store raw hex for {}: {}", &hash[..16], e);
+            }
+        }
+
+        println!("   ✅ Rolled back {} blocks, archived to orphaned_blocks ({} with raw hex)",
+            rolled_back, raw_blocks.len());
 
         Ok(Some(fork_height.saturating_sub(1)))
     }
@@ -721,6 +750,31 @@ impl Indexer {
                             if height % 256 == 0 {
                                 if let Err(e) = self.capture_boundary_snapshot(&rpc, height).await {
                                     println!("   ⚠️ Boundary snapshot error at {}: {}", height, e);
+                                }
+                            }
+
+                            // Archive raw block hex within activation window
+                            if let Some(act_h) = self.config.archive_window_height {
+                                let window = 500u32;
+                                if height >= act_h.saturating_sub(window) && height <= act_h + window {
+                                    let hash_result = rpc.get_block_hash(height as u64).await;
+                                    if let Ok(hash) = hash_result {
+                                        match rpc.get_raw_block_hex(&hash).await {
+                                            Ok(hex) => {
+                                                let reason = if height == act_h {
+                                                    "activation_block"
+                                                } else if height < act_h {
+                                                    "pre_activation"
+                                                } else {
+                                                    "post_activation"
+                                                };
+                                                if let Err(e) = self.postgres.archive_raw_block(height, &hash, &hex, reason).await {
+                                                    println!("   ⚠️ Block archive error at {}: {}", height, e);
+                                                }
+                                            }
+                                            Err(e) => println!("   ⚠️ Raw block fetch error at {}: {}", height, e),
+                                        }
+                                    }
                                 }
                             }
                         }

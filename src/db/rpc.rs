@@ -159,6 +159,12 @@ impl ZebraRpc {
         self.get_block(&hash).await
     }
 
+    /// Get full raw block as hex (verbosity 0)
+    pub async fn get_raw_block_hex(&self, hash: &str) -> Result<String, String> {
+        self.call("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
+            .await
+    }
+
     /// Get raw transaction hex
     pub async fn get_raw_transaction_hex(&self, txid: &str) -> Result<String, String> {
         self.call(

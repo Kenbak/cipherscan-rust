@@ -1021,6 +1021,45 @@ impl PostgresWriter {
         Ok(())
     }
 
+    /// Store raw block hex on an already-archived orphaned_blocks row.
+    pub async fn store_orphan_raw_hex(
+        &self,
+        block_hash: &str,
+        raw_hex: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE orphaned_blocks SET raw_hex = $1 WHERE hash = $2"
+        )
+        .bind(raw_hex)
+        .bind(block_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Archive a raw block hex during the activation window.
+    /// Uses the existing `block_archive` table for persistent forensic storage.
+    pub async fn archive_raw_block(
+        &self,
+        height: u32,
+        hash: &str,
+        raw_hex: &str,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"INSERT INTO block_archive (height, hash, raw_hex, reason, captured_at)
+               VALUES ($1, $2, $3, $4, NOW())
+               ON CONFLICT (height, hash) DO NOTHING"#,
+        )
+        .bind(height as i64)
+        .bind(hash)
+        .bind(raw_hex)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Insert a boundary pool snapshot (authoritative Zebra pool sizes at a 256-block boundary).
     /// Uses ON CONFLICT to allow idempotent re-inserts (e.g. after reorg re-indexing).
     pub async fn insert_boundary_pool_snapshot(
