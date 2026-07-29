@@ -172,6 +172,15 @@ enum Commands {
         batch: usize,
     },
 
+    /// Reclassify nonstandard outputs as P2PK or bare-multisig.
+    /// Scans transaction_outputs WHERE script_type = 'nonstandard' AND address IS NULL,
+    /// re-parses raw scripts from Zebra RocksDB, and updates the DB.
+    BackfillScripts {
+        /// Number of outputs to process per DB commit batch
+        #[arg(long, default_value = "5000")]
+        batch: u32,
+    },
+
     /// Full validation: index into test DB, compare with prod, benchmark
     Validate {
         /// Production database URL
@@ -287,6 +296,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::BackfillAnchors { v6_only, batch } => {
             run_backfill_anchors(&config, v6_only, batch).await?;
+        }
+        Commands::BackfillScripts { batch } => {
+            run_backfill_scripts(&config, batch).await?;
         }
         Commands::Validate {
             prod_db,
@@ -683,6 +695,179 @@ async fn run_backfill_anchors(
     println!("✅ Anchor backfill complete!");
     println!("   Transactions processed: {}", total);
     println!("   Rows updated: {}", updated_total);
+    println!("   Errors: {}", errors);
+    println!("   Time: {:.1}s", elapsed.as_secs_f64());
+
+    Ok(())
+}
+
+/// Reclassify nonstandard outputs as P2PK or bare-multisig by re-parsing raw scripts.
+async fn run_backfill_scripts(config: &Config, batch_size: u32) -> Result<(), String> {
+    use crate::db::PostgresWriter;
+    use crate::indexer::TransactionParser;
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::Row;
+
+    if config.database_url.is_empty() {
+        return Err(
+            "DATABASE_URL not configured. Set it in .env or pass --database-url".to_string(),
+        );
+    }
+
+    let zebra = ZebraState::open(config)?;
+    let _postgres = PostgresWriter::connect(&config.database_url)
+        .await
+        .map_err(|e| format!("PostgreSQL error: {}", e))?;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&config.database_url)
+        .await
+        .map_err(|e| format!("Query pool error: {}", e))?;
+
+    // Find all nonstandard outputs with no address (P2PK/multisig candidates)
+    let rows: Vec<_> = sqlx::query(
+        r#"SELECT o.txid, o.vout_index, t.block_height
+           FROM transaction_outputs o
+           JOIN transactions t ON o.txid = t.txid
+           WHERE o.script_type = 'nonstandard' AND o.address IS NULL
+           ORDER BY t.block_height ASC"#
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("Query error: {}", e))?;
+
+    let total = rows.len();
+    if total == 0 {
+        println!("✅ No nonstandard outputs to reclassify.");
+        return Ok(());
+    }
+
+    println!(
+        "🔧 Script backfill: {} nonstandard outputs to re-parse (batch={})",
+        total, batch_size
+    );
+    println!("────────────────────────────────────────────────────────────");
+
+    let overall_start = Instant::now();
+    let mut reclassified = 0u64;
+    let mut errors = 0u64;
+    let mut addresses_upserted = 0u64;
+
+    for (chunk_idx, chunk) in rows.chunks(batch_size as usize).enumerate() {
+        let mut db_tx = pool
+            .begin()
+            .await
+            .map_err(|e| format!("Transaction start error: {}", e))?;
+
+        for row in chunk {
+            let txid: String = row.get("txid");
+            let vout_index: i32 = row.get("vout_index");
+            let block_height: i64 = row.get("block_height");
+
+            // Look up the raw transaction from Zebra RocksDB
+            let raw_txs = match zebra.iter_block_transactions(block_height as u32) {
+                Ok(txs) => txs,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            let mut found = false;
+            for (_tx_idx, raw) in &raw_txs {
+                let block_hash_bytes = match zebra.get_block_hash(block_height as u32) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                let mut hash_rev = block_hash_bytes;
+                hash_rev.reverse();
+                let block_hash = hex::encode(&hash_rev);
+
+                match TransactionParser::parse(raw, block_height as u32, &block_hash, config.network) {
+                    Ok(tx) => {
+                        if tx.txid == txid {
+                            if let Some(output) = tx.vout.iter().find(|o| o.n == vout_index as u32) {
+                                if output.script_type == "pubkey" || output.script_type == "multisig" {
+                                    // Reclassify the output
+                                    sqlx::query(
+                                        r#"UPDATE transaction_outputs
+                                           SET script_type = $1, address = $2, script_pubkey = $3
+                                           WHERE txid = $4 AND vout_index = $5"#
+                                    )
+                                    .bind(&output.script_type)
+                                    .bind(&output.address)
+                                    .bind(&output.script_pub_key)
+                                    .bind(&txid)
+                                    .bind(vout_index)
+                                    .execute(&mut *db_tx)
+                                    .await
+                                    .map_err(|e| format!("Update error: {}", e))?;
+
+                                    // Upsert the address into the addresses table
+                                    if let Some(addr) = &output.address {
+                                        sqlx::query(
+                                            r#"INSERT INTO addresses (address, balance, total_received, tx_count, first_seen, last_seen, address_type)
+                                               VALUES ($1, $2, $2, 1, $3, $3, 'transparent')
+                                               ON CONFLICT (address) DO UPDATE SET
+                                                   balance = addresses.balance + EXCLUDED.balance,
+                                                   total_received = addresses.total_received + EXCLUDED.total_received,
+                                                   tx_count = addresses.tx_count + 1,
+                                                   last_seen = GREATEST(addresses.last_seen, EXCLUDED.last_seen)"#
+                                        )
+                                        .bind(addr)
+                                        .bind(output.value)
+                                        .bind(block_height)
+                                        .execute(&mut *db_tx)
+                                        .await
+                                        .map_err(|e| format!("Upsert address error: {}", e))?;
+                                        addresses_upserted += 1;
+                                    }
+
+                                    reclassified += 1;
+                                }
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+            if !found {
+                errors += 1;
+            }
+        }
+
+        db_tx
+            .commit()
+            .await
+            .map_err(|e| format!("Commit error: {}", e))?;
+
+        let done = ((chunk_idx + 1) * batch_size as usize).min(total);
+        let elapsed = overall_start.elapsed();
+        let rate = done as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
+        let eta = (total - done) as f64 / rate;
+
+        println!(
+            "📦 {}/{} ({:.1}%) | {:.0} outputs/s | reclassified: {} | addresses: {} | errors: {} | ETA: {:.0}s",
+            done,
+            total,
+            done as f64 / total as f64 * 100.0,
+            rate,
+            reclassified,
+            addresses_upserted,
+            errors,
+            eta
+        );
+    }
+
+    let elapsed = overall_start.elapsed();
+    println!("────────────────────────────────────────────────────────────");
+    println!("✅ Script backfill complete!");
+    println!("   Outputs processed: {}", total);
+    println!("   Reclassified: {} (P2PK/multisig)", reclassified);
+    println!("   Addresses upserted: {}", addresses_upserted);
     println!("   Errors: {}", errors);
     println!("   Time: {:.1}s", elapsed.as_secs_f64());
 

@@ -300,12 +300,83 @@ impl TransactionParser {
             return (Some(address), "scripthash".to_string());
         }
 
+        // P2PK (compressed): <0x21><33-byte-pubkey><OP_CHECKSIG>
+        if bytes.len() == 35
+            && bytes[0] == 0x21
+            && (bytes[1] == 0x02 || bytes[1] == 0x03)
+            && bytes[34] == 0xac
+        {
+            let pubkey = &bytes[1..34];
+            let hash160 = Self::hash160(pubkey);
+            let address = Self::encode_address(&p2pkh_prefix, &hash160);
+            return (Some(address), "pubkey".to_string());
+        }
+
+        // P2PK (uncompressed): <0x41><65-byte-pubkey><OP_CHECKSIG>
+        if bytes.len() == 67
+            && bytes[0] == 0x41
+            && bytes[1] == 0x04
+            && bytes[66] == 0xac
+        {
+            let pubkey = &bytes[1..66];
+            let hash160 = Self::hash160(pubkey);
+            let address = Self::encode_address(&p2pkh_prefix, &hash160);
+            return (Some(address), "pubkey".to_string());
+        }
+
+        // Bare multisig: OP_m <pubkeys...> OP_n OP_CHECKMULTISIG
+        if bytes.len() >= 37 && bytes[bytes.len() - 1] == 0xae {
+            let m = bytes[0] as i32 - 0x50; // OP_1..OP_16
+            let n_byte = bytes[bytes.len() - 2];
+            let n = n_byte as i32 - 0x50;
+            if m >= 1 && m <= 16 && n >= 1 && n <= 16 && m <= n {
+                if let Some(first_pubkey) = Self::extract_first_multisig_pubkey(&bytes[1..bytes.len() - 2], n as usize) {
+                    let hash160 = Self::hash160(first_pubkey);
+                    let address = Self::encode_address(&p2pkh_prefix, &hash160);
+                    return (Some(address), "multisig".to_string());
+                }
+            }
+        }
+
         // OP_RETURN
         if !bytes.is_empty() && bytes[0] == 0x6a {
             return (None, "nulldata".to_string());
         }
 
         (None, "nonstandard".to_string())
+    }
+
+    /// SHA256 + RIPEMD160 (standard Bitcoin/Zcash pubkey-to-address hash)
+    fn hash160(data: &[u8]) -> [u8; 20] {
+        use sha2::{Sha256, Digest};
+        use ripemd::Ripemd160;
+
+        let sha = Sha256::digest(data);
+        let ripe = Ripemd160::digest(&sha);
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&ripe);
+        out
+    }
+
+    /// Extract the first public key from bare multisig script body.
+    /// Returns None if the script doesn't contain valid pubkey pushes.
+    fn extract_first_multisig_pubkey(script_body: &[u8], _expected_n: usize) -> Option<&[u8]> {
+        if script_body.is_empty() {
+            return None;
+        }
+        let push_len = script_body[0] as usize;
+        if push_len == 33 && script_body.len() > 34 {
+            let pubkey = &script_body[1..34];
+            if pubkey[0] == 0x02 || pubkey[0] == 0x03 {
+                return Some(pubkey);
+            }
+        } else if push_len == 65 && script_body.len() > 66 {
+            let pubkey = &script_body[1..66];
+            if pubkey[0] == 0x04 {
+                return Some(pubkey);
+            }
+        }
+        None
     }
 
     /// Encode address with Base58Check
@@ -415,5 +486,125 @@ mod tests {
     fn lock_time_time_above_threshold() {
         let lt = LockTime::min_lock_time_timestamp();
         assert_eq!(lock_time_to_u32(lt), 500_000_000);
+    }
+
+    /// Helper to create a Script from raw bytes for testing parse_output_script
+    fn make_script(bytes: &[u8]) -> zebra_chain::transparent::Script {
+        zebra_chain::transparent::Script::new(bytes)
+    }
+
+    #[test]
+    fn test_p2pk_compressed() {
+        // Compressed P2PK: <0x21><02 + 32 bytes><OP_CHECKSIG>
+        let mut script = vec![0x21]; // push 33 bytes
+        script.push(0x02); // compressed pubkey prefix
+        script.extend_from_slice(&[0xaa; 32]); // 32 bytes of pubkey data
+        script.push(0xac); // OP_CHECKSIG
+        assert_eq!(script.len(), 35);
+
+        let s = make_script(&script);
+        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        assert_eq!(stype, "pubkey");
+        assert!(addr.is_some());
+        assert!(addr.unwrap().starts_with("t1"));
+    }
+
+    #[test]
+    fn test_p2pk_uncompressed() {
+        // Uncompressed P2PK: <0x41><04 + 64 bytes><OP_CHECKSIG>
+        let mut script = vec![0x41]; // push 65 bytes
+        script.push(0x04); // uncompressed pubkey prefix
+        script.extend_from_slice(&[0xbb; 64]); // 64 bytes of pubkey data
+        script.push(0xac); // OP_CHECKSIG
+        assert_eq!(script.len(), 67);
+
+        let s = make_script(&script);
+        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        assert_eq!(stype, "pubkey");
+        assert!(addr.is_some());
+        assert!(addr.unwrap().starts_with("t1"));
+    }
+
+    #[test]
+    fn test_p2pk_compressed_testnet() {
+        let mut script = vec![0x21];
+        script.push(0x03); // alternate compressed prefix
+        script.extend_from_slice(&[0xcc; 32]);
+        script.push(0xac);
+
+        let s = make_script(&script);
+        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Testnet);
+        assert_eq!(stype, "pubkey");
+        assert!(addr.is_some());
+        assert!(addr.unwrap().starts_with("tm"));
+    }
+
+    #[test]
+    fn test_bare_multisig_2_of_3_compressed() {
+        // OP_2 <pubkey1> <pubkey2> <pubkey3> OP_3 OP_CHECKMULTISIG
+        let mut script = vec![0x52]; // OP_2
+        for i in 0..3u8 {
+            script.push(0x21); // push 33 bytes
+            script.push(0x02); // compressed prefix
+            script.extend_from_slice(&[i + 1; 32]);
+        }
+        script.push(0x53); // OP_3
+        script.push(0xae); // OP_CHECKMULTISIG
+
+        let s = make_script(&script);
+        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        assert_eq!(stype, "multisig");
+        assert!(addr.is_some());
+        assert!(addr.unwrap().starts_with("t1"));
+    }
+
+    #[test]
+    fn test_p2pkh_still_works() {
+        // Standard P2PKH script
+        let mut script = vec![0x76, 0xa9, 0x14]; // OP_DUP OP_HASH160 push20
+        script.extend_from_slice(&[0xdd; 20]); // 20-byte hash
+        script.push(0x88); // OP_EQUALVERIFY
+        script.push(0xac); // OP_CHECKSIG
+        assert_eq!(script.len(), 25);
+
+        let s = make_script(&script);
+        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        assert_eq!(stype, "pubkeyhash");
+        assert!(addr.is_some());
+        assert!(addr.unwrap().starts_with("t1"));
+    }
+
+    #[test]
+    fn test_p2sh_still_works() {
+        // Standard P2SH script
+        let mut script = vec![0xa9, 0x14]; // OP_HASH160 push20
+        script.extend_from_slice(&[0xee; 20]); // 20-byte hash
+        script.push(0x87); // OP_EQUAL
+        assert_eq!(script.len(), 23);
+
+        let s = make_script(&script);
+        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        assert_eq!(stype, "scripthash");
+        assert!(addr.is_some());
+        assert!(addr.unwrap().starts_with("t3"));
+    }
+
+    #[test]
+    fn test_nulldata_still_works() {
+        let script = vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]; // OP_RETURN + data
+        let s = make_script(&script);
+        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        assert_eq!(stype, "nulldata");
+        assert!(addr.is_none());
+    }
+
+    #[test]
+    fn test_hash160() {
+        // Known test vector: hash160 of empty byte slice
+        let result = TransactionParser::hash160(&[]);
+        // SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        // RIPEMD160(above) = b472a266d0bd89c13706a4132ccfb16f7c3b9fcb
+        let expected = hex::decode("b472a266d0bd89c13706a4132ccfb16f7c3b9fcb").unwrap();
+        assert_eq!(result.to_vec(), expected);
     }
 }

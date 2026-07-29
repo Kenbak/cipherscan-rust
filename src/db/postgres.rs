@@ -278,12 +278,13 @@ impl PostgresWriter {
                 for output in &tx.vout {
                     sqlx::query(
                         r#"
-                    INSERT INTO transaction_outputs (txid, vout_index, value, address, script_type)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO transaction_outputs (txid, vout_index, value, address, script_type, script_pubkey)
+                    VALUES ($1, $2, $3, $4, $5, $6)
                     ON CONFLICT (txid, vout_index) DO UPDATE SET
                         value = EXCLUDED.value,
                         address = EXCLUDED.address,
-                        script_type = EXCLUDED.script_type
+                        script_type = EXCLUDED.script_type,
+                        script_pubkey = EXCLUDED.script_pubkey
                     "#,
                     )
                     .bind(&tx.txid)
@@ -291,6 +292,7 @@ impl PostgresWriter {
                     .bind(output.value)
                     .bind(&output.address)
                     .bind(&output.script_type)
+                    .bind(&output.script_pub_key)
                     .execute(&mut *db_tx)
                     .await?;
                 }
@@ -479,21 +481,23 @@ impl PostgresWriter {
         const OUTPUT_CHUNK_SIZE: usize = 10_000;
         for chunk in outputs.chunks(OUTPUT_CHUNK_SIZE) {
             let mut query = QueryBuilder::<Postgres>::new(
-                "INSERT INTO transaction_outputs (txid, vout_index, value, address, script_type) ",
+                "INSERT INTO transaction_outputs (txid, vout_index, value, address, script_type, script_pubkey) ",
             );
             query.push_values(chunk, |mut row, (txid, output)| {
                 row.push_bind(*txid)
                     .push_bind(output.n as i32)
                     .push_bind(output.value)
                     .push_bind(&output.address)
-                    .push_bind(&output.script_type);
+                    .push_bind(&output.script_type)
+                    .push_bind(&output.script_pub_key);
             });
             query.push(
                 r#"
                 ON CONFLICT (txid, vout_index) DO UPDATE SET
                     value = EXCLUDED.value,
                     address = EXCLUDED.address,
-                    script_type = EXCLUDED.script_type
+                    script_type = EXCLUDED.script_type,
+                    script_pubkey = EXCLUDED.script_pubkey
                 "#,
             );
             query.build().execute(&mut **db_tx).await?;
