@@ -9,6 +9,8 @@ pub mod proto {
 
 use proto::indexer_client::IndexerClient;
 use proto::Empty;
+use std::time::Duration;
+use tonic::transport::Endpoint;
 use tonic::Streaming;
 
 /// Connect to Zebra's gRPC indexer and return a ChainTipChange stream.
@@ -16,7 +18,12 @@ use tonic::Streaming;
 pub async fn connect_chain_tip_stream(
     url: &str,
 ) -> Result<Streaming<proto::BlockHashAndHeight>, String> {
-    let mut client = IndexerClient::connect(url.to_string())
+    let endpoint = Endpoint::from_shared(url.to_string())
+        .map_err(|e| format!("Invalid gRPC URL: {}", e))?
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30));
+
+    let mut client = IndexerClient::connect(endpoint)
         .await
         .map_err(|e| format!("gRPC connect failed: {}", e))?;
 

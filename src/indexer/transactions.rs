@@ -425,9 +425,11 @@ impl TransactionParser {
 
         // Calculate fee:
         // fee = transparent_in + shielded_value_balance - transparent_out
-        // where shielded_value_balance = sapling_value_balance + orchard_value_balance
+        // where shielded_value_balance = sapling + orchard + ironwood
         // (positive value_balance means ZEC leaving shielded pool = more inputs)
-        let shielded_value_balance = tx.sapling_value_balance + tx.orchard_value_balance;
+        let shielded_value_balance = tx.sapling_value_balance
+            + tx.orchard_value_balance
+            + tx.ironwood_value_balance;
         let fee = tx.transparent_value_in + shielded_value_balance - tx.transparent_value_out;
 
         // Fee should always be positive (or zero for edge cases)

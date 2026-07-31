@@ -24,6 +24,11 @@ impl PostgresWriter {
         Ok(Self { pool })
     }
 
+    /// Access the underlying connection pool
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Update indexer state (checkpoint)
     pub async fn update_checkpoint(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
         sqlx::query(

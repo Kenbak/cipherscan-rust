@@ -6,6 +6,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Zebra RPC client
 pub struct ZebraRpc {
@@ -93,7 +94,11 @@ impl ZebraRpc {
             None
         };
 
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
         Ok(Self { client, url, auth })
     }
