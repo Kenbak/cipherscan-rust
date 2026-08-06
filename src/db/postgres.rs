@@ -541,6 +541,30 @@ impl PostgresWriter {
             query.build().execute(&mut **db_tx).await?;
         }
 
+        // Mark referenced outputs as spent (forward tracking)
+        let spent_refs: Vec<_> = transactions
+            .iter()
+            .flat_map(|tx| {
+                tx.vin
+                    .iter()
+                    .filter(|input| !input.is_coinbase)
+                    .map(move |input| (tx.txid.as_str(), input.txid.as_str(), input.vout as i32))
+            })
+            .collect();
+        for (spending_txid, prev_txid, prev_vout) in &spent_refs {
+            sqlx::query(
+                r#"UPDATE transaction_outputs
+                   SET spent = TRUE, spent_txid = $1, spent_at = to_timestamp($2::double precision)
+                   WHERE txid = $3 AND vout_index = $4 AND spent = FALSE"#
+            )
+            .bind(*spending_txid)
+            .bind(timestamp as f64)
+            .bind(*prev_txid)
+            .bind(*prev_vout)
+            .execute(&mut **db_tx)
+            .await?;
+        }
+
         struct AddressTransactionRow<'a> {
             address: &'a str,
             txid: &'a str,
