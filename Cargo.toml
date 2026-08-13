@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Fast Rust indexer for CipherScan - reads directly from Zebra's RocksDB"
 authors = ["CipherScan"]
-license = "AGPL-3.0"
+license = "MIT"
 
 [dependencies]
 # Async runtime

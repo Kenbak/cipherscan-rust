@@ -344,7 +344,7 @@ RUST_LOG=debug cargo run -- status
 
 ## License
 
-AGPL-3.0 + Commons Clause - see [LICENSE](LICENSE) file.
+MIT — see [LICENSE](LICENSE) file.
 
 ## Related Projects
 
