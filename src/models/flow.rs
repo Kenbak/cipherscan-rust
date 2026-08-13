@@ -195,6 +195,8 @@ mod tests {
             sapling_value_balance: 0,
             orchard_value_balance: 10000, // fee only
             ironwood_value_balance: 0,
+            orchard_anchor: None,
+            ironwood_anchor: None,
             fee: Some(10000),
             vin: vec![],
             vout: vec![],
@@ -228,6 +230,8 @@ mod tests {
             sapling_value_balance: 5000000,    // 0.05 ZEC leaving Sapling
             orchard_value_balance: -4990000,   // ~0.05 ZEC entering Orchard (minus fee)
             ironwood_value_balance: 0,
+            orchard_anchor: None,
+            ironwood_anchor: None,
             fee: Some(10000),
             vin: vec![],
             vout: vec![],
@@ -261,6 +265,8 @@ mod tests {
             sapling_value_balance: 0,
             orchard_value_balance: 10010000,   // 0.1 ZEC + fee leaving Orchard
             ironwood_value_balance: -10000000, // 0.1 ZEC entering Ironwood
+            orchard_anchor: None,
+            ironwood_anchor: None,
             fee: Some(10000),
             vin: vec![],
             vout: vec![],

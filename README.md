@@ -1,14 +1,17 @@
 # CipherScan Rust Indexer
 
-High-performance Zcash blockchain indexer written in Rust. Reads directly from Zebra's RocksDB state for maximum speed.
+High-performance Zcash blockchain indexer written in Rust. Reads directly from Zebra's RocksDB state for maximum speed. Powers [CipherScan](https://cipherscan.app).
 
 ## Features
 
 - **Direct RocksDB access**: No RPC overhead, reads Zebra's state directly
-- **~100 blocks/sec**: 10-50x faster than the Node.js indexer
-- **Full data parity**: Produces identical data to the Node.js indexer
-- **PostgreSQL output**: Same schema, drop-in replacement
-- **Validation mode**: Compare output against existing production data
+- **~100 blocks/sec backfill**: 20-50x faster than JSON-RPC indexing
+- **Live mode with gRPC**: Instant block notifications via Zebra's gRPC stream
+- **Reorg handling**: Automatic fork detection, rollback, and orphan archival
+- **Full Ironwood/NU6.3 support**: v6 transactions, Ironwood pool balances, anchors
+- **Shielded flow classification**: Shield/deshield detection across all pools
+- **Health monitoring**: Telegram alerts, heartbeat tracking, systemd integration
+- **PostgreSQL output**: Atomic batch writes with COPY protocol
 
 ## Requirements
 
@@ -158,6 +161,35 @@ psql -U user -d zcash_explorer -f schema/migrations/001_rust_indexer_support.sql
 ## Architecture
 
 ```
+src/
+├── main.rs              CLI definitions + dispatch (329 lines)
+├── config.rs            Environment-based configuration
+├── util.rs              Shared utilities (hash encoding, timestamps)
+├── commands/
+│   ├── analyze.rs       RocksDB structure analysis
+│   ├── backfill.rs      Bulk indexing (genesis → tip)
+│   ├── compare.rs       Production data comparison
+│   ├── inspect.rs       Block/transaction inspection
+│   ├── live.rs          Chain-tip follower
+│   ├── repair.rs        Fee recalculation (Ironwood fix)
+│   ├── status.rs        Health + status reporting
+│   ├── validate.rs      Full index validation suite
+│   └── verify.rs        RPC cross-check verification
+├── db/
+│   ├── rocks.rs         Zebra RocksDB reader
+│   ├── postgres.rs      PostgreSQL writer (bulk + rowwise)
+│   ├── rpc.rs           Zebra JSON-RPC client
+│   └── grpc.rs          Zebra gRPC chain-tip stream
+├── indexer/
+│   ├── mod.rs           Backfill + live orchestration, reorg handling
+│   └── transactions.rs  Transaction parsing (zebra-chain)
+└── models/
+    ├── transaction.rs   Transaction/Input/Output data types
+    └── flow.rs          Shielded flow classification
+```
+
+Data flow:
+```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │   Zebra Node    │────▶│  Rust Indexer   │────▶│   PostgreSQL    │
 │   (RocksDB)     │     │                 │     │                 │
@@ -198,11 +230,12 @@ Benchmarks on AMD EPYC (8 cores, 32GB RAM, NVMe SSD):
 - Total fees, miner address
 
 ### Transactions
-- txid, block height, version, locktime
-- Size, fee (calculated)
+- txid, block height, version, locktime, expiry height
+- Size, fee (calculated from inputs - outputs - value balances)
 - Input/output counts
-- Value balances (Sapling, Orchard)
-- Shielded component counts
+- Value balances (Sapling, Orchard, Ironwood)
+- Shielded component counts (joinsplits, sapling spends/outputs, orchard/ironwood actions)
+- Anchor roots (Orchard, Ironwood) for ZIP-318 compliance analysis
 - is_coinbase flag
 
 ### Transparent Inputs
@@ -216,7 +249,7 @@ Benchmarks on AMD EPYC (8 cores, 32GB RAM, NVMe SSD):
 
 ### Shielded Flows
 - Flow type: shield or deshield
-- Pool: sapling, orchard, or mixed
+- Pool: sapling, orchard, ironwood, or mixed
 - Amount (net total)
 - Associated transparent addresses
 
@@ -226,7 +259,7 @@ Benchmarks on AMD EPYC (8 cores, 32GB RAM, NVMe SSD):
 Zebra is still running. Stop Zebra or wait for it to release the lock.
 
 ### "column family not found"
-The Zebra state version may be different. Check `ZEBRA_STATE_PATH` points to the correct version (e.g., `v27`).
+The Zebra state version may be different. Check `ZEBRA_STATE_PATH` points to the correct version (e.g., `v28`).
 
 ### Slow performance
 - Ensure NVMe SSD for both RocksDB and PostgreSQL

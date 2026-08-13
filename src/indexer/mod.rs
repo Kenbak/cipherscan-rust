@@ -8,7 +8,8 @@ pub use transactions::TransactionParser;
 use crate::config::Config;
 use crate::db::{PostgresWriter, ZebraState};
 use crate::models::ShieldedFlow;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use crate::util::unix_timestamp_secs;
+use std::time::Instant;
 
 
 fn checkpoint_progress_height(
@@ -21,13 +22,6 @@ fn checkpoint_progress_height(
     } else {
         None
     }
-}
-
-fn unix_timestamp_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// Main indexer orchestrator
@@ -266,11 +260,8 @@ impl Indexer {
 
     /// Index a single block and all its transactions
     async fn index_block(&self, height: u32) -> Result<(u32, u32), String> {
-        // Get block hash
         let hash_bytes = self.zebra.get_block_hash(height)?;
-        let mut hash_rev = hash_bytes;
-        hash_rev.reverse();
-        let block_hash = hex::encode(&hash_rev);
+        let block_hash = crate::util::display_hash(&hash_bytes);
 
         // Get block header for timestamp and other fields
         let header = self.zebra.get_block_header(height)?;

@@ -19,6 +19,7 @@
 # Secrets
 *.pem
 *.key
+*.cookie
 
 # macOS
 .DS_Store

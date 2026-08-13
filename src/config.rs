@@ -41,7 +41,7 @@ pub enum Network {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            zebra_state_path: PathBuf::from("/root/.cache/zebra/state/v27/mainnet"),
+            zebra_state_path: PathBuf::from("/root/.cache/zebra/state/v28/mainnet"),
             database_url: String::from("postgres://localhost/zcash_explorer_mainnet"),
             batch_size: 1000,
             network: Network::Mainnet,

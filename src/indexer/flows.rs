@@ -29,6 +29,8 @@ mod tests {
             sapling_value_balance: -9999000,
             orchard_value_balance: 0,
             ironwood_value_balance: 0,
+            orchard_anchor: None,
+            ironwood_anchor: None,
             fee: Some(1000),
             vin: vec![TransparentInput {
                 txid: "prev".to_string(),
@@ -72,6 +74,8 @@ mod tests {
             sapling_value_balance: 0,
             orchard_value_balance: 10010000,
             ironwood_value_balance: -10000000,
+            orchard_anchor: None,
+            ironwood_anchor: None,
             fee: Some(10000),
             vin: vec![],
             vout: vec![],
