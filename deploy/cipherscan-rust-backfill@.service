@@ -3,25 +3,35 @@
 # Fenced, supervised alternative to running `run-parallel-backfill.sh` (or a
 # bare `cipherscan-indexer backfill`) by hand. It exists specifically to
 # prevent the class of incident from 2026-07-16, where a stale/edited unit
-# invoked `backfill` at the same time another worker was indexing: this unit
-# takes the SAME flock as cipherscan-rust.service
-# (/run/cipherscan-indexer.lock) and additionally declares Conflicts= against
-# it, so systemd will refuse to run both at once and the flock makes any
-# accidental concurrent invocation (systemd-managed or not) fail fast instead
-# of writing to PostgreSQL concurrently.
+# invoked `backfill` at the same time another worker was indexing.
+#
+# Fencing mechanism: ExecStart wraps the binary in `flock -n
+# /run/cipherscan-indexer.lock`, the SAME lock file cipherscan-rust.service
+# holds for its entire run. If the live unit is active, this unit's flock
+# fails immediately (exit 1) and ONLY this unit fails to start — the live
+# unit is completely unaffected.
+#
+# IMPORTANT: do NOT add `Conflicts=cipherscan-rust.service` (or any
+# Conflicts= against it) here. systemd's Conflicts= is symmetric: starting a
+# unit that conflicts with an active unit causes systemd to STOP the active
+# unit as part of the same transaction, before this unit even runs. An
+# earlier revision of this file had Conflicts= and, on 2026-08-15, starting
+# this template while cipherscan-rust.service was active stopped live
+# indexing for ~6 minutes (self-healed with zero missing block heights, but
+# it was still an unintended production outage). The flock alone gives the
+# correct behavior: the new unit fails, the running one is untouched.
 #
 # Usage (manual, one-shot; instance name is "<from>-<to>"):
-#   sudo systemctl start cipherscan-rust-backfill@3000000-3001000.service
+#   systemctl is-active --quiet cipherscan-rust && echo "STOP: live is active" || \
+#     systemctl start cipherscan-rust-backfill@3000000-3001000.service
 #   journalctl -u cipherscan-rust-backfill@3000000-3001000.service -f
 #
-# Never enable this unit for boot-time start, and never run it while
-# cipherscan-rust.service (live) is active — Conflicts= stops systemd from
-# starting both, but always verify with `systemctl is-active cipherscan-rust`
-# first regardless.
+# Never enable this unit for boot-time start, and always confirm
+# `systemctl is-active cipherscan-rust` is NOT "active" before starting it —
+# the flock will refuse to run alongside it, but check first regardless.
 
 [Unit]
 Description=CipherScan Rust Indexer - Fenced Backfill (%i) - DISABLED, ad-hoc use only
-Conflicts=cipherscan-rust.service
 After=network-online.target postgresql.service zebrad-mainnet.service
 
 [Service]
