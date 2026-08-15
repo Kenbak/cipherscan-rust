@@ -1359,6 +1359,35 @@ CREATE TABLE public.transaction_outputs (
 
 ALTER TABLE public.transaction_outputs OWNER TO zcash_user;
 
+-- Reviewed migration 013 state: disclosed keys are analytics, never ownership.
+CREATE TABLE public.transparent_key_exposures (
+    txid text NOT NULL,
+    vout_index integer NOT NULL,
+    key_index integer NOT NULL,
+    pubkey_hex text NOT NULL,
+    script_type text NOT NULL,
+    derived_address text NOT NULL,
+    created_at timestamp without time zone DEFAULT now() NOT NULL,
+    PRIMARY KEY (txid, vout_index, key_index),
+    FOREIGN KEY (txid, vout_index)
+        REFERENCES public.transaction_outputs(txid, vout_index) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_transparent_key_exposures_derived
+    ON public.transparent_key_exposures (derived_address);
+
+CREATE TABLE public.addresses_integrity_rebuild (
+    address text PRIMARY KEY,
+    balance bigint NOT NULL,
+    total_received bigint NOT NULL,
+    total_sent bigint NOT NULL,
+    tx_count integer DEFAULT 0,
+    first_seen bigint,
+    last_seen bigint,
+    address_type text,
+    updated_at timestamp without time zone DEFAULT now()
+);
+
 --
 -- Name: turnstile_daily; Type: TABLE; Schema: public; Owner: zcash_user
 --

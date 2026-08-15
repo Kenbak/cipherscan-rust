@@ -2,11 +2,11 @@
 //!
 //! Uses zebra-chain's native deserialization for proper parsing of all tx versions.
 
+use crate::config::Network;
+use crate::models::{PubkeyExposure, Transaction, TransparentInput, TransparentOutput};
 use std::io::Cursor;
 use zebra_chain::serialization::ZcashDeserialize;
 use zebra_chain::transaction::Transaction as ZebraTransaction;
-use crate::config::Network;
-use crate::models::{Transaction, TransparentInput, TransparentOutput};
 
 /// Transaction parser using zebra-chain
 pub struct TransactionParser;
@@ -21,7 +21,12 @@ impl TransactionParser {
     }
 
     /// Parse a raw transaction from bytes using zebra-chain
-    pub fn parse(raw: &[u8], block_height: u32, block_hash: &str, network: Network) -> Result<Transaction, String> {
+    pub fn parse(
+        raw: &[u8],
+        block_height: u32,
+        block_hash: &str,
+        network: Network,
+    ) -> Result<Transaction, String> {
         // Use zebra-chain to deserialize
         let mut cursor = Cursor::new(raw);
         let zebra_tx = ZebraTransaction::zcash_deserialize(&mut cursor)
@@ -78,7 +83,11 @@ impl TransactionParser {
                         script_sig: Some(hex::encode(data)),
                     });
                 }
-                Input::PrevOut { outpoint, unlock_script, .. } => {
+                Input::PrevOut {
+                    outpoint,
+                    unlock_script,
+                    ..
+                } => {
                     vin.push(TransparentInput {
                         txid: outpoint.hash.to_string(),
                         vout: outpoint.index,
@@ -102,7 +111,8 @@ impl TransactionParser {
                 .ok_or_else(|| format!("Overflow in transparent_value_out at output {}", n))?;
 
             // Try to get address from lock script
-            let (address, script_type) = Self::parse_output_script(&output.lock_script, network);
+            let (address, script_type, pubkey_exposures) =
+                Self::parse_output_script(&output.lock_script, network);
 
             vout.push(TransparentOutput {
                 n: n as u32,
@@ -110,6 +120,7 @@ impl TransactionParser {
                 address,
                 script_type,
                 script_pub_key: Some(hex::encode(output.lock_script.as_raw_bytes())),
+                pubkey_exposures,
             });
         }
 
@@ -117,21 +128,38 @@ impl TransactionParser {
         let (joinsplit_count, sapling_spends, sapling_outputs, orchard_actions) = match &tx {
             V1 { .. } | V2 { .. } => (0, 0, 0, 0),
             V3 { joinsplit_data, .. } => {
-                let js_count = joinsplit_data.as_ref().map(|d| d.joinsplits().count()).unwrap_or(0);
+                let js_count = joinsplit_data
+                    .as_ref()
+                    .map(|d| d.joinsplits().count())
+                    .unwrap_or(0);
                 (js_count as u16, 0, 0, 0)
             }
-            V4 { joinsplit_data, sapling_shielded_data, .. } => {
-                let js_count = joinsplit_data.as_ref().map(|d| d.joinsplits().count()).unwrap_or(0);
-                let (spends, outputs) = sapling_shielded_data.as_ref()
+            V4 {
+                joinsplit_data,
+                sapling_shielded_data,
+                ..
+            } => {
+                let js_count = joinsplit_data
+                    .as_ref()
+                    .map(|d| d.joinsplits().count())
+                    .unwrap_or(0);
+                let (spends, outputs) = sapling_shielded_data
+                    .as_ref()
                     .map(|d| (d.spends().count(), d.outputs().count()))
                     .unwrap_or((0, 0));
                 (js_count as u16, spends as u16, outputs as u16, 0)
             }
-            V5 { sapling_shielded_data, orchard_shielded_data, .. } => {
-                let (spends, outputs) = sapling_shielded_data.as_ref()
+            V5 {
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ..
+            } => {
+                let (spends, outputs) = sapling_shielded_data
+                    .as_ref()
                     .map(|d| (d.spends().count(), d.outputs().count()))
                     .unwrap_or((0, 0));
-                let actions = orchard_shielded_data.as_ref()
+                let actions = orchard_shielded_data
+                    .as_ref()
                     .map(|d| d.actions.len())
                     .unwrap_or(0);
                 (0, spends as u16, outputs as u16, actions as u16)
@@ -139,11 +167,17 @@ impl TransactionParser {
             // NU6.3 v6: Sapling is V5-shaped; the v6 Orchard bundle is ShieldedDataV6,
             // which exposes the underlying Orchard ShieldedData via .data(). Ironwood
             // is counted separately below.
-            V6 { sapling_shielded_data, orchard_shielded_data, .. } => {
-                let (spends, outputs) = sapling_shielded_data.as_ref()
+            V6 {
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ..
+            } => {
+                let (spends, outputs) = sapling_shielded_data
+                    .as_ref()
                     .map(|d| (d.spends().count(), d.outputs().count()))
                     .unwrap_or((0, 0));
-                let actions = orchard_shielded_data.as_ref()
+                let actions = orchard_shielded_data
+                    .as_ref()
                     .map(|d| d.data().actions.len())
                     .unwrap_or(0);
                 (0, spends as u16, outputs as u16, actions as u16)
@@ -153,56 +187,70 @@ impl TransactionParser {
         // NU6.3 Ironwood actions (v6 only). ironwood::ShieldedData wraps an Orchard
         // v6 bundle; reach the Orchard actions through .data().
         let ironwood_actions: u16 = match &tx {
-            V6 { ironwood_shielded_data, .. } => {
-                ironwood_shielded_data.as_ref()
-                    .map(|d| d.data().actions.len())
-                    .unwrap_or(0) as u16
-            }
+            V6 {
+                ironwood_shielded_data,
+                ..
+            } => ironwood_shielded_data
+                .as_ref()
+                .map(|d| d.data().actions.len())
+                .unwrap_or(0) as u16,
             _ => 0,
         };
 
         // Get value balances
         let sapling_value_balance: i64 = match &tx {
-            V4 { sapling_shielded_data, .. } => {
-                sapling_shielded_data.as_ref()
-                    .map(|d| i64::from(d.value_balance))
-                    .unwrap_or(0)
-            }
-            V5 { sapling_shielded_data, .. } => {
-                sapling_shielded_data.as_ref()
-                    .map(|d| i64::from(d.value_balance))
-                    .unwrap_or(0)
-            }
-            V6 { sapling_shielded_data, .. } => {
-                sapling_shielded_data.as_ref()
-                    .map(|d| i64::from(d.value_balance))
-                    .unwrap_or(0)
-            }
+            V4 {
+                sapling_shielded_data,
+                ..
+            } => sapling_shielded_data
+                .as_ref()
+                .map(|d| i64::from(d.value_balance))
+                .unwrap_or(0),
+            V5 {
+                sapling_shielded_data,
+                ..
+            } => sapling_shielded_data
+                .as_ref()
+                .map(|d| i64::from(d.value_balance))
+                .unwrap_or(0),
+            V6 {
+                sapling_shielded_data,
+                ..
+            } => sapling_shielded_data
+                .as_ref()
+                .map(|d| i64::from(d.value_balance))
+                .unwrap_or(0),
             _ => 0,
         };
 
         let orchard_value_balance: i64 = match &tx {
-            V5 { orchard_shielded_data, .. } => {
-                orchard_shielded_data.as_ref()
-                    .map(|d| i64::from(d.value_balance))
-                    .unwrap_or(0)
-            }
-            V6 { orchard_shielded_data, .. } => {
-                orchard_shielded_data.as_ref()
-                    .map(|d| i64::from(d.data().value_balance))
-                    .unwrap_or(0)
-            }
+            V5 {
+                orchard_shielded_data,
+                ..
+            } => orchard_shielded_data
+                .as_ref()
+                .map(|d| i64::from(d.value_balance))
+                .unwrap_or(0),
+            V6 {
+                orchard_shielded_data,
+                ..
+            } => orchard_shielded_data
+                .as_ref()
+                .map(|d| i64::from(d.data().value_balance))
+                .unwrap_or(0),
             _ => 0,
         };
 
         // NU6.3 Ironwood value balance (v6 only). Negative = into Ironwood,
         // positive = out of Ironwood — same sign convention as Orchard.
         let ironwood_value_balance: i64 = match &tx {
-            V6 { ironwood_shielded_data, .. } => {
-                ironwood_shielded_data.as_ref()
-                    .map(|d| i64::from(d.data().value_balance))
-                    .unwrap_or(0)
-            }
+            V6 {
+                ironwood_shielded_data,
+                ..
+            } => ironwood_shielded_data
+                .as_ref()
+                .map(|d| i64::from(d.data().value_balance))
+                .unwrap_or(0),
             _ => 0,
         };
 
@@ -210,22 +258,28 @@ impl TransactionParser {
         // ZIP-318 compliance requires the Orchard anchor to reference a boundary-aligned
         // block height (height % 144 == 0).
         let orchard_anchor: Option<String> = match &tx {
-            V5 { orchard_shielded_data, .. } => {
-                orchard_shielded_data.as_ref()
-                    .map(|d| hex::encode(<[u8; 32]>::from(d.shared_anchor)))
-            }
-            V6 { orchard_shielded_data, .. } => {
-                orchard_shielded_data.as_ref()
-                    .map(|d| hex::encode(<[u8; 32]>::from(d.data().shared_anchor)))
-            }
+            V5 {
+                orchard_shielded_data,
+                ..
+            } => orchard_shielded_data
+                .as_ref()
+                .map(|d| hex::encode(<[u8; 32]>::from(d.shared_anchor))),
+            V6 {
+                orchard_shielded_data,
+                ..
+            } => orchard_shielded_data
+                .as_ref()
+                .map(|d| hex::encode(<[u8; 32]>::from(d.data().shared_anchor))),
             _ => None,
         };
 
         let ironwood_anchor: Option<String> = match &tx {
-            V6 { ironwood_shielded_data, .. } => {
-                ironwood_shielded_data.as_ref()
-                    .map(|d| hex::encode(<[u8; 32]>::from(d.data().shared_anchor)))
-            }
+            V6 {
+                ironwood_shielded_data,
+                ..
+            } => ironwood_shielded_data
+                .as_ref()
+                .map(|d| hex::encode(<[u8; 32]>::from(d.data().shared_anchor))),
             _ => None,
         };
 
@@ -267,11 +321,14 @@ impl TransactionParser {
     }
 
     /// Parse output script to get address and type
-    fn parse_output_script(script: &zebra_chain::transparent::Script, network: Network) -> (Option<String>, String) {
+    fn parse_output_script(
+        script: &zebra_chain::transparent::Script,
+        network: Network,
+    ) -> (Option<String>, String, Vec<PubkeyExposure>) {
         let bytes = script.as_raw_bytes();
 
         if bytes.is_empty() {
-            return (None, "empty".to_string());
+            return (None, "empty".to_string(), Vec::new());
         }
 
         let (p2pkh_prefix, p2sh_prefix) = Self::addr_prefixes(network);
@@ -282,22 +339,24 @@ impl TransactionParser {
             && bytes[1] == 0xa9  // OP_HASH160
             && bytes[2] == 0x14  // Push 20 bytes
             && bytes[23] == 0x88 // OP_EQUALVERIFY
-            && bytes[24] == 0xac // OP_CHECKSIG
+            && bytes[24] == 0xac
+        // OP_CHECKSIG
         {
             let hash = &bytes[3..23];
             let address = Self::encode_address(&p2pkh_prefix, hash);
-            return (Some(address), "pubkeyhash".to_string());
+            return (Some(address), "pubkeyhash".to_string(), Vec::new());
         }
 
         // P2SH: OP_HASH160 <20 bytes> OP_EQUAL
         if bytes.len() == 23
             && bytes[0] == 0xa9  // OP_HASH160
             && bytes[1] == 0x14  // Push 20 bytes
-            && bytes[22] == 0x87 // OP_EQUAL
+            && bytes[22] == 0x87
+        // OP_EQUAL
         {
             let hash = &bytes[2..22];
             let address = Self::encode_address(&p2sh_prefix, hash);
-            return (Some(address), "scripthash".to_string());
+            return (Some(address), "scripthash".to_string(), Vec::new());
         }
 
         // P2PK (compressed): <0x21><33-byte-pubkey><OP_CHECKSIG>
@@ -307,21 +366,21 @@ impl TransactionParser {
             && bytes[34] == 0xac
         {
             let pubkey = &bytes[1..34];
-            let hash160 = Self::hash160(pubkey);
-            let address = Self::encode_address(&p2pkh_prefix, &hash160);
-            return (Some(address), "pubkey".to_string());
+            return (
+                None,
+                "pubkey".to_string(),
+                vec![Self::pubkey_exposure(0, pubkey, &p2pkh_prefix)],
+            );
         }
 
         // P2PK (uncompressed): <0x41><65-byte-pubkey><OP_CHECKSIG>
-        if bytes.len() == 67
-            && bytes[0] == 0x41
-            && bytes[1] == 0x04
-            && bytes[66] == 0xac
-        {
+        if bytes.len() == 67 && bytes[0] == 0x41 && bytes[1] == 0x04 && bytes[66] == 0xac {
             let pubkey = &bytes[1..66];
-            let hash160 = Self::hash160(pubkey);
-            let address = Self::encode_address(&p2pkh_prefix, &hash160);
-            return (Some(address), "pubkey".to_string());
+            return (
+                None,
+                "pubkey".to_string(),
+                vec![Self::pubkey_exposure(0, pubkey, &p2pkh_prefix)],
+            );
         }
 
         // Bare multisig: OP_m <pubkeys...> OP_n OP_CHECKMULTISIG
@@ -330,26 +389,33 @@ impl TransactionParser {
             let n_byte = bytes[bytes.len() - 2];
             let n = n_byte as i32 - 0x50;
             if m >= 1 && m <= 16 && n >= 1 && n <= 16 && m <= n {
-                if let Some(first_pubkey) = Self::extract_first_multisig_pubkey(&bytes[1..bytes.len() - 2], n as usize) {
-                    let hash160 = Self::hash160(first_pubkey);
-                    let address = Self::encode_address(&p2pkh_prefix, &hash160);
-                    return (Some(address), "multisig".to_string());
+                if let Some(pubkeys) =
+                    Self::extract_multisig_pubkeys(&bytes[1..bytes.len() - 2], n as usize)
+                {
+                    let exposures = pubkeys
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, pubkey)| {
+                            Self::pubkey_exposure(index as u16, pubkey, &p2pkh_prefix)
+                        })
+                        .collect();
+                    return (None, "multisig".to_string(), exposures);
                 }
             }
         }
 
         // OP_RETURN
         if !bytes.is_empty() && bytes[0] == 0x6a {
-            return (None, "nulldata".to_string());
+            return (None, "nulldata".to_string(), Vec::new());
         }
 
-        (None, "nonstandard".to_string())
+        (None, "nonstandard".to_string(), Vec::new())
     }
 
     /// SHA256 + RIPEMD160 (standard Bitcoin/Zcash pubkey-to-address hash)
     fn hash160(data: &[u8]) -> [u8; 20] {
-        use sha2::{Sha256, Digest};
         use ripemd::Ripemd160;
+        use sha2::{Digest, Sha256};
 
         let sha = Sha256::digest(data);
         let ripe = Ripemd160::digest(&sha);
@@ -358,30 +424,40 @@ impl TransactionParser {
         out
     }
 
-    /// Extract the first public key from bare multisig script body.
-    /// Returns None if the script doesn't contain valid pubkey pushes.
-    fn extract_first_multisig_pubkey(script_body: &[u8], _expected_n: usize) -> Option<&[u8]> {
-        if script_body.is_empty() {
-            return None;
+    fn pubkey_exposure(index: u16, pubkey: &[u8], prefix: &[u8]) -> PubkeyExposure {
+        PubkeyExposure {
+            pubkey_index: index,
+            pubkey_hex: hex::encode(pubkey),
+            derived_p2pkh: Self::encode_address(prefix, &Self::hash160(pubkey)),
         }
-        let push_len = script_body[0] as usize;
-        if push_len == 33 && script_body.len() > 34 {
-            let pubkey = &script_body[1..34];
-            if pubkey[0] == 0x02 || pubkey[0] == 0x03 {
-                return Some(pubkey);
+    }
+
+    /// Parse every canonical direct pubkey push and require the declared key count.
+    fn extract_multisig_pubkeys(script_body: &[u8], expected_n: usize) -> Option<Vec<&[u8]>> {
+        let mut cursor = 0;
+        let mut pubkeys = Vec::with_capacity(expected_n);
+        while cursor < script_body.len() {
+            let push_len = *script_body.get(cursor)? as usize;
+            if push_len != 33 && push_len != 65 {
+                return None;
             }
-        } else if push_len == 65 && script_body.len() > 66 {
-            let pubkey = &script_body[1..66];
-            if pubkey[0] == 0x04 {
-                return Some(pubkey);
+            let start = cursor.checked_add(1)?;
+            let end = start.checked_add(push_len)?;
+            let pubkey = script_body.get(start..end)?;
+            let valid = (push_len == 33 && matches!(pubkey[0], 0x02 | 0x03))
+                || (push_len == 65 && pubkey[0] == 0x04);
+            if !valid {
+                return None;
             }
+            pubkeys.push(pubkey);
+            cursor = end;
         }
-        None
+        (pubkeys.len() == expected_n).then_some(pubkeys)
     }
 
     /// Encode address with Base58Check
     fn encode_address(prefix: &[u8], hash: &[u8]) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut data = Vec::with_capacity(prefix.len() + hash.len() + 4);
         data.extend_from_slice(prefix);
@@ -397,52 +473,64 @@ impl TransactionParser {
 
     /// Resolve input addresses and values by looking up previous outputs
     /// This mutates the transaction in place, and calculates the fee
-    pub fn resolve_inputs(tx: &mut Transaction, zebra: &crate::db::ZebraState) {
+    pub fn resolve_inputs(
+        tx: &mut Transaction,
+        zebra: &crate::db::ZebraState,
+    ) -> Result<(), String> {
         // Skip coinbase - no inputs to resolve, no fee
         if tx.vin.iter().any(|v| v.is_coinbase) {
             tx.fee = None;
-            return;
+            return Ok(());
         }
 
         for input in tx.vin.iter_mut() {
             // Look up the previous output
-            match zebra.get_prev_output(&input.txid, input.vout) {
-                Ok((value, address)) => {
-                    input.value = Some(value);
-                    input.address = address;
-                }
-                Err(_e) => {
-                    // Previous output not found (might be from before our indexed range)
-                    // This is normal during partial backfills
-                }
-            }
+            let (value, address) = zebra
+                .get_prev_output(&input.txid, input.vout)
+                .map_err(|e| {
+                    format!(
+                        "unresolved prevout {}:{} for {}: {}",
+                        input.txid, input.vout, tx.txid, e
+                    )
+                })?;
+            input.value = Some(value);
+            input.address = address;
         }
 
         // Recalculate transparent_value_in
-        tx.transparent_value_in = tx.vin.iter()
-            .filter_map(|v| v.value)
-            .sum();
+        tx.transparent_value_in = tx.vin.iter().try_fold(0i64, |total, input| {
+            total
+                .checked_add(input.value.unwrap_or(0))
+                .ok_or_else(|| format!("transparent input overflow for {}", tx.txid))
+        })?;
 
         // Calculate fee:
         // fee = transparent_in + shielded_value_balance - transparent_out
         // where shielded_value_balance = sapling + orchard + ironwood
         // (positive value_balance means ZEC leaving shielded pool = more inputs)
-        let shielded_value_balance = tx.sapling_value_balance
-            + tx.orchard_value_balance
-            + tx.ironwood_value_balance;
-        let fee = tx.transparent_value_in + shielded_value_balance - tx.transparent_value_out;
+        let shielded_value_balance = tx
+            .sapling_value_balance
+            .checked_add(tx.orchard_value_balance)
+            .and_then(|v| v.checked_add(tx.ironwood_value_balance))
+            .ok_or_else(|| format!("shielded value balance overflow for {}", tx.txid))?;
+        let fee = tx
+            .transparent_value_in
+            .checked_add(shielded_value_balance)
+            .and_then(|v| v.checked_sub(tx.transparent_value_out))
+            .ok_or_else(|| format!("fee overflow for {}", tx.txid))?;
 
         // Fee should always be positive (or zero for edge cases)
         tx.fee = if fee >= 0 { Some(fee) } else { None };
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zebra_chain::transaction::LockTime;
     use zebra_chain::block::Height;
     use zebra_chain::serialization::ZcashSerialize;
+    use zebra_chain::transaction::LockTime;
 
     #[test]
     fn test_address_encoding_mainnet() {
@@ -505,10 +593,11 @@ mod tests {
         assert_eq!(script.len(), 35);
 
         let s = make_script(&script);
-        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        let (addr, stype, exposures) = TransactionParser::parse_output_script(&s, Network::Mainnet);
         assert_eq!(stype, "pubkey");
-        assert!(addr.is_some());
-        assert!(addr.unwrap().starts_with("t1"));
+        assert!(addr.is_none());
+        assert_eq!(exposures.len(), 1);
+        assert!(exposures[0].derived_p2pkh.starts_with("t1"));
     }
 
     #[test]
@@ -521,10 +610,10 @@ mod tests {
         assert_eq!(script.len(), 67);
 
         let s = make_script(&script);
-        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        let (addr, stype, exposures) = TransactionParser::parse_output_script(&s, Network::Mainnet);
         assert_eq!(stype, "pubkey");
-        assert!(addr.is_some());
-        assert!(addr.unwrap().starts_with("t1"));
+        assert!(addr.is_none());
+        assert_eq!(exposures.len(), 1);
     }
 
     #[test]
@@ -535,10 +624,10 @@ mod tests {
         script.push(0xac);
 
         let s = make_script(&script);
-        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Testnet);
+        let (addr, stype, exposures) = TransactionParser::parse_output_script(&s, Network::Testnet);
         assert_eq!(stype, "pubkey");
-        assert!(addr.is_some());
-        assert!(addr.unwrap().starts_with("tm"));
+        assert!(addr.is_none());
+        assert!(exposures[0].derived_p2pkh.starts_with("tm"));
     }
 
     #[test]
@@ -554,10 +643,13 @@ mod tests {
         script.push(0xae); // OP_CHECKMULTISIG
 
         let s = make_script(&script);
-        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        let (addr, stype, exposures) = TransactionParser::parse_output_script(&s, Network::Mainnet);
         assert_eq!(stype, "multisig");
-        assert!(addr.is_some());
-        assert!(addr.unwrap().starts_with("t1"));
+        assert!(addr.is_none());
+        assert_eq!(exposures.len(), 3);
+        assert!(exposures
+            .iter()
+            .all(|item| item.derived_p2pkh.starts_with("t1")));
     }
 
     #[test]
@@ -570,7 +662,7 @@ mod tests {
         assert_eq!(script.len(), 25);
 
         let s = make_script(&script);
-        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        let (addr, stype, _) = TransactionParser::parse_output_script(&s, Network::Mainnet);
         assert_eq!(stype, "pubkeyhash");
         assert!(addr.is_some());
         assert!(addr.unwrap().starts_with("t1"));
@@ -585,7 +677,7 @@ mod tests {
         assert_eq!(script.len(), 23);
 
         let s = make_script(&script);
-        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        let (addr, stype, _) = TransactionParser::parse_output_script(&s, Network::Mainnet);
         assert_eq!(stype, "scripthash");
         assert!(addr.is_some());
         assert!(addr.unwrap().starts_with("t3"));
@@ -595,7 +687,7 @@ mod tests {
     fn test_nulldata_still_works() {
         let script = vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]; // OP_RETURN + data
         let s = make_script(&script);
-        let (addr, stype) = TransactionParser::parse_output_script(&s, Network::Mainnet);
+        let (addr, stype, _) = TransactionParser::parse_output_script(&s, Network::Mainnet);
         assert_eq!(stype, "nulldata");
         assert!(addr.is_none());
     }

@@ -1,6 +1,6 @@
 //! Transaction data model
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Zcash transaction
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,11 +20,11 @@ pub struct Transaction {
     pub transparent_value_out: i64,
 
     // Shielded counts
-    pub joinsplit_count: u16,      // Sprout
+    pub joinsplit_count: u16, // Sprout
     pub sapling_spends: u16,
     pub sapling_outputs: u16,
     pub orchard_actions: u16,
-    pub ironwood_actions: u16,     // NU6.3 Ironwood pool (v6 tx)
+    pub ironwood_actions: u16, // NU6.3 Ironwood pool (v6 tx)
 
     // Value balances (negative = into shielded, positive = out of shielded)
     pub sapling_value_balance: i64,
@@ -54,8 +54,8 @@ impl Transaction {
 /// Transparent input (vin)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransparentInput {
-    pub txid: String,       // Previous output txid
-    pub vout: u32,          // Previous output index
+    pub txid: String, // Previous output txid
+    pub vout: u32,    // Previous output index
     pub address: Option<String>,
     pub value: Option<i64>, // In zatoshis
     pub is_coinbase: bool,
@@ -67,12 +67,23 @@ pub struct TransparentInput {
 /// Transparent output (vout)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransparentOutput {
-    pub n: u32,             // Output index
-    pub value: i64,         // In zatoshis
+    pub n: u32,     // Output index
+    pub value: i64, // In zatoshis
     pub address: Option<String>,
     pub script_type: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub script_pub_key: Option<String>,
+
+    /// Public keys disclosed by P2PK and bare multisig scripts. These are
+    /// analytics metadata only and never imply ownership by a derived address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pubkey_exposures: Vec<PubkeyExposure>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PubkeyExposure {
+    pub pubkey_index: u16,
+    pub pubkey_hex: String,
+    pub derived_p2pkh: String,
+}

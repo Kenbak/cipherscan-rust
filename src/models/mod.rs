@@ -1,8 +1,8 @@
 //! Data models for CipherScan
 
-mod transaction;
 mod flow;
+mod transaction;
 
-pub use transaction::{Transaction, TransparentInput, TransparentOutput};
 #[allow(unused_imports)]
-pub use flow::{ShieldedFlow, FlowType, Pool};
+pub use flow::{FlowType, Pool, ShieldedFlow};
+pub use transaction::{PubkeyExposure, Transaction, TransparentInput, TransparentOutput};

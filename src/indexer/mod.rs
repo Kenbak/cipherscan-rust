@@ -9,9 +9,16 @@ use crate::config::Config;
 use crate::db::{PostgresWriter, ZebraState};
 use crate::models::ShieldedFlow;
 use crate::util::unix_timestamp_secs;
+use std::collections::HashMap;
 use std::time::Instant;
 
-
+fn cached_prev_output(
+    key: &(String, u32),
+    current: &HashMap<(String, u32), (i64, Option<String>)>,
+    database: &HashMap<(String, u32), (i64, Option<String>)>,
+) -> Option<(i64, Option<String>)> {
+    current.get(key).or_else(|| database.get(key)).cloned()
+}
 fn checkpoint_progress_height(
     current_height: u32,
     end_height: u32,
@@ -170,8 +177,12 @@ impl Indexer {
             return Ok(None); // chain is consistent
         }
 
-        println!("🔄 REORG DETECTED at height {} — DB hash {} != canonical {}",
-            last_indexed, &db_hash[..16.min(db_hash.len())], &canonical_hash[..16.min(canonical_hash.len())]);
+        println!(
+            "🔄 REORG DETECTED at height {} — DB hash {} != canonical {}",
+            last_indexed,
+            &db_hash[..16.min(db_hash.len())],
+            &canonical_hash[..16.min(canonical_hash.len())]
+        );
 
         // Walk backward to find the fork point (common ancestor)
         let max_depth = self.config.max_reorg_depth;
@@ -200,13 +211,17 @@ impl Indexer {
 
             if stored == canonical {
                 fork_height = check_height + 1;
-                println!("   📍 Fork point: height {} (common ancestor: {})", fork_height, check_height);
+                println!(
+                    "   📍 Fork point: height {} (common ancestor: {})",
+                    fork_height, check_height
+                );
                 break;
             }
 
             if depth == max_depth {
                 return Err(format!(
-                    "Reorg deeper than {} blocks — manual intervention required", max_depth
+                    "Reorg deeper than {} blocks — manual intervention required",
+                    max_depth
                 ));
             }
         }
@@ -223,11 +238,20 @@ impl Indexer {
         // which stores raw hex as blocks are indexed (before any reorg occurs).
         let mut raw_blocks: Vec<(String, String)> = Vec::new();
         for h in fork_height..=last_indexed {
-            let hash = self.postgres.get_block_hash_at_height(h).await.ok().flatten();
+            let hash = self
+                .postgres
+                .get_block_hash_at_height(h)
+                .await
+                .ok()
+                .flatten();
             if let Some(hash) = hash {
                 match rpc.get_raw_block_hex(&hash).await {
                     Ok(hex) => {
-                        println!("   📦 Captured raw orphan block {} ({} bytes)", h, hex.len() / 2);
+                        println!(
+                            "   📦 Captured raw orphan block {} ({} bytes)",
+                            h,
+                            hex.len() / 2
+                        );
                         raw_blocks.push((hash, hex));
                     }
                     Err(_) => {
@@ -237,7 +261,10 @@ impl Indexer {
             }
         }
 
-        println!("   🗑️ Rolling back {} blocks from height {}", reorg_depth, fork_height);
+        println!(
+            "   🗑️ Rolling back {} blocks from height {}",
+            reorg_depth, fork_height
+        );
 
         let rolled_back = self
             .postgres
@@ -252,8 +279,11 @@ impl Indexer {
             }
         }
 
-        println!("   ✅ Rolled back {} blocks, archived to orphaned_blocks ({} with raw hex)",
-            rolled_back, raw_blocks.len());
+        println!(
+            "   ✅ Rolled back {} blocks, archived to orphaned_blocks ({} with raw hex)",
+            rolled_back,
+            raw_blocks.len()
+        );
 
         Ok(Some(fork_height.saturating_sub(1)))
     }
@@ -280,7 +310,9 @@ impl Indexer {
                 .map_err(|e| format!("Failed to parse tx {}:{}: {}", height, tx_index, e))?;
 
             // Resolve input addresses and values from previous outputs
-            TransactionParser::resolve_inputs(&mut tx, &self.zebra);
+            TransactionParser::resolve_inputs(&mut tx, &self.zebra).map_err(|e| {
+                format!("Input resolution failed at {}:{}: {}", height, tx_index, e)
+            })?;
 
             // Extract shielded flows
             let tx_flows = ShieldedFlow::from_transaction(&tx);
@@ -442,64 +474,109 @@ impl Indexer {
 
         let tx_count = block_info.tx.len() as u32;
         let mut transactions = Vec::with_capacity(block_info.tx.len());
-        let mut flows = Vec::new();
 
-        // Get each transaction
+        // Fetch each current transaction once.
         for (tx_index, txid) in block_info.tx.iter().enumerate() {
             let raw_hex = rpc.get_raw_transaction_hex(txid).await?;
             let raw_bytes =
                 hex::decode(&raw_hex).map_err(|e| format!("Hex decode error: {}", e))?;
 
-            let mut tx =
-                TransactionParser::parse(&raw_bytes, height, &block_hash, self.config.network)
-                    .map_err(|e| format!("Failed to parse tx {}:{}: {}", height, tx_index, e))?;
+            let tx = TransactionParser::parse(&raw_bytes, height, &block_hash, self.config.network)
+                .map_err(|e| format!("Failed to parse tx {}:{}: {}", height, tx_index, e))?;
+            transactions.push(tx);
+        }
 
-            // Resolve input values via RPC (for fee calculation)
+        let current_outputs: HashMap<(String, u32), (i64, Option<String>)> = transactions
+            .iter()
+            .flat_map(|tx| {
+                tx.vout.iter().map(move |output| {
+                    (
+                        (tx.txid.clone(), output.n),
+                        (output.value, output.address.clone()),
+                    )
+                })
+            })
+            .collect();
+        let mut references: Vec<(String, u32)> = transactions
+            .iter()
+            .flat_map(|tx| {
+                tx.vin
+                    .iter()
+                    .filter(|input| {
+                        !input.is_coinbase
+                            && !current_outputs.contains_key(&(input.txid.clone(), input.vout))
+                    })
+                    .map(|input| (input.txid.clone(), input.vout))
+            })
+            .collect();
+        references.sort_unstable();
+        references.dedup();
+        let database_outputs = self
+            .postgres
+            .get_prev_outputs(&references)
+            .await
+            .map_err(|e| format!("prevout database lookup failed: {e}"))?;
+        let mut raw_fallbacks: HashMap<String, crate::models::Transaction> = HashMap::new();
+        let mut flows = Vec::new();
+
+        for tx in &mut transactions {
             if !tx.is_coinbase() && !tx.vin.is_empty() {
                 let mut total_input: i64 = 0;
                 for input in &mut tx.vin {
                     if input.is_coinbase {
                         continue;
                     }
-                    if let Ok(prev_tx_json) = rpc.get_raw_transaction(&input.txid).await {
-                        if let Some(vout_array) =
-                            prev_tx_json.get("vout").and_then(|v| v.as_array())
-                        {
-                            if let Some(prev_output) = vout_array.get(input.vout as usize) {
-                                if let Some(value_zec) =
-                                    prev_output.get("value").and_then(|v| v.as_f64())
-                                {
-                                    let value_zatoshi = (value_zec * 100_000_000.0) as i64;
-                                    input.value = Some(value_zatoshi);
-                                    total_input += value_zatoshi;
-                                }
-                                if let Some(script_pubkey) = prev_output.get("scriptPubKey") {
-                                    if let Some(addresses) =
-                                        script_pubkey.get("addresses").and_then(|a| a.as_array())
-                                    {
-                                        if let Some(addr) =
-                                            addresses.first().and_then(|a| a.as_str())
-                                        {
-                                            input.address = Some(addr.to_string());
-                                        }
-                                    } else if let Some(addr) =
-                                        script_pubkey.get("address").and_then(|a| a.as_str())
-                                    {
-                                        input.address = Some(addr.to_string());
-                                    }
-                                }
+                    let key = (input.txid.clone(), input.vout);
+                    let resolved = cached_prev_output(&key, &current_outputs, &database_outputs);
+                    let (value, address) = match resolved {
+                        Some(output) => output,
+                        None => {
+                            if !raw_fallbacks.contains_key(&input.txid) {
+                                let raw_hex = rpc
+                                    .get_raw_transaction_hex(&input.txid)
+                                    .await
+                                    .map_err(|e| {
+                                        format!(
+                                            "unresolved prevout transaction {}: {}",
+                                            input.txid, e
+                                        )
+                                    })?;
+                                let raw = hex::decode(&raw_hex)
+                                    .map_err(|e| format!("invalid prevout transaction hex: {e}"))?;
+                                let parsed =
+                                    TransactionParser::parse(&raw, 0, "", self.config.network)
+                                        .map_err(|e| {
+                                            format!("failed to parse prevout transaction: {e}")
+                                        })?;
+                                raw_fallbacks.insert(input.txid.clone(), parsed);
                             }
+                            let previous = raw_fallbacks.get(&input.txid).ok_or_else(|| {
+                                format!("missing cached prevout transaction {}", input.txid)
+                            })?;
+                            let output =
+                                previous.vout.get(input.vout as usize).ok_or_else(|| {
+                                    format!("missing prevout {}:{}", input.txid, input.vout)
+                                })?;
+                            (output.value, output.address.clone())
                         }
-                    }
+                    };
+                    input.value = Some(value);
+                    input.address = address;
+                    total_input = total_input
+                        .checked_add(value)
+                        .ok_or_else(|| format!("transparent input overflow for {}", tx.txid))?;
                 }
                 tx.transparent_value_in = total_input;
             }
 
             if !tx.is_coinbase() {
-                let fee = tx.transparent_value_in - tx.transparent_value_out
-                    + tx.sapling_value_balance
-                    + tx.orchard_value_balance
-                    + tx.ironwood_value_balance;
+                let fee = tx
+                    .transparent_value_in
+                    .checked_sub(tx.transparent_value_out)
+                    .and_then(|v| v.checked_add(tx.sapling_value_balance))
+                    .and_then(|v| v.checked_add(tx.orchard_value_balance))
+                    .and_then(|v| v.checked_add(tx.ironwood_value_balance))
+                    .ok_or_else(|| format!("fee overflow for {}", tx.txid))?;
                 if fee >= 0 {
                     tx.fee = Some(fee);
                 }
@@ -507,7 +584,6 @@ impl Indexer {
 
             let tx_flows = ShieldedFlow::from_transaction(&tx);
             flows.extend(tx_flows);
-            transactions.push(tx);
         }
 
         // Create header from RPC block info
@@ -549,7 +625,8 @@ impl Indexer {
         height: u32,
     ) -> Result<(), String> {
         let info = rpc.get_blockchain_info().await?;
-        let value_pools = info.get("valuePools")
+        let value_pools = info
+            .get("valuePools")
             .and_then(|v| v.as_array())
             .ok_or("Missing valuePools in getblockchaininfo")?;
 
@@ -561,7 +638,8 @@ impl Indexer {
 
         for pool in value_pools {
             let id = pool.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let zat = pool.get("chainValueZat")
+            let zat = pool
+                .get("chainValueZat")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             match id {
@@ -574,7 +652,8 @@ impl Indexer {
             }
         }
 
-        let chain_supply = info.get("chainSupply")
+        let chain_supply = info
+            .get("chainSupply")
             .and_then(|v| v.get("chainValueZat"))
             .and_then(|v| v.as_i64());
 
@@ -595,7 +674,8 @@ impl Indexer {
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        println!("   📊 Boundary snapshot at {} | O:{} I:{} S:{} Sp:{}",
+        println!(
+            "   📊 Boundary snapshot at {} | O:{} I:{} S:{} Sp:{}",
             height,
             orchard / 100_000_000,
             ironwood / 100_000_000,
@@ -701,7 +781,10 @@ impl Indexer {
                 match self.detect_and_handle_reorg(&rpc, last_indexed).await {
                     Ok(Some(new_checkpoint)) => {
                         reorg_fork_height = Some(new_checkpoint + 1);
-                        println!("   🔄 Reorg handled, resuming from height {}", new_checkpoint + 1);
+                        println!(
+                            "   🔄 Reorg handled, resuming from height {}",
+                            new_checkpoint + 1
+                        );
                         last_indexed = new_checkpoint;
                     }
                     Ok(None) => {} // no reorg
@@ -750,11 +833,21 @@ impl Indexer {
                                 if let Ok(hash) = hash_result {
                                     match rpc.get_raw_block_hex(&hash).await {
                                         Ok(hex) => {
-                                            if let Err(e) = self.postgres.archive_raw_block(height, &hash, &hex, "live").await {
-                                                println!("   ⚠️ Block archive error at {}: {}", height, e);
+                                            if let Err(e) = self
+                                                .postgres
+                                                .archive_raw_block(height, &hash, &hex, "live")
+                                                .await
+                                            {
+                                                println!(
+                                                    "   ⚠️ Block archive error at {}: {}",
+                                                    height, e
+                                                );
                                             }
                                         }
-                                        Err(e) => println!("   ⚠️ Raw block fetch error at {}: {}", height, e),
+                                        Err(e) => println!(
+                                            "   ⚠️ Raw block fetch error at {}: {}",
+                                            height, e
+                                        ),
                                     }
                                 }
                             }
@@ -777,7 +870,11 @@ impl Indexer {
 
                     // After re-indexing post-reorg, backfill canonical hashes and clean false orphans
                     if let Some(fork_h) = reorg_fork_height {
-                        if let Err(e) = self.postgres.finalize_orphans_after_reindex(fork_h, last_success).await {
+                        if let Err(e) = self
+                            .postgres
+                            .finalize_orphans_after_reindex(fork_h, last_success)
+                            .await
+                        {
                             println!("   ⚠️ Orphan finalization error: {}", e);
                         }
                     }
@@ -789,7 +886,8 @@ impl Indexer {
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint_progress_height;
+    use super::{cached_prev_output, checkpoint_progress_height};
+    use std::collections::HashMap;
 
     #[test]
     fn checkpoint_progress_uses_last_success_only() {
@@ -800,5 +898,16 @@ mod tests {
     #[test]
     fn checkpoint_progress_skips_non_boundary_heights() {
         assert_eq!(checkpoint_progress_height(42, 200, Some(42)), None);
+    }
+
+    #[test]
+    fn current_block_prevout_wins_before_database() {
+        let key = ("same-block".to_string(), 0);
+        let current = HashMap::from([(key.clone(), (42, None))]);
+        let database = HashMap::from([(key.clone(), (7, Some("stale".to_string())))]);
+        assert_eq!(
+            cached_prev_output(&key, &current, &database),
+            Some((42, None))
+        );
     }
 }

@@ -5,13 +5,31 @@
 
 use crate::models::{ShieldedFlow, Transaction};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
+use std::collections::HashMap;
 
 /// PostgreSQL connection and writer
 pub struct PostgresWriter {
     pool: PgPool,
 }
 
+#[cfg(test)]
+mod integrity_write_tests {
+    #[test]
+    fn spent_metadata_uses_spending_block_time() {
+        let source = include_str!("postgres.rs");
+        assert!(source.contains("to_timestamp(spender.block_time) AT TIME ZONE 'UTC'"));
+    }
+
+    #[test]
+    fn replay_resets_activity_and_deletes_removed_owners() {
+        let source = include_str!("postgres.rs");
+        assert!(source.contains("DELETE FROM address_transactions WHERE txid = ANY($1)"));
+        assert!(source.contains("DELETE FROM addresses summary"));
+    }
+}
+
 impl PostgresWriter {
+    const BLOCK_WRITE_LOCK: i64 = 0x4349_5048_4552;
     /// Connect to PostgreSQL
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
@@ -27,6 +45,35 @@ impl PostgresWriter {
     /// Access the underlying connection pool
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub async fn get_prev_outputs(
+        &self,
+        references: &[(String, u32)],
+    ) -> Result<HashMap<(String, u32), (i64, Option<String>)>, sqlx::Error> {
+        if references.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let txids: Vec<&str> = references.iter().map(|(txid, _)| txid.as_str()).collect();
+        let vouts: Vec<i32> = references.iter().map(|(_, vout)| *vout as i32).collect();
+        let rows: Vec<(String, i32, Option<i64>, Option<String>)> = sqlx::query_as(
+            r#"SELECT requested.txid,requested.vout,output.value,output.address
+               FROM UNNEST($1::text[],$2::int[]) requested(txid,vout)
+               JOIN transaction_outputs output
+                 ON output.txid=requested.txid AND output.vout_index=requested.vout"#,
+        )
+        .bind(&txids)
+        .bind(&vouts)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(txid, vout, value, address)| {
+                let value = value.ok_or_else(|| {
+                    sqlx::Error::Protocol(format!("null prevout value for {txid}:{vout}"))
+                })?;
+                Ok(((txid, vout as u32), (value, address)))
+            })
+            .collect()
     }
 
     /// Update indexer state (checkpoint)
@@ -95,18 +142,62 @@ impl PostgresWriter {
         flows: &[ShieldedFlow],
         header: &crate::db::ParsedBlockHeader,
     ) -> Result<(u64, u64), sqlx::Error> {
+        for tx in transactions {
+            if !tx.is_coinbase() && tx.vin.iter().any(|input| input.value.is_none()) {
+                return Err(sqlx::Error::Protocol(format!(
+                    "transaction {} contains an unresolved transparent input",
+                    tx.txid
+                )));
+            }
+            tx.sapling_value_balance
+                .checked_add(tx.orchard_value_balance)
+                .and_then(|value| value.checked_add(tx.ironwood_value_balance))
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol(format!(
+                        "shielded value balance overflow for {}",
+                        tx.txid
+                    ))
+                })?;
+        }
         let mut db_tx = self.pool.begin().await?;
+        // Block writers cooperate through a shared lock; integrity cutover and
+        // reorg rollback take the exclusive form without serializing backfills.
+        sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+            .bind(Self::BLOCK_WRITE_LOCK)
+            .execute(&mut *db_tx)
+            .await?;
+        // Serialize only duplicate writers for the same height. Distinct
+        // backfill heights remain parallel, while replay detection is atomic.
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(0x424c_4f43_i32)
+            .bind(height as i32)
+            .execute(&mut *db_tx)
+            .await?;
+        let is_replay: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blocks WHERE height=$1)")
+                .bind(height as i64)
+                .fetch_one(&mut *db_tx)
+                .await?;
         let mut count = 0u64;
 
         // Calculate block-level aggregates
-        let total_fees: i64 = transactions.iter().filter_map(|tx| tx.fee).sum();
+        let total_fees = transactions
+            .iter()
+            .filter_map(|tx| tx.fee)
+            .try_fold(0i64, |total, fee| total.checked_add(fee))
+            .ok_or_else(|| sqlx::Error::Protocol("block fee total overflow".to_string()))?;
 
         // Block size = sum of all tx sizes + header size (~1487 bytes for Zcash)
         // Header: 4 (version) + 32 (prev_hash) + 32 (merkle) + 32 (reserved) + 4 (time)
         //       + 4 (bits) + 32 (nonce) + 3 (solution length) + 1344 (solution) = ~1487
         const HEADER_SIZE: i32 = 1487;
-        let tx_sizes: i32 = transactions.iter().map(|tx| tx.size as i32).sum();
-        let block_size = tx_sizes + HEADER_SIZE;
+        let tx_sizes = transactions
+            .iter()
+            .try_fold(0i32, |total, tx| total.checked_add(tx.size as i32))
+            .ok_or_else(|| sqlx::Error::Protocol("block size overflow".to_string()))?;
+        let block_size = tx_sizes
+            .checked_add(HEADER_SIZE)
+            .ok_or_else(|| sqlx::Error::Protocol("block size overflow".to_string()))?;
 
         // Miner address = first output of coinbase transaction
         let miner_address: Option<String> = transactions.first().and_then(|coinbase| {
@@ -179,6 +270,12 @@ impl PostgresWriter {
         .execute(&mut *db_tx)
         .await?;
 
+        let old_activity_addresses = if is_replay {
+            self.reset_address_activity(&mut db_tx, transactions)
+                .await?
+        } else {
+            Vec::new()
+        };
         let use_rowwise_writes = std::env::var_os("CIPHERSCAN_ROWWISE_WRITES").is_some();
         if !use_rowwise_writes {
             // Collapse the transaction, input, output, and address-activity writes
@@ -313,6 +410,8 @@ impl PostgresWriter {
                     INSERT INTO transaction_inputs (txid, vout_index, prev_txid, prev_vout, address, value)
                     VALUES ($1, $2, $3, $4, $5, $6)
                     ON CONFLICT (txid, vout_index) DO UPDATE SET
+                        prev_txid = EXCLUDED.prev_txid,
+                        prev_vout = EXCLUDED.prev_vout,
                         address = EXCLUDED.address,
                         value = EXCLUDED.value
                     "#
@@ -335,7 +434,12 @@ impl PostgresWriter {
                     for output in &tx.vout {
                         if let Some(ref addr) = output.address {
                             let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
-                            entry.1 = entry.1.checked_add(output.value).unwrap_or(i64::MAX);
+                            entry.1 = entry.1.checked_add(output.value).ok_or_else(|| {
+                                sqlx::Error::Protocol(format!(
+                                    "address output total overflow for {}",
+                                    tx.txid
+                                ))
+                            })?;
                         }
                     }
                     for input in &tx.vin {
@@ -344,7 +448,16 @@ impl PostgresWriter {
                         }
                         if let Some(ref addr) = input.address {
                             let entry = addr_map.entry(addr.as_str()).or_insert((0, 0));
-                            entry.0 = entry.0.checked_add(input.value.unwrap_or(0)).unwrap_or(i64::MAX);
+                            entry.0 =
+                                entry
+                                    .0
+                                    .checked_add(input.value.unwrap_or(0))
+                                    .ok_or_else(|| {
+                                        sqlx::Error::Protocol(format!(
+                                            "address input total overflow for {}",
+                                            tx.txid
+                                        ))
+                                    })?;
                         }
                     }
 
@@ -378,14 +491,104 @@ impl PostgresWriter {
             }
         }
 
+        self.insert_pubkey_exposures(&mut db_tx, transactions)
+            .await?;
+        self.mark_spent_outputs(&mut db_tx, transactions).await?;
         let flow_count = self.insert_flows_tx(&mut db_tx, flows, timestamp).await?;
 
-        // Update addresses table (aggregate per-address for this block)
-        self.update_addresses_for_block(&mut db_tx, transactions, timestamp)
-            .await?;
+        if is_replay {
+            // Replay or corrective reprocessing: derive exact summaries from
+            // the idempotent activity ledger, including removed owners.
+            self.update_addresses_for_block(&mut db_tx, transactions, &old_activity_addresses)
+                .await?;
+        } else {
+            // New block: apply its delta once. The per-height lock and replay
+            // check prevent duplicate application without rescanning history.
+            self.apply_address_deltas_for_new_block(&mut db_tx, transactions, timestamp)
+                .await?;
+        }
 
         db_tx.commit().await?;
         Ok((count, flow_count))
+    }
+
+    async fn reset_address_activity(
+        &self,
+        db_tx: &mut sqlx::Transaction<'_, Postgres>,
+        transactions: &[Transaction],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let txids: Vec<&str> = transactions.iter().map(|tx| tx.txid.as_str()).collect();
+        if txids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let old_addresses = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT address FROM address_transactions WHERE txid = ANY($1)",
+        )
+        .bind(&txids)
+        .fetch_all(&mut **db_tx)
+        .await?;
+        sqlx::query("DELETE FROM address_transactions WHERE txid = ANY($1)")
+            .bind(&txids)
+            .execute(&mut **db_tx)
+            .await?;
+        Ok(old_addresses)
+    }
+
+    async fn mark_spent_outputs(
+        &self,
+        db_tx: &mut sqlx::Transaction<'_, Postgres>,
+        transactions: &[Transaction],
+    ) -> Result<(), sqlx::Error> {
+        let txids: Vec<&str> = transactions.iter().map(|tx| tx.txid.as_str()).collect();
+        if txids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            UPDATE transaction_outputs output
+            SET spent = TRUE, spent_txid = input.txid,
+                spent_at = to_timestamp(spender.block_time) AT TIME ZONE 'UTC'
+            FROM transaction_inputs input
+            JOIN transactions spender ON spender.txid = input.txid
+            WHERE input.txid = ANY($1)
+              AND output.txid = input.prev_txid
+              AND output.vout_index = input.prev_vout
+            "#,
+        )
+        .bind(&txids)
+        .execute(&mut **db_tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_pubkey_exposures(
+        &self,
+        db_tx: &mut sqlx::Transaction<'_, Postgres>,
+        transactions: &[Transaction],
+    ) -> Result<(), sqlx::Error> {
+        for tx in transactions {
+            for output in &tx.vout {
+                for exposure in &output.pubkey_exposures {
+                    sqlx::query(
+                        "INSERT INTO transparent_key_exposures \
+                         (txid, vout_index, key_index, pubkey_hex, script_type, derived_address) \
+                         VALUES ($1, $2, $3, $4, $5, $6) \
+                         ON CONFLICT (txid, vout_index, key_index) DO UPDATE SET \
+                         pubkey_hex = EXCLUDED.pubkey_hex, script_type = EXCLUDED.script_type, \
+                         derived_address = EXCLUDED.derived_address",
+                    )
+                    .bind(&tx.txid)
+                    .bind(output.n as i32)
+                    .bind(exposure.pubkey_index as i32)
+                    .bind(&exposure.pubkey_hex)
+                    .bind(&output.script_type)
+                    .bind(&exposure.derived_p2pkh)
+                    .execute(&mut **db_tx)
+                    .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn bulk_insert_transaction_data(
@@ -534,6 +737,8 @@ impl PostgresWriter {
             query.push(
                 r#"
                 ON CONFLICT (txid, vout_index) DO UPDATE SET
+                    prev_txid = EXCLUDED.prev_txid,
+                    prev_vout = EXCLUDED.prev_vout,
                     address = EXCLUDED.address,
                     value = EXCLUDED.value
                 "#,
@@ -558,14 +763,24 @@ impl PostgresWriter {
             for output in &tx.vout {
                 if let Some(address) = output.address.as_deref() {
                     let e = addresses.entry(address).or_insert((0, 0));
-                    e.1 = e.1.checked_add(output.value).unwrap_or(i64::MAX);
+                    e.1 = e.1.checked_add(output.value).ok_or_else(|| {
+                        sqlx::Error::Protocol(format!(
+                            "address output total overflow for {}",
+                            tx.txid
+                        ))
+                    })?;
                 }
             }
             for input in &tx.vin {
                 if !input.is_coinbase {
                     if let Some(address) = input.address.as_deref() {
                         let e = addresses.entry(address).or_insert((0, 0));
-                        e.0 = e.0.checked_add(input.value.unwrap_or(0)).unwrap_or(i64::MAX);
+                        e.0 = e.0.checked_add(input.value.unwrap_or(0)).ok_or_else(|| {
+                            sqlx::Error::Protocol(format!(
+                                "address input total overflow for {}",
+                                tx.txid
+                            ))
+                        })?;
                     }
                 }
             }
@@ -618,104 +833,156 @@ impl PostgresWriter {
         Ok(())
     }
 
-    /// Batch insert with full block header info.
-    /// Update the addresses summary table for all addresses in a block's transactions
-    async fn update_addresses_for_block(
+    async fn apply_address_deltas_for_new_block(
         &self,
         db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         transactions: &[Transaction],
         block_time: u64,
     ) -> Result<(), sqlx::Error> {
-        use std::collections::HashMap;
-
-        // Aggregate: address -> (total_received, total_sent, set of txids)
-        struct AddrStats {
-            total_received: i64,
-            total_sent: i64,
+        struct Delta {
+            received: i64,
+            sent: i64,
             txids: std::collections::HashSet<String>,
         }
 
-        let mut addr_map: HashMap<String, AddrStats> = HashMap::new();
-
+        let mut deltas: HashMap<String, Delta> = HashMap::new();
         for tx in transactions {
-            // Outputs = received
             for output in &tx.vout {
-                if let Some(ref address) = output.address {
-                    let entry = addr_map
-                        .entry(address.clone())
-                        .or_insert_with(|| AddrStats {
-                            total_received: 0,
-                            total_sent: 0,
-                            txids: std::collections::HashSet::new(),
-                        });
-                    entry.total_received = entry.total_received
-                        .checked_add(output.value)
-                        .unwrap_or(i64::MAX);
-                    entry.txids.insert(tx.txid.clone());
+                if let Some(address) = &output.address {
+                    let delta = deltas.entry(address.clone()).or_insert_with(|| Delta {
+                        received: 0,
+                        sent: 0,
+                        txids: std::collections::HashSet::new(),
+                    });
+                    delta.received =
+                        delta.received.checked_add(output.value).ok_or_else(|| {
+                            sqlx::Error::Protocol(format!(
+                                "address receive delta overflow for {}",
+                                tx.txid
+                            ))
+                        })?;
+                    delta.txids.insert(tx.txid.clone());
                 }
             }
-
-            // Inputs = sent
             for input in &tx.vin {
                 if input.is_coinbase {
                     continue;
                 }
-                if let Some(ref address) = input.address {
-                    if let Some(value) = input.value {
-                        let entry = addr_map
-                            .entry(address.clone())
-                            .or_insert_with(|| AddrStats {
-                                total_received: 0,
-                                total_sent: 0,
-                                txids: std::collections::HashSet::new(),
-                            });
-                        entry.total_sent = entry.total_sent
-                            .checked_add(value)
-                            .unwrap_or(i64::MAX);
-                        entry.txids.insert(tx.txid.clone());
-                    }
+                if let (Some(address), Some(value)) = (&input.address, input.value) {
+                    let delta = deltas.entry(address.clone()).or_insert_with(|| Delta {
+                        received: 0,
+                        sent: 0,
+                        txids: std::collections::HashSet::new(),
+                    });
+                    delta.sent = delta.sent.checked_add(value).ok_or_else(|| {
+                        sqlx::Error::Protocol(format!(
+                            "address send delta overflow for {}",
+                            tx.txid
+                        ))
+                    })?;
+                    delta.txids.insert(tx.txid.clone());
                 }
             }
         }
 
-        const ADDRESS_CHUNK_SIZE: usize = 8_000;
-        let mut address_rows: Vec<_> = addr_map.iter().collect();
-        // Concurrent backfill workers can touch popular addresses in different
-        // blocks. A stable lock order prevents cross-block UPSERT deadlocks.
-        address_rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        for chunk in address_rows.chunks(ADDRESS_CHUNK_SIZE) {
+        let mut rows: Vec<_> = deltas.iter().collect();
+        rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        const CHUNK_SIZE: usize = 8_000;
+        for chunk in rows.chunks(CHUNK_SIZE) {
             let mut query = QueryBuilder::<Postgres>::new(
-                r#"
-                INSERT INTO addresses (
-                    address, balance, total_received, total_sent,
-                    tx_count, first_seen, last_seen, address_type
-                ) "#,
+                "INSERT INTO addresses \
+                 (address,balance,total_received,total_sent,tx_count,first_seen,last_seen,address_type) ",
             );
-            query.push_values(chunk, |mut row, (address, stats)| {
+            query.push_values(chunk, |mut row, (address, delta)| {
                 row.push_bind(*address)
-                    .push_bind(stats.total_received - stats.total_sent)
-                    .push_bind(stats.total_received)
-                    .push_bind(stats.total_sent)
-                    .push_bind(stats.txids.len() as i64)
+                    .push_bind(delta.received - delta.sent)
+                    .push_bind(delta.received)
+                    .push_bind(delta.sent)
+                    .push_bind(delta.txids.len() as i32)
                     .push_bind(block_time as i64)
                     .push_bind(block_time as i64)
                     .push_bind("transparent");
             });
             query.push(
-                r#"
-                ON CONFLICT (address) DO UPDATE SET
-                    balance = addresses.balance + EXCLUDED.balance,
-                    total_received = addresses.total_received + EXCLUDED.total_received,
-                    total_sent = addresses.total_sent + EXCLUDED.total_sent,
-                    tx_count = addresses.tx_count + EXCLUDED.tx_count,
-                    first_seen = LEAST(addresses.first_seen, EXCLUDED.first_seen),
-                    last_seen = GREATEST(addresses.last_seen, EXCLUDED.last_seen),
-                    updated_at = NOW()
-                "#,
+                " ON CONFLICT(address) DO UPDATE SET \
+                 balance=addresses.balance+EXCLUDED.balance, \
+                 total_received=addresses.total_received+EXCLUDED.total_received, \
+                 total_sent=addresses.total_sent+EXCLUDED.total_sent, \
+                 tx_count=addresses.tx_count+EXCLUDED.tx_count, \
+                 first_seen=LEAST(addresses.first_seen,EXCLUDED.first_seen), \
+                 last_seen=GREATEST(addresses.last_seen,EXCLUDED.last_seen), \
+                 updated_at=NOW()",
             );
             query.build().execute(&mut **db_tx).await?;
         }
+        Ok(())
+    }
 
+    /// Recompute exact summaries for replayed or corrected transactions.
+    async fn update_addresses_for_block(
+        &self,
+        db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        transactions: &[Transaction],
+        old_activity_addresses: &[String],
+    ) -> Result<(), sqlx::Error> {
+        let mut addresses: Vec<&str> = old_activity_addresses
+            .iter()
+            .map(String::as_str)
+            .chain(transactions.iter().flat_map(|tx| {
+                tx.vout
+                    .iter()
+                    .filter_map(|output| output.address.as_deref())
+                    .chain(tx.vin.iter().filter_map(|input| input.address.as_deref()))
+            }))
+            .collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO addresses (
+                address, balance, total_received, total_sent,
+                tx_count, first_seen, last_seen, address_type, updated_at
+            )
+            SELECT
+                activity.address,
+                SUM(activity.value_out) - SUM(activity.value_in),
+                SUM(activity.value_out),
+                SUM(activity.value_in),
+                COUNT(DISTINCT activity.txid),
+                MIN(activity.block_time),
+                MAX(activity.block_time),
+                'transparent',
+                NOW()
+            FROM address_transactions activity
+            WHERE activity.address = ANY($1)
+            GROUP BY activity.address
+            ON CONFLICT (address) DO UPDATE SET
+                balance = EXCLUDED.balance,
+                total_received = EXCLUDED.total_received,
+                total_sent = EXCLUDED.total_sent,
+                tx_count = EXCLUDED.tx_count,
+                first_seen = EXCLUDED.first_seen,
+                last_seen = EXCLUDED.last_seen,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&addresses)
+        .execute(&mut **db_tx)
+        .await?;
+        sqlx::query(
+            r#"DELETE FROM addresses summary
+               WHERE summary.address = ANY($1)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM address_transactions activity
+                     WHERE activity.address = summary.address
+                 )"#,
+        )
+        .bind(&addresses)
+        .execute(&mut **db_tx)
+        .await?;
         Ok(())
     }
 
@@ -829,6 +1096,10 @@ impl PostgresWriter {
         description: &str,
     ) -> Result<u32, sqlx::Error> {
         let mut db_tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(Self::BLOCK_WRITE_LOCK)
+            .execute(&mut *db_tx)
+            .await?;
 
         // Count blocks being rolled back
         let orphan_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blocks WHERE height >= $1")
@@ -922,26 +1193,28 @@ impl PostgresWriter {
         .execute(&mut *db_tx)
         .await?;
 
-        // Reverse address balance deltas using txid index (fast path)
+        // Preserve the complete affected set before removing orphan movements.
         sqlx::query(
-            r#"UPDATE addresses SET
-                   balance = addresses.balance - sub.net_delta,
-                   total_received = GREATEST(0, addresses.total_received - sub.total_in),
-                   total_sent = GREATEST(0, addresses.total_sent - sub.total_out),
-                   tx_count = GREATEST(0, addresses.tx_count - sub.tx_count)
-               FROM (
-                   SELECT address,
-                          SUM(value_out) as total_in,
-                          SUM(value_in) as total_out,
-                          SUM(value_out - value_in) as net_delta,
-                          COUNT(DISTINCT txid) as tx_count
-                   FROM address_transactions
-                   WHERE txid IN (SELECT txid FROM transactions WHERE block_height >= $1)
-                   GROUP BY address
-               ) sub
-               WHERE addresses.address = sub.address"#,
+            r#"CREATE TEMP TABLE integrity_reorg_addresses
+               ON COMMIT DROP AS
+               SELECT DISTINCT address
+               FROM address_transactions
+               WHERE txid IN (
+                   SELECT txid FROM transactions WHERE block_height >= $1
+               )"#,
         )
         .bind(fork_height as i32)
+        .execute(&mut *db_tx)
+        .await?;
+        // Outputs on the surviving chain must no longer point at orphan spends.
+        sqlx::query(
+            r#"UPDATE transaction_outputs
+               SET spent = FALSE, spent_txid = NULL, spent_at = NULL
+               WHERE spent_txid IN (
+                   SELECT txid FROM transactions WHERE block_height >= $1
+               )"#,
+        )
+        .bind(fork_height as i64)
         .execute(&mut *db_tx)
         .await?;
 
@@ -950,6 +1223,44 @@ impl PostgresWriter {
             "DELETE FROM address_transactions WHERE txid IN (SELECT txid FROM transactions WHERE block_height >= $1)"
         )
         .bind(fork_height as i64)
+        .execute(&mut *db_tx)
+        .await?;
+
+        // Rebuild summaries from the surviving idempotent movement ledger.
+        sqlx::query(
+            r#"INSERT INTO addresses (
+                   address, balance, total_received, total_sent,
+                   tx_count, first_seen, last_seen, address_type, updated_at
+               )
+               SELECT at.address,
+                      SUM(at.value_out) - SUM(at.value_in),
+                      SUM(at.value_out), SUM(at.value_in),
+                      COUNT(DISTINCT at.txid),
+                      MIN(at.block_time), MAX(at.block_time),
+                      'transparent', NOW()
+               FROM address_transactions at
+               JOIN integrity_reorg_addresses touched ON touched.address = at.address
+               GROUP BY at.address
+               ON CONFLICT (address) DO UPDATE SET
+                   balance = EXCLUDED.balance,
+                   total_received = EXCLUDED.total_received,
+                   total_sent = EXCLUDED.total_sent,
+                   tx_count = EXCLUDED.tx_count,
+                   first_seen = EXCLUDED.first_seen,
+                   last_seen = EXCLUDED.last_seen,
+                   updated_at = NOW()"#,
+        )
+        .execute(&mut *db_tx)
+        .await?;
+        sqlx::query(
+            r#"DELETE FROM addresses a
+               USING integrity_reorg_addresses touched
+               WHERE a.address = touched.address
+                 AND NOT EXISTS (
+                     SELECT 1 FROM address_transactions at
+                     WHERE at.address = a.address
+                 )"#,
+        )
         .execute(&mut *db_tx)
         .await?;
 
@@ -1049,13 +1360,11 @@ impl PostgresWriter {
         block_hash: &str,
         raw_hex: &str,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE orphaned_blocks SET raw_hex = $1 WHERE hash = $2"
-        )
-        .bind(raw_hex)
-        .bind(block_hash)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE orphaned_blocks SET raw_hex = $1 WHERE hash = $2")
+            .bind(raw_hex)
+            .bind(block_hash)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

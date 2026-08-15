@@ -32,7 +32,7 @@ struct Cli {
     zebra_path: Option<String>,
 
     /// PostgreSQL connection URL
-    #[arg(long, env = "DATABASE_URL")]
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: Option<String>,
 
     /// Batch size for database operations
@@ -210,6 +210,26 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Audit or repair the known transparent address-accounting defects.
+    Integrity {
+        #[arg(value_enum)]
+        phase: commands::integrity::IntegrityPhase,
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        /// Also recompute summaries for every address touched in this range.
+        /// Use for a known summary-only incident range.
+        #[arg(long)]
+        repair_range_summaries: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value = "5000")]
+        lock_timeout_ms: u64,
+        #[arg(long, default_value = "600000")]
+        statement_timeout_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -289,7 +309,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rpc_url,
             cookie_file,
         } => {
-            commands::verify::verify_parsing(&config, height, count, &rpc_url, &cookie_file).await?;
+            commands::verify::verify_parsing(&config, height, count, &rpc_url, &cookie_file)
+                .await?;
         }
         Commands::Tx { height, index } => {
             commands::inspect::show_transaction(&config, height, index)?;
@@ -318,10 +339,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             to_height,
         } => {
             let prod_url = prod_db.unwrap_or_else(|| config.database_url.clone());
-            commands::validate::validate_full(&config, &prod_url, &test_db, from_height, to_height).await?;
+            commands::validate::validate_full(&config, &prod_url, &test_db, from_height, to_height)
+                .await?;
         }
         Commands::RepairFees { batch, dry_run } => {
             commands::repair::repair_ironwood_fees(&config, batch, dry_run).await?;
+        }
+        Commands::Integrity {
+            phase,
+            from,
+            to,
+            repair_range_summaries,
+            dry_run,
+            lock_timeout_ms,
+            statement_timeout_ms,
+        } => {
+            commands::integrity::run(
+                &config,
+                phase,
+                from,
+                to,
+                repair_range_summaries,
+                dry_run,
+                lock_timeout_ms,
+                statement_timeout_ms,
+            )
+            .await?;
         }
     }
 

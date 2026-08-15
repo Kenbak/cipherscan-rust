@@ -3,7 +3,11 @@ use crate::db::ZebraState;
 use std::time::Instant;
 
 /// Run backfill indexer (with PostgreSQL writes)
-pub(crate) async fn run_backfill(config: &Config, from: Option<u32>, to: Option<u32>) -> Result<(), String> {
+pub(crate) async fn run_backfill(
+    config: &Config,
+    from: Option<u32>,
+    to: Option<u32>,
+) -> Result<(), String> {
     use crate::indexer::Indexer;
 
     // Check if DATABASE_URL is configured
@@ -56,19 +60,28 @@ pub(crate) async fn run_backfill_metadata(
         .map_err(|e| format!("Checkpoint read error: {}", e))?
     {
         Some(saved) if saved >= from => {
-            println!("📍 Resuming metadata backfill from checkpoint: {}", saved + 1);
+            println!(
+                "📍 Resuming metadata backfill from checkpoint: {}",
+                saved + 1
+            );
             saved + 1
         }
         _ => from,
     };
 
     if start > end {
-        println!("✅ Metadata backfill already complete (start {} > end {})", start, end);
+        println!(
+            "✅ Metadata backfill already complete (start {} > end {})",
+            start, end
+        );
         return Ok(());
     }
 
     let total_blocks = end - start + 1;
-    println!("🔧 Metadata backfill: {} → {} ({} blocks, batch={})", start, end, total_blocks, batch_size);
+    println!(
+        "🔧 Metadata backfill: {} → {} ({} blocks, batch={})",
+        start, end, total_blocks, batch_size
+    );
     println!("   Only updating: locktime, expiry_height, sapling_spend_count,");
     println!("                  sapling_output_count, sprout_joinsplit_count, has_sprout");
     println!("────────────────────────────────────────────────────────────");
@@ -116,7 +129,12 @@ pub(crate) async fn run_backfill_metadata(
         let updated = postgres
             .batch_update_metadata(&batch_txs)
             .await
-            .map_err(|e| format!("DB update error at heights {}-{}: {}", current, batch_end, e))?;
+            .map_err(|e| {
+                format!(
+                    "DB update error at heights {}-{}: {}",
+                    current, batch_end, e
+                )
+            })?;
         total_txs_updated += updated;
 
         postgres
@@ -189,7 +207,11 @@ pub(crate) async fn run_backfill_anchors(
         .await
         .map_err(|e| format!("Query pool error: {}", e))?;
 
-    let version_filter = if v6_only { "AND version = 6" } else { "AND version >= 5" };
+    let version_filter = if v6_only {
+        "AND version = 6"
+    } else {
+        "AND version >= 5"
+    };
 
     let query = format!(
         r#"SELECT txid, block_height, block_hash
@@ -321,13 +343,15 @@ pub(crate) async fn run_backfill_scripts(config: &Config, batch_size: u32) -> Re
         .await
         .map_err(|e| format!("Query pool error: {}", e))?;
 
-    // Find all nonstandard outputs with no address (P2PK/multisig candidates)
+    // Include already-classified rows so migration 013 can normalize their
+    // address semantics and populate every disclosed pubkey exposure.
     let rows: Vec<_> = sqlx::query(
         r#"SELECT o.txid, o.vout_index, t.block_height
            FROM transaction_outputs o
            JOIN transactions t ON o.txid = t.txid
-           WHERE o.script_type = 'nonstandard' AND o.address IS NULL
-           ORDER BY t.block_height ASC"#
+           WHERE (o.script_type = 'nonstandard' AND o.address IS NULL)
+              OR o.script_type IN ('pubkey', 'multisig')
+           ORDER BY t.block_height ASC"#,
     )
     .fetch_all(&pool)
     .await
@@ -348,7 +372,6 @@ pub(crate) async fn run_backfill_scripts(config: &Config, batch_size: u32) -> Re
     let overall_start = Instant::now();
     let mut reclassified = 0u64;
     let mut errors = 0u64;
-    let mut addresses_upserted = 0u64;
 
     for (chunk_idx, chunk) in rows.chunks(batch_size as usize).enumerate() {
         let mut db_tx = pool
@@ -378,19 +401,33 @@ pub(crate) async fn run_backfill_scripts(config: &Config, batch_size: u32) -> Re
                 };
                 let block_hash = crate::util::display_hash(&block_hash_bytes);
 
-                match TransactionParser::parse(raw, block_height as u32, &block_hash, config.network) {
+                match TransactionParser::parse(
+                    raw,
+                    block_height as u32,
+                    &block_hash,
+                    config.network,
+                ) {
                     Ok(tx) => {
                         if tx.txid == txid {
-                            if let Some(output) = tx.vout.iter().find(|o| o.n == vout_index as u32) {
-                                if output.script_type == "pubkey" || output.script_type == "multisig" {
-                                    // Reclassify the output
+                            if let Some(output) = tx.vout.iter().find(|o| o.n == vout_index as u32)
+                            {
+                                if output.script_type == "pubkey"
+                                    || output.script_type == "multisig"
+                                {
+                                    if output.pubkey_exposures.is_empty() {
+                                        errors += 1;
+                                        found = true;
+                                        break;
+                                    }
+                                    // Populate canonical script/exposure metadata first.
+                                    // The targeted integrity repair clears legacy synthetic
+                                    // addresses atomically with activity/summary correction.
                                     sqlx::query(
                                         r#"UPDATE transaction_outputs
-                                           SET script_type = $1, address = $2, script_pubkey = $3
-                                           WHERE txid = $4 AND vout_index = $5"#
+                                           SET script_type = $1, script_pubkey = $2
+                                           WHERE txid = $3 AND vout_index = $4"#,
                                     )
                                     .bind(&output.script_type)
-                                    .bind(&output.address)
                                     .bind(&output.script_pub_key)
                                     .bind(&txid)
                                     .bind(vout_index)
@@ -398,24 +435,34 @@ pub(crate) async fn run_backfill_scripts(config: &Config, batch_size: u32) -> Re
                                     .await
                                     .map_err(|e| format!("Update error: {}", e))?;
 
-                                    // Upsert the address into the addresses table
-                                    if let Some(addr) = &output.address {
+                                    sqlx::query(
+                                        "DELETE FROM transparent_key_exposures \
+                                         WHERE txid=$1 AND vout_index=$2",
+                                    )
+                                    .bind(&txid)
+                                    .bind(vout_index)
+                                    .execute(&mut *db_tx)
+                                    .await
+                                    .map_err(|e| format!("Exposure reset error: {}", e))?;
+                                    for exposure in &output.pubkey_exposures {
                                         sqlx::query(
-                                            r#"INSERT INTO addresses (address, balance, total_received, tx_count, first_seen, last_seen, address_type)
-                                               VALUES ($1, $2, $2, 1, $3, $3, 'transparent')
-                                               ON CONFLICT (address) DO UPDATE SET
-                                                   balance = addresses.balance + EXCLUDED.balance,
-                                                   total_received = addresses.total_received + EXCLUDED.total_received,
-                                                   tx_count = addresses.tx_count + 1,
-                                                   last_seen = GREATEST(addresses.last_seen, EXCLUDED.last_seen)"#
+                                            r#"INSERT INTO transparent_key_exposures
+                                               (txid, vout_index, key_index, pubkey_hex, script_type, derived_address)
+                                               VALUES ($1, $2, $3, $4, $5, $6)
+                                               ON CONFLICT (txid, vout_index, key_index) DO UPDATE SET
+                                                   pubkey_hex = EXCLUDED.pubkey_hex,
+                                                   script_type = EXCLUDED.script_type,
+                                                   derived_address = EXCLUDED.derived_address"#
                                         )
-                                        .bind(addr)
-                                        .bind(output.value)
-                                        .bind(block_height)
+                                        .bind(&txid)
+                                        .bind(vout_index)
+                                        .bind(exposure.pubkey_index as i32)
+                                        .bind(&exposure.pubkey_hex)
+                                        .bind(&output.script_type)
+                                        .bind(&exposure.derived_p2pkh)
                                         .execute(&mut *db_tx)
                                         .await
-                                        .map_err(|e| format!("Upsert address error: {}", e))?;
-                                        addresses_upserted += 1;
+                                        .map_err(|e| format!("Exposure upsert error: {}", e))?;
                                     }
 
                                     reclassified += 1;
@@ -444,13 +491,12 @@ pub(crate) async fn run_backfill_scripts(config: &Config, batch_size: u32) -> Re
         let eta = (total - done) as f64 / rate;
 
         println!(
-            "📦 {}/{} ({:.1}%) | {:.0} outputs/s | reclassified: {} | addresses: {} | errors: {} | ETA: {:.0}s",
+            "📦 {}/{} ({:.1}%) | {:.0} outputs/s | reclassified: {} | errors: {} | ETA: {:.0}s",
             done,
             total,
             done as f64 / total as f64 * 100.0,
             rate,
             reclassified,
-            addresses_upserted,
             errors,
             eta
         );
@@ -461,9 +507,13 @@ pub(crate) async fn run_backfill_scripts(config: &Config, batch_size: u32) -> Re
     println!("✅ Script backfill complete!");
     println!("   Outputs processed: {}", total);
     println!("   Reclassified: {} (P2PK/multisig)", reclassified);
-    println!("   Addresses upserted: {}", addresses_upserted);
     println!("   Errors: {}", errors);
     println!("   Time: {:.1}s", elapsed.as_secs_f64());
 
+    if errors != 0 {
+        return Err(format!(
+            "script exposure backfill failed with {errors} unresolved outputs"
+        ));
+    }
     Ok(())
 }

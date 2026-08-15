@@ -64,8 +64,8 @@ pub struct BlockInfo {
 impl ZebraRpc {
     /// Create new RPC client from environment
     pub fn from_env() -> Result<Self, String> {
-        let url = std::env::var("ZEBRA_RPC_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8232".to_string());
+        let url =
+            std::env::var("ZEBRA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8232".to_string());
 
         // Try cookie file first
         let auth = if let Ok(cookie_path) = std::env::var("ZEBRA_RPC_COOKIE_FILE") {
@@ -154,8 +154,11 @@ impl ZebraRpc {
 
     /// Get block info by hash
     pub async fn get_block(&self, hash: &str) -> Result<BlockInfo, String> {
-        self.call("getblock", vec![serde_json::json!(hash), serde_json::json!(1)])
-            .await
+        self.call(
+            "getblock",
+            vec![serde_json::json!(hash), serde_json::json!(1)],
+        )
+        .await
     }
 
     /// Get block info by height
@@ -166,8 +169,11 @@ impl ZebraRpc {
 
     /// Get full raw block as hex (verbosity 0)
     pub async fn get_raw_block_hex(&self, hash: &str) -> Result<String, String> {
-        self.call("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
-            .await
+        self.call(
+            "getblock",
+            vec![serde_json::json!(hash), serde_json::json!(0)],
+        )
+        .await
     }
 
     /// Get raw transaction hex
@@ -175,15 +181,6 @@ impl ZebraRpc {
         self.call(
             "getrawtransaction",
             vec![serde_json::json!(txid), serde_json::json!(0)],
-        )
-        .await
-    }
-
-    /// Get raw transaction verbose (JSON)
-    pub async fn get_raw_transaction(&self, txid: &str) -> Result<serde_json::Value, String> {
-        self.call(
-            "getrawtransaction",
-            vec![serde_json::json!(txid), serde_json::json!(1)],
         )
         .await
     }

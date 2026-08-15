@@ -67,7 +67,9 @@ pub(crate) async fn validate_full(
             match TransactionParser::parse(raw, height, &block_hash, config.network) {
                 Ok(mut tx) => {
                     // Resolve input addresses and values from previous outputs
-                    TransactionParser::resolve_inputs(&mut tx, &zebra);
+                    TransactionParser::resolve_inputs(&mut tx, &zebra).map_err(|e| {
+                        format!("Input resolution failed at {}:{}: {}", height, tx_index, e)
+                    })?;
 
                     let flows = ShieldedFlow::from_transaction(&tx);
                     rust_flow_count += flows.len() as u64;
