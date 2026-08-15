@@ -72,13 +72,9 @@ pub(crate) fn analyze_database(config: &Config) -> Result<(), String> {
     println!();
     if let Some(cf) = db.cf_handle("hash_by_height") {
         let mut last_height = 0u32;
-        for item in db.iterator_cf(cf, IteratorMode::End) {
-            if let Ok((key, _)) = item {
-                if key.len() >= 3 {
-                    last_height =
-                        ((key[0] as u32) << 16) | ((key[1] as u32) << 8) | (key[2] as u32);
-                }
-                break;
+        if let Some(Ok((key, _))) = db.iterator_cf(cf, IteratorMode::End).next() {
+            if key.len() >= 3 {
+                last_height = ((key[0] as u32) << 16) | ((key[1] as u32) << 8) | (key[2] as u32);
             }
         }
         println!("📈 Chain tip height: {}", last_height);

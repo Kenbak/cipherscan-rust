@@ -88,7 +88,8 @@ pub(crate) async fn compare_with_postgres(
             }
         };
 
-        let block_hash = crate::util::display_hash(&zebra.get_block_hash(height).unwrap_or([0u8; 32]));
+        let block_hash =
+            crate::util::display_hash(&zebra.get_block_hash(height).unwrap_or([0u8; 32]));
 
         let rust_tx = match TransactionParser::parse(&raw, height, &block_hash, config.network) {
             Ok(tx) => tx,
@@ -261,7 +262,7 @@ pub(crate) async fn compare_with_postgres(
 
         // Get from RocksDB
         let rust_hash = match zebra.get_block_hash(height) {
-            Ok(h) => { crate::util::display_hash(&h) }
+            Ok(h) => crate::util::display_hash(&h),
             Err(_) => continue,
         };
 
@@ -271,7 +272,7 @@ pub(crate) async fn compare_with_postgres(
         let mut diffs: Vec<String> = Vec::new();
 
         if rust_hash != pg_hash {
-            diffs.push(format!("hash mismatch"));
+            diffs.push("hash mismatch".to_string());
         }
 
         if let Some(pg_tc) = pg_tx_count {
@@ -341,7 +342,8 @@ pub(crate) async fn compare_with_postgres(
             Err(_) => continue,
         };
 
-        let block_hash = crate::util::display_hash(&zebra.get_block_hash(height).unwrap_or([0u8; 32]));
+        let block_hash =
+            crate::util::display_hash(&zebra.get_block_hash(height).unwrap_or([0u8; 32]));
 
         let rust_tx = match TransactionParser::parse(&raw, height, &block_hash, config.network) {
             Ok(tx) => tx,

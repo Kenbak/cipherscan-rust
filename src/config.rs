@@ -29,7 +29,6 @@ pub struct Config {
     /// Reorgs deeper than this require manual intervention (mainnet safety).
     /// Testnet should use a higher value since deep reorgs are routine.
     pub max_reorg_depth: u32,
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +79,11 @@ impl Config {
                 "testnet" => Network::Testnet,
                 _ => Network::Mainnet,
             };
-        } else if config.zebra_state_path.to_string_lossy().contains("testnet") {
+        } else if config
+            .zebra_state_path
+            .to_string_lossy()
+            .contains("testnet")
+        {
             config.network = Network::Testnet;
         }
 

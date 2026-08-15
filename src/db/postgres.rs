@@ -888,13 +888,12 @@ impl PostgresWriter {
                         sent: 0,
                         txids: std::collections::HashSet::new(),
                     });
-                    delta.received =
-                        delta.received.checked_add(output.value).ok_or_else(|| {
-                            sqlx::Error::Protocol(format!(
-                                "address receive delta overflow for {}",
-                                tx.txid
-                            ))
-                        })?;
+                    delta.received = delta.received.checked_add(output.value).ok_or_else(|| {
+                        sqlx::Error::Protocol(format!(
+                            "address receive delta overflow for {}",
+                            tx.txid
+                        ))
+                    })?;
                     delta.txids.insert(tx.txid.clone());
                 }
             }
@@ -926,7 +925,8 @@ impl PostgresWriter {
         }
 
         let lock_addresses: Vec<&str> = rows.iter().map(|(addr, _)| addr.as_str()).collect();
-        self.lock_addresses_for_write(db_tx, &lock_addresses).await?;
+        self.lock_addresses_for_write(db_tx, &lock_addresses)
+            .await?;
 
         const CHUNK_SIZE: usize = 8_000;
         for chunk in rows.chunks(CHUNK_SIZE) {
@@ -1508,6 +1508,9 @@ impl PostgresWriter {
 
     /// Insert a boundary pool snapshot (authoritative Zebra pool sizes at a 256-block boundary).
     /// Uses ON CONFLICT to allow idempotent re-inserts (e.g. after reorg re-indexing).
+    /// Each argument maps 1:1 to a column; bundling into a struct would only
+    /// move the same 8 fields to a call site with no correctness benefit.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_boundary_pool_snapshot(
         &self,
         boundary_height: u32,

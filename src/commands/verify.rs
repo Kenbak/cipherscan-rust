@@ -42,7 +42,7 @@ pub(crate) async fn verify_parsing(
     for height in start_height..start_height + count {
         // Get hash from RocksDB
         let rocks_hash = match zebra.get_block_hash(height) {
-            Ok(h) => { crate::util::display_hash(&h) }
+            Ok(h) => crate::util::display_hash(&h),
             Err(e) => {
                 println!("   ❌ Height {}: RocksDB error - {}", height, e);
                 mismatches += 1;
@@ -279,7 +279,11 @@ async fn verify_transaction_simple(
         for i in 0..3u16 {
             match zebra.get_tx_hash_by_loc(height, i) {
                 Ok(hash) => {
-                    println!("   TX {}: {} (from RocksDB)", i, crate::util::display_hash(&hash));
+                    println!(
+                        "   TX {}: {} (from RocksDB)",
+                        i,
+                        crate::util::display_hash(&hash)
+                    );
                 }
                 Err(_) => break,
             }

@@ -388,7 +388,7 @@ impl TransactionParser {
             let m = bytes[0] as i32 - 0x50; // OP_1..OP_16
             let n_byte = bytes[bytes.len() - 2];
             let n = n_byte as i32 - 0x50;
-            if m >= 1 && m <= 16 && n >= 1 && n <= 16 && m <= n {
+            if (1..=16).contains(&m) && (1..=16).contains(&n) && m <= n {
                 if let Some(pubkeys) =
                     Self::extract_multisig_pubkeys(&bytes[1..bytes.len() - 2], n as usize)
                 {
@@ -418,7 +418,7 @@ impl TransactionParser {
         use sha2::{Digest, Sha256};
 
         let sha = Sha256::digest(data);
-        let ripe = Ripemd160::digest(&sha);
+        let ripe = Ripemd160::digest(sha);
         let mut out = [0u8; 20];
         out.copy_from_slice(&ripe);
         out
@@ -465,7 +465,7 @@ impl TransactionParser {
 
         // Checksum
         let first = Sha256::digest(&data);
-        let second = Sha256::digest(&first);
+        let second = Sha256::digest(first);
         data.extend_from_slice(&second[0..4]);
 
         bs58::encode(&data).into_string()

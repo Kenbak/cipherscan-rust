@@ -5,10 +5,10 @@
 //!
 //! Uses RocksDB secondary mode to follow Zebra's writes in real-time.
 
-use rocksdb::{DB, Options, IteratorMode};
+use crate::config::Config;
+use rocksdb::{IteratorMode, Options, DB};
 use std::io::Cursor;
 use std::time::Instant;
-use crate::config::Config;
 use zebra_chain::block::Header as ZebraHeader;
 use zebra_chain::serialization::ZcashDeserialize;
 
@@ -40,10 +40,8 @@ impl ZebraState {
         // RocksDB secondary instances require an exclusive secondary directory.
         // Include the PID so bounded parallel backfill workers can safely read the
         // same Zebra primary without sharing lock or catch-up state.
-        let secondary_path = std::env::temp_dir().join(format!(
-            "cipherscan-rocks-secondary-{}",
-            std::process::id()
-        ));
+        let secondary_path =
+            std::env::temp_dir().join(format!("cipherscan-rocks-secondary-{}", std::process::id()));
         std::fs::create_dir_all(&secondary_path)
             .map_err(|e| format!("Failed to create secondary path: {}", e))?;
 
@@ -62,24 +60,19 @@ impl ZebraState {
 
     /// Get current chain tip height
     pub fn get_tip_height(&self) -> Result<u32, String> {
-        let cf = self.db.cf_handle("hash_by_height")
+        let cf = self
+            .db
+            .cf_handle("hash_by_height")
             .ok_or("hash_by_height CF not found")?;
 
         let mut last_height = 0u32;
 
-        // Iterate to find last entry (RocksDB is sorted)
-        for item in self.db.iterator_cf(cf, IteratorMode::End) {
-            match item {
-                Ok((key, _)) => {
-                    if key.len() >= 3 {
-                        // 3-byte big-endian height
-                        last_height = ((key[0] as u32) << 16)
-                            | ((key[1] as u32) << 8)
-                            | (key[2] as u32);
-                    }
-                    break;  // Only need the last one
-                }
-                Err(e) => return Err(format!("Error reading tip: {}", e)),
+        // RocksDB is sorted; only the last entry is needed.
+        if let Some(item) = self.db.iterator_cf(cf, IteratorMode::End).next() {
+            let (key, _) = item.map_err(|e| format!("Error reading tip: {}", e))?;
+            if key.len() >= 3 {
+                // 3-byte big-endian height
+                last_height = ((key[0] as u32) << 16) | ((key[1] as u32) << 8) | (key[2] as u32);
             }
         }
 
@@ -88,7 +81,9 @@ impl ZebraState {
 
     /// Get block hash by height
     pub fn get_block_hash(&self, height: u32) -> Result<[u8; 32], String> {
-        let cf = self.db.cf_handle("hash_by_height")
+        let cf = self
+            .db
+            .cf_handle("hash_by_height")
             .ok_or("hash_by_height CF not found")?;
 
         // Encode height as 3-byte big-endian
@@ -98,7 +93,7 @@ impl ZebraState {
             (height & 0xFF) as u8,
         ];
 
-        match self.db.get_cf(cf, &key) {
+        match self.db.get_cf(cf, key) {
             Ok(Some(value)) => {
                 if value.len() >= 32 {
                     let mut hash = [0u8; 32];
@@ -115,7 +110,9 @@ impl ZebraState {
 
     /// Get and parse block header
     pub fn get_block_header(&self, height: u32) -> Result<ParsedBlockHeader, String> {
-        let cf = self.db.cf_handle("block_header_by_height")
+        let cf = self
+            .db
+            .cf_handle("block_header_by_height")
             .ok_or("block_header_by_height CF not found")?;
 
         // Encode height as 3-byte big-endian
@@ -125,7 +122,7 @@ impl ZebraState {
             (height & 0xFF) as u8,
         ];
 
-        match self.db.get_cf(cf, &key) {
+        match self.db.get_cf(cf, key) {
             Ok(Some(value)) => {
                 // Parse header using zebra-chain
                 let mut cursor = Cursor::new(&value[..]);
@@ -136,7 +133,8 @@ impl ZebraState {
                 let version = {
                     let v_str = format!("{:?}", header.version);
                     // Parse "Version(4)" -> 4
-                    v_str.trim_start_matches("Version(")
+                    v_str
+                        .trim_start_matches("Version(")
                         .trim_end_matches(')')
                         .parse::<i32>()
                         .unwrap_or(4)
@@ -144,24 +142,21 @@ impl ZebraState {
 
                 // Convert hashes to hex (display order = reversed)
                 let prev_hash = {
-                    let bytes: [u8; 32] = header.previous_block_hash.0.into();
-                    let mut rev = bytes;
+                    let mut rev = header.previous_block_hash.0;
                     rev.reverse();
-                    hex::encode(&rev)
+                    hex::encode(rev)
                 };
 
                 let merkle_root = {
-                    let bytes: [u8; 32] = header.merkle_root.0.into();
-                    let mut rev = bytes;
+                    let mut rev = header.merkle_root.0;
                     rev.reverse();
-                    hex::encode(&rev)
+                    hex::encode(rev)
                 };
 
                 let final_sapling_root = {
-                    let bytes: [u8; 32] = header.commitment_bytes.0;
-                    let mut rev = bytes;
+                    let mut rev = header.commitment_bytes.0;
                     rev.reverse();
-                    hex::encode(&rev)
+                    hex::encode(rev)
                 };
 
                 // Time
@@ -205,7 +200,7 @@ impl ZebraState {
                     // Reverse byte order for standard display (little-endian to big-endian)
                     if hex_str.len() == 64 {
                         let bytes: Vec<u8> = (0..32)
-                            .filter_map(|i| u8::from_str_radix(&hex_str[i*2..i*2+2], 16).ok())
+                            .filter_map(|i| u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16).ok())
                             .collect();
                         let reversed: Vec<u8> = bytes.into_iter().rev().collect();
                         hex::encode(&reversed)
@@ -266,7 +261,9 @@ impl ZebraState {
 
     /// Get transaction by location (block height + tx index)
     pub fn get_transaction_by_loc(&self, height: u32, tx_index: u16) -> Result<Vec<u8>, String> {
-        let cf = self.db.cf_handle("tx_by_loc")
+        let cf = self
+            .db
+            .cf_handle("tx_by_loc")
             .ok_or("tx_by_loc CF not found")?;
 
         // Encode location: 3-byte height BE + 2-byte tx_index BE
@@ -278,7 +275,7 @@ impl ZebraState {
             (tx_index & 0xFF) as u8,
         ];
 
-        match self.db.get_cf(cf, &key) {
+        match self.db.get_cf(cf, key) {
             Ok(Some(value)) => Ok(value.to_vec()),
             Ok(None) => Err(format!("Transaction not found at {}:{}", height, tx_index)),
             Err(e) => Err(format!("Error reading transaction: {}", e)),
@@ -287,7 +284,9 @@ impl ZebraState {
 
     /// Get transaction hash by location
     pub fn get_tx_hash_by_loc(&self, height: u32, tx_index: u16) -> Result<[u8; 32], String> {
-        let cf = self.db.cf_handle("hash_by_tx_loc")
+        let cf = self
+            .db
+            .cf_handle("hash_by_tx_loc")
             .ok_or("hash_by_tx_loc CF not found")?;
 
         // Same key format as tx_by_loc
@@ -299,7 +298,7 @@ impl ZebraState {
             (tx_index & 0xFF) as u8,
         ];
 
-        match self.db.get_cf(cf, &key) {
+        match self.db.get_cf(cf, key) {
             Ok(Some(value)) => {
                 if value.len() >= 32 {
                     let mut hash = [0u8; 32];
@@ -317,7 +316,9 @@ impl ZebraState {
     /// Iterate over all transactions in a block
     /// Returns (tx_index, raw_tx_bytes) for each transaction
     pub fn iter_block_transactions(&self, height: u32) -> Result<Vec<(u16, Vec<u8>)>, String> {
-        let cf = self.db.cf_handle("tx_by_loc")
+        let cf = self
+            .db
+            .cf_handle("tx_by_loc")
             .ok_or("tx_by_loc CF not found")?;
 
         // Prefix for this block height (3 bytes BE)
@@ -330,7 +331,7 @@ impl ZebraState {
         let mut transactions = Vec::new();
 
         // Iterate from the start of this height's prefix
-        for item in self.db.prefix_iterator_cf(cf, &prefix) {
+        for item in self.db.prefix_iterator_cf(cf, prefix) {
             match item {
                 Ok((key, value)) => {
                     // Check if still in same block (first 3 bytes match)
@@ -358,16 +359,17 @@ impl ZebraState {
     /// Get transaction location (height, index) by txid hash
     /// The txid should be in internal byte order (not display order)
     pub fn get_tx_loc_by_hash(&self, txid_bytes: &[u8; 32]) -> Result<(u32, u16), String> {
-        let cf = self.db.cf_handle("tx_loc_by_hash")
+        let cf = self
+            .db
+            .cf_handle("tx_loc_by_hash")
             .ok_or("tx_loc_by_hash CF not found")?;
 
         match self.db.get_cf(cf, txid_bytes) {
             Ok(Some(value)) => {
                 if value.len() >= 5 {
                     // 3-byte height BE + 2-byte tx_index BE
-                    let height = ((value[0] as u32) << 16)
-                        | ((value[1] as u32) << 8)
-                        | (value[2] as u32);
+                    let height =
+                        ((value[0] as u32) << 16) | ((value[1] as u32) << 8) | (value[2] as u32);
                     let tx_index = ((value[3] as u16) << 8) | (value[4] as u16);
                     Ok((height, tx_index))
                 } else {
@@ -382,10 +384,14 @@ impl ZebraState {
     /// Get a previous output's value and address using UTXO lookup (fast path)
     /// Falls back to parsing the full transaction if UTXO not found (already spent)
     /// Returns (value_zat, address_option)
-    pub fn get_prev_output(&self, prev_txid_hex: &str, prev_vout: u32) -> Result<(i64, Option<String>), String> {
+    pub fn get_prev_output(
+        &self,
+        prev_txid_hex: &str,
+        prev_vout: u32,
+    ) -> Result<(i64, Option<String>), String> {
         // Convert hex txid to bytes (internal order - reversed)
-        let txid_bytes = hex::decode(prev_txid_hex)
-            .map_err(|e| format!("Invalid txid hex: {}", e))?;
+        let txid_bytes =
+            hex::decode(prev_txid_hex).map_err(|e| format!("Invalid txid hex: {}", e))?;
 
         if txid_bytes.len() != 32 {
             return Err(format!("Invalid txid length: {}", txid_bytes.len()));
@@ -401,7 +407,8 @@ impl ZebraState {
         let (height, tx_index) = self.get_tx_loc_by_hash(&txid_internal)?;
 
         // Try UTXO lookup first (fast path - only works for unspent outputs)
-        if let Ok(Some((value, address))) = self.get_utxo_by_loc(height, tx_index, prev_vout as u16) {
+        if let Ok(Some((value, address))) = self.get_utxo_by_loc(height, tx_index, prev_vout as u16)
+        {
             return Ok((value, address));
         }
 
@@ -410,8 +417,15 @@ impl ZebraState {
     }
 
     /// Get UTXO directly from utxo_by_out_loc (fast, but only for unspent)
-    fn get_utxo_by_loc(&self, height: u32, tx_index: u16, output_index: u16) -> Result<Option<(i64, Option<String>)>, String> {
-        let cf = self.db.cf_handle("utxo_by_out_loc")
+    fn get_utxo_by_loc(
+        &self,
+        height: u32,
+        tx_index: u16,
+        output_index: u16,
+    ) -> Result<Option<(i64, Option<String>)>, String> {
+        let cf = self
+            .db
+            .cf_handle("utxo_by_out_loc")
             .ok_or("utxo_by_out_loc CF not found")?;
 
         // Key: 3-byte height BE + 2-byte tx_index BE + 2-byte output_index BE
@@ -425,7 +439,7 @@ impl ZebraState {
             (output_index & 0xFF) as u8,
         ];
 
-        match self.db.get_cf(cf, &key) {
+        match self.db.get_cf(cf, key) {
             Ok(Some(value)) => {
                 // Parse the UTXO value: 8-byte value LE + script
                 if value.len() < 8 {
@@ -460,7 +474,8 @@ impl ZebraState {
             && script[1] == 0xa9  // OP_HASH160
             && script[2] == 0x14  // Push 20 bytes
             && script[23] == 0x88 // OP_EQUALVERIFY
-            && script[24] == 0xac // OP_CHECKSIG
+            && script[24] == 0xac
+        // OP_CHECKSIG
         {
             let hash = &script[3..23];
             return Some(Self::encode_address_static(&p2pkh_prefix, hash));
@@ -470,7 +485,8 @@ impl ZebraState {
         if script.len() == 23
             && script[0] == 0xa9  // OP_HASH160
             && script[1] == 0x14  // Push 20 bytes
-            && script[22] == 0x87 // OP_EQUAL
+            && script[22] == 0x87
+        // OP_EQUAL
         {
             let hash = &script[2..22];
             return Some(Self::encode_address_static(&p2sh_prefix, hash));
@@ -481,21 +497,26 @@ impl ZebraState {
 
     /// Encode address with Base58Check
     fn encode_address_static(prefix: &[u8], hash: &[u8]) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut data = Vec::with_capacity(prefix.len() + hash.len() + 4);
         data.extend_from_slice(prefix);
         data.extend_from_slice(hash);
 
         let first = Sha256::digest(&data);
-        let second = Sha256::digest(&first);
+        let second = Sha256::digest(first);
         data.extend_from_slice(&second[0..4]);
 
         bs58::encode(&data).into_string()
     }
 
     /// Fallback: parse the full transaction to get output (slower)
-    fn get_output_by_parsing(&self, height: u32, tx_index: u16, output_index: u32) -> Result<(i64, Option<String>), String> {
+    fn get_output_by_parsing(
+        &self,
+        height: u32,
+        tx_index: u16,
+        output_index: u32,
+    ) -> Result<(i64, Option<String>), String> {
         use crate::indexer::TransactionParser;
 
         let raw_tx = self.get_transaction_by_loc(height, tx_index)?;
@@ -503,7 +524,7 @@ impl ZebraState {
         let block_hash = {
             let mut h = self.get_block_hash(height)?;
             h.reverse();
-            hex::encode(&h)
+            hex::encode(h)
         };
 
         let tx = TransactionParser::parse(&raw_tx, height, &block_hash, self.config.network)?;
@@ -514,7 +535,6 @@ impl ZebraState {
             Err(format!("Output {} not found in tx", output_index))
         }
     }
-
 }
 
 /// Parsed block header with all fields

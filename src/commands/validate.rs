@@ -102,7 +102,7 @@ pub(crate) async fn validate_full(
             .await
             .map_err(|e| format!("DB write error at {}: {}", height, e))?;
 
-        if (height - from_height + 1) % 10 == 0 {
+        if (height - from_height + 1).is_multiple_of(10) {
             let elapsed = rust_start.elapsed();
             let rate = (height - from_height + 1) as f64 / elapsed.as_secs_f64();
             println!(
@@ -494,7 +494,7 @@ pub(crate) async fn validate_full(
 
             match (&prod_prev_txid, &test_prev_txid) {
                 (Some(p), Some(t)) if p != t => {
-                    diffs.push(format!("prev_txid differs"));
+                    diffs.push("prev_txid differs".to_string());
                 }
                 (Some(_), None) => diffs.push("prev_txid: prod has value, test NULL".to_string()),
                 (None, Some(_)) => diffs.push("prev_txid: prod NULL, test has value".to_string()),

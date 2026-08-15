@@ -2,8 +2,8 @@
 //!
 //! Flows represent value moving between transparent and shielded pools.
 
-use serde::{Serialize, Deserialize};
 use crate::models::Transaction;
+use serde::{Deserialize, Serialize};
 
 /// Type of shielded flow
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ pub struct ShieldedFlow {
     pub txid: String,
     pub flow_type: String,
     pub pool: String,
-    pub amount: i64,  // In zatoshis (always positive)
+    pub amount: i64, // In zatoshis (always positive)
     pub block_height: u32,
     pub transparent_addresses: Vec<String>,
 }
@@ -137,7 +137,9 @@ impl ShieldedFlow {
         }
 
         // Collect transparent addresses for context
-        let addresses: Vec<String> = tx.vin.iter()
+        let addresses: Vec<String> = tx
+            .vin
+            .iter()
             .filter_map(|v| v.address.clone())
             .chain(tx.vout.iter().filter_map(|v| v.address.clone()))
             .collect();
@@ -231,7 +233,10 @@ mod tests {
         };
 
         let flows = ShieldedFlow::from_transaction(&tx);
-        assert!(flows.is_empty(), "Fully shielded tx should produce no flows");
+        assert!(
+            flows.is_empty(),
+            "Fully shielded tx should produce no flows"
+        );
     }
 
     #[test]
@@ -255,8 +260,8 @@ mod tests {
             sapling_outputs: 0,
             orchard_actions: 2,
             ironwood_actions: 0,
-            sapling_value_balance: 5000000,    // 0.05 ZEC leaving Sapling
-            orchard_value_balance: -4990000,   // ~0.05 ZEC entering Orchard (minus fee)
+            sapling_value_balance: 5000000, // 0.05 ZEC leaving Sapling
+            orchard_value_balance: -4990000, // ~0.05 ZEC entering Orchard (minus fee)
             ironwood_value_balance: 0,
             orchard_anchor: None,
             ironwood_anchor: None,
@@ -266,7 +271,10 @@ mod tests {
         };
 
         let flows = ShieldedFlow::from_transaction(&tx);
-        assert!(flows.is_empty(), "Pool migration should NOT produce a shield/deshield flow");
+        assert!(
+            flows.is_empty(),
+            "Pool migration should NOT produce a shield/deshield flow"
+        );
     }
 
     #[test]
@@ -291,7 +299,7 @@ mod tests {
             orchard_actions: 2,
             ironwood_actions: 2,
             sapling_value_balance: 0,
-            orchard_value_balance: 10010000,   // 0.1 ZEC + fee leaving Orchard
+            orchard_value_balance: 10010000, // 0.1 ZEC + fee leaving Orchard
             ironwood_value_balance: -10000000, // 0.1 ZEC entering Ironwood
             orchard_anchor: None,
             ironwood_anchor: None,
@@ -301,6 +309,9 @@ mod tests {
         };
 
         let flows = ShieldedFlow::from_transaction(&tx);
-        assert!(flows.is_empty(), "Orchard→Ironwood migration should NOT produce a shield/deshield flow");
+        assert!(
+            flows.is_empty(),
+            "Orchard→Ironwood migration should NOT produce a shield/deshield flow"
+        );
     }
 }

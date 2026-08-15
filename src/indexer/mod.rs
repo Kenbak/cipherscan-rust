@@ -24,7 +24,7 @@ fn checkpoint_progress_height(
     end_height: u32,
     last_successful_height: Option<u32>,
 ) -> Option<u32> {
-    if current_height % 100 == 0 || current_height == end_height {
+    if current_height.is_multiple_of(100) || current_height == end_height {
         last_successful_height
     } else {
         None
@@ -582,7 +582,7 @@ impl Indexer {
                 }
             }
 
-            let tx_flows = ShieldedFlow::from_transaction(&tx);
+            let tx_flows = ShieldedFlow::from_transaction(tx);
             flows.extend(tx_flows);
         }
 

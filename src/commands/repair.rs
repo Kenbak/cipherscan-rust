@@ -42,7 +42,10 @@ pub(crate) async fn repair_ironwood_fees(
     .map_err(|e| format!("Query error: {}", e))?;
 
     let total = rows.len();
-    println!("   Found {} transactions with nonzero ironwood_value_balance", total);
+    println!(
+        "   Found {} transactions with nonzero ironwood_value_balance",
+        total
+    );
 
     if total == 0 {
         println!("   ✅ Nothing to repair");
@@ -111,7 +114,11 @@ pub(crate) async fn repair_ironwood_fees(
     println!(
         "   ✅ {} fees {}, {} already correct",
         updated,
-        if dry_run { "would be updated" } else { "updated" },
+        if dry_run {
+            "would be updated"
+        } else {
+            "updated"
+        },
         skipped,
     );
     Ok(())
