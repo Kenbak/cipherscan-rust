@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install protoc (required to build the gRPC .proto files)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -45,18 +47,20 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/cipherscan_ci
     steps:
       - uses: actions/checkout@v4
+      - name: Install protoc and postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Apply schema to the disposable CI database
         run: |
-          sudo apt-get update && sudo apt-get install -y postgresql-client
           PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci \
             -c "CREATE ROLE zcash_user LOGIN SUPERUSER;"
-          # schema/postgres.sql has one known ordering issue (a migration-013
-          # table's FK references a PK defined later in the same file) — see
-          # the "schema hygiene" note in server/deploy/README.md. Applying
-          # without -v ON_ERROR_STOP lets every other object create
+          # schema/postgres.sql has one known ordering issue: the migration-013
+          # transparent_key_exposures table's inline FK references
+          # transaction_outputs' primary key, which this dump defines later in
+          # the same file (pg_dump-style trailing ALTER TABLE ADD CONSTRAINT).
+          # Applying without -v ON_ERROR_STOP lets every other object create
           # successfully; the follow-up step creates the one deferred table.
           PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci \
             -f schema/postgres.sql || true
