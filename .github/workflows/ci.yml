@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-and-clippy:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy -D warnings
+        run: cargo clippy --release --all-targets -- -D warnings
+
+  build-and-test:
+    name: build + test (with Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cipherscan_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/cipherscan_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Apply schema to the disposable CI database
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci \
+            -c "CREATE ROLE zcash_user LOGIN SUPERUSER;"
+          # schema/postgres.sql has one known ordering issue (a migration-013
+          # table's FK references a PK defined later in the same file) — see
+          # the "schema hygiene" note in server/deploy/README.md. Applying
+          # without -v ON_ERROR_STOP lets every other object create
+          # successfully; the follow-up step creates the one deferred table.
+          PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci \
+            -f schema/postgres.sql || true
+          PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci <<'SQL'
+          CREATE TABLE IF NOT EXISTS public.transparent_key_exposures (
+              txid text NOT NULL,
+              vout_index integer NOT NULL,
+              key_index integer NOT NULL,
+              pubkey_hex text NOT NULL,
+              script_type text NOT NULL,
+              derived_address text NOT NULL,
+              created_at timestamp without time zone DEFAULT now() NOT NULL,
+              PRIMARY KEY (txid, vout_index, key_index),
+              FOREIGN KEY (txid, vout_index)
+                  REFERENCES public.transaction_outputs(txid, vout_index) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_transparent_key_exposures_derived
+              ON public.transparent_key_exposures (derived_address);
+          SQL
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: cargo test --release
+        run: cargo test --release -- --test-threads=4

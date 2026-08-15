@@ -14,6 +14,8 @@ mod config;
 mod db;
 mod indexer;
 mod models;
+#[cfg(test)]
+mod postgres_integration_tests;
 mod util;
 
 use clap::{Parser, Subcommand};

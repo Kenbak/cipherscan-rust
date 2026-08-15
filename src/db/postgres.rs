@@ -12,22 +12,6 @@ pub struct PostgresWriter {
     pool: PgPool,
 }
 
-#[cfg(test)]
-mod integrity_write_tests {
-    #[test]
-    fn spent_metadata_uses_spending_block_time() {
-        let source = include_str!("postgres.rs");
-        assert!(source.contains("to_timestamp(spender.block_time) AT TIME ZONE 'UTC'"));
-    }
-
-    #[test]
-    fn replay_resets_activity_and_deletes_removed_owners() {
-        let source = include_str!("postgres.rs");
-        assert!(source.contains("DELETE FROM address_transactions WHERE txid = ANY($1)"));
-        assert!(source.contains("DELETE FROM addresses summary"));
-    }
-}
-
 impl PostgresWriter {
     const BLOCK_WRITE_LOCK: i64 = 0x4349_5048_4552;
     // Namespace for per-address advisory locks taken in update_addresses_for_block.
@@ -1548,5 +1532,21 @@ impl PostgresWriter {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod integrity_write_tests {
+    #[test]
+    fn spent_metadata_uses_spending_block_time() {
+        let source = include_str!("postgres.rs");
+        assert!(source.contains("to_timestamp(spender.block_time) AT TIME ZONE 'UTC'"));
+    }
+
+    #[test]
+    fn replay_resets_activity_and_deletes_removed_owners() {
+        let source = include_str!("postgres.rs");
+        assert!(source.contains("DELETE FROM address_transactions WHERE txid = ANY($1)"));
+        assert!(source.contains("DELETE FROM addresses summary"));
     }
 }
