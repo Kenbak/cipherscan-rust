@@ -1,0 +1,22 @@
+# Captured from the live testnet host on 2026-08-15 and
+# committed to version control for the first time — this unit was live-only
+# and undocumented previously. Added the same flock-based single-writer
+# fencing already proven on mainnet (see ../cipherscan-rust.service) since
+# testnet has the identical dual-writer risk and the fencing is zero-cost.
+
+[Unit]
+Description=CipherScan Rust Indexer (Testnet)
+After=zakurad.service postgresql.service
+Requires=zakurad.service postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/cipherscan-rust
+ExecStartPre=/bin/sleep 20
+ExecStart=/usr/bin/flock -n /run/cipherscan-indexer-testnet.lock /root/cipherscan-rust/target/release/cipherscan-indexer live
+Restart=on-failure
+RestartSec=10
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
