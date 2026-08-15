@@ -903,7 +903,7 @@ impl PostgresWriter {
         }
 
         let mut rows: Vec<_> = deltas.iter().collect();
-        rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        rows.sort_unstable_by_key(|(left, _)| *left);
         if rows.is_empty() {
             return Ok(());
         }
