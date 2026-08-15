@@ -504,17 +504,29 @@ impl PostgresWriter {
         self.mark_spent_outputs(&mut db_tx, transactions).await?;
         let flow_count = self.insert_flows_tx(&mut db_tx, flows, timestamp).await?;
 
-        // Address summaries are always derived from the address_transactions
-        // ledger — never an incremental `balance += delta` — so a genuinely
-        // new block and a replayed/corrective one converge through the same
-        // idempotent, concurrency-safe recompute. For a new block
-        // `old_activity_addresses` is empty; `update_addresses_for_block`
-        // still derives the correct touched-address set from `transactions`
-        // itself, whose address_transactions rows were already written above
-        // in this same db_tx. See update_addresses_for_block for why a
-        // per-address advisory lock is required in addition to recomputing.
-        self.update_addresses_for_block(&mut db_tx, transactions, &old_activity_addresses)
-            .await?;
+        if is_replay {
+            // Replay or corrective reprocessing: derive exact summaries from
+            // the idempotent activity ledger, including removed owners. Full
+            // recompute is O(that address's total history), so this path is
+            // intentionally reserved for the rare replay/backfill-overlap
+            // case rather than every new block (see 2026-08-15 incident:
+            // routing all new blocks through recompute made ordinary blocks
+            // that touch a high-volume address take 10-20s each).
+            self.update_addresses_for_block(&mut db_tx, transactions, &old_activity_addresses)
+                .await?;
+        } else {
+            // New block: apply its delta once. This is a plain relative
+            // `UPDATE ... SET balance = addresses.balance + delta`, which
+            // Postgres row-locking already makes safe against other
+            // concurrent deltas on the same address (the second UPDATE
+            // blocks on the row lock and sees the first's committed value —
+            // no lost update). The per-address advisory lock taken inside
+            // apply_address_deltas_for_new_block exists only to serialize
+            // against a concurrent REPLAY on the same address, whose
+            // absolute-recompute write is not safe to interleave with.
+            self.apply_address_deltas_for_new_block(&mut db_tx, transactions, timestamp)
+                .await?;
+        }
 
         db_tx.commit().await?;
         Ok((count, flow_count))
@@ -844,29 +856,146 @@ impl PostgresWriter {
         Ok(())
     }
 
-    /// Recompute exact address summaries for this block's touched addresses.
-    ///
-    /// This is the ONLY path that writes to `addresses` — there is no
-    /// incremental `balance += delta` path. It is used for both a genuinely
-    /// new block (`old_activity_addresses` empty) and a replay/corrective
-    /// reprocess (`old_activity_addresses` = addresses that lost activity on
-    /// reset), so re-indexing any block converges to identical state for a
-    /// single writer.
-    ///
-    /// Concurrency: recomputing an absolute SUM from a stale snapshot is
-    /// itself a lost-update hazard under concurrent writers (e.g. parallel
-    /// backfill at different heights touching the same address) — whichever
-    /// transaction's SELECT ran first can be overwritten by the other's
-    /// absolute result, silently dropping the first writer's contribution.
-    /// To close this, every touched address is locked with a session-scoped,
-    /// xact-held advisory lock BEFORE the recompute SELECT, in the same
-    /// sorted order `addresses` is already in. Concurrent transactions with
-    /// overlapping address sets therefore always acquire in the same
-    /// relative order (no deadlock), and whichever transaction acquires a
-    /// given address's lock second is guaranteed to see the first
-    /// transaction's fully committed address_transactions rows (the lock is
-    /// xact-scoped, so it cannot be acquired until the holder commits or
-    /// rolls back). Disjoint address sets remain fully parallel.
+    /// Applies each touched address's net delta for a genuinely new block via
+    /// a single relative `UPDATE ... SET balance = addresses.balance +
+    /// EXCLUDED.balance`. This is O(1) per address regardless of that
+    /// address's total history (unlike update_addresses_for_block's full
+    /// recompute), which matters for high-volume addresses (exchange hot
+    /// wallets) that appear in many blocks. The relative UPDATE is already
+    /// safe against another concurrent delta on the same address — Postgres
+    /// serializes it via the row lock, so the second UPDATE always sees the
+    /// first's committed value — but is NOT safe to interleave with a
+    /// concurrent REPLAY's absolute overwrite on the same address, hence the
+    /// per-address advisory lock before writing.
+    async fn apply_address_deltas_for_new_block(
+        &self,
+        db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        transactions: &[Transaction],
+        block_time: u64,
+    ) -> Result<(), sqlx::Error> {
+        struct Delta {
+            received: i64,
+            sent: i64,
+            txids: std::collections::HashSet<String>,
+        }
+
+        let mut deltas: HashMap<String, Delta> = HashMap::new();
+        for tx in transactions {
+            for output in &tx.vout {
+                if let Some(address) = &output.address {
+                    let delta = deltas.entry(address.clone()).or_insert_with(|| Delta {
+                        received: 0,
+                        sent: 0,
+                        txids: std::collections::HashSet::new(),
+                    });
+                    delta.received =
+                        delta.received.checked_add(output.value).ok_or_else(|| {
+                            sqlx::Error::Protocol(format!(
+                                "address receive delta overflow for {}",
+                                tx.txid
+                            ))
+                        })?;
+                    delta.txids.insert(tx.txid.clone());
+                }
+            }
+            for input in &tx.vin {
+                if input.is_coinbase {
+                    continue;
+                }
+                if let (Some(address), Some(value)) = (&input.address, input.value) {
+                    let delta = deltas.entry(address.clone()).or_insert_with(|| Delta {
+                        received: 0,
+                        sent: 0,
+                        txids: std::collections::HashSet::new(),
+                    });
+                    delta.sent = delta.sent.checked_add(value).ok_or_else(|| {
+                        sqlx::Error::Protocol(format!(
+                            "address send delta overflow for {}",
+                            tx.txid
+                        ))
+                    })?;
+                    delta.txids.insert(tx.txid.clone());
+                }
+            }
+        }
+
+        let mut rows: Vec<_> = deltas.iter().collect();
+        rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let lock_addresses: Vec<&str> = rows.iter().map(|(addr, _)| addr.as_str()).collect();
+        self.lock_addresses_for_write(db_tx, &lock_addresses).await?;
+
+        const CHUNK_SIZE: usize = 8_000;
+        for chunk in rows.chunks(CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO addresses \
+                 (address,balance,total_received,total_sent,tx_count,first_seen,last_seen,address_type) ",
+            );
+            query.push_values(chunk, |mut row, (address, delta)| {
+                row.push_bind(*address)
+                    .push_bind(delta.received - delta.sent)
+                    .push_bind(delta.received)
+                    .push_bind(delta.sent)
+                    .push_bind(delta.txids.len() as i32)
+                    .push_bind(block_time as i64)
+                    .push_bind(block_time as i64)
+                    .push_bind("transparent");
+            });
+            query.push(
+                " ON CONFLICT(address) DO UPDATE SET \
+                 balance=addresses.balance+EXCLUDED.balance, \
+                 total_received=addresses.total_received+EXCLUDED.total_received, \
+                 total_sent=addresses.total_sent+EXCLUDED.total_sent, \
+                 tx_count=addresses.tx_count+EXCLUDED.tx_count, \
+                 first_seen=LEAST(addresses.first_seen,EXCLUDED.first_seen), \
+                 last_seen=GREATEST(addresses.last_seen,EXCLUDED.last_seen), \
+                 updated_at=NOW()",
+            );
+            query.build().execute(&mut **db_tx).await?;
+        }
+        Ok(())
+    }
+
+    /// Acquires a per-address, xact-scoped advisory lock for every address in
+    /// `addresses` (which must already be sorted and deduped), in that same
+    /// sorted order. Concurrent transactions with overlapping address sets
+    /// therefore always acquire in the same relative order (no deadlock),
+    /// and whichever transaction acquires a given address's lock second is
+    /// guaranteed to see the first transaction's fully committed writes to
+    /// that address (the lock is xact-scoped, so it cannot be acquired until
+    /// the holder commits or rolls back). Disjoint address sets stay fully
+    /// parallel — this is not a substitute for the plain relative `UPDATE
+    /// balance = balance + delta` pattern's own safety on the fast path;
+    /// it exists to prevent a concurrent REPLAY (absolute recompute) from
+    /// interleaving unsafely with either a delta apply or another replay on
+    /// the same address. See apply_address_deltas_for_new_block and
+    /// update_addresses_for_block for how each side uses it.
+    async fn lock_addresses_for_write(
+        &self,
+        db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        addresses: &[&str],
+    ) -> Result<(), sqlx::Error> {
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock($1, hashtext(addr)) \
+             FROM unnest($2::text[]) AS addr ORDER BY addr",
+        )
+        .bind(Self::ADDRESS_LOCK_NAMESPACE)
+        .bind(addresses)
+        .execute(&mut **db_tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Recompute exact address summaries for replayed or corrected
+    /// transactions. Full recompute from the address_transactions ledger is
+    /// O(that address's total history) — reserved for replay/backfill, NOT
+    /// used for ordinary new blocks (see apply_address_deltas_for_new_block).
     async fn update_addresses_for_block(
         &self,
         db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -889,14 +1018,7 @@ impl PostgresWriter {
             return Ok(());
         }
 
-        sqlx::query(
-            "SELECT pg_advisory_xact_lock($1, hashtext(addr)) \
-             FROM unnest($2::text[]) AS addr ORDER BY addr",
-        )
-        .bind(Self::ADDRESS_LOCK_NAMESPACE)
-        .bind(&addresses)
-        .execute(&mut **db_tx)
-        .await?;
+        self.lock_addresses_for_write(db_tx, &addresses).await?;
 
         sqlx::query(
             r#"
