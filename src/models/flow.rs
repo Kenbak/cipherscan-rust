@@ -89,9 +89,24 @@ impl ShieldedFlow {
             return flows;
         }
 
-        // Calculate NET total across all shielded pools (Sapling + Orchard + Ironwood)
-        let total_value_balance =
-            tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance;
+        // Calculate NET total across all shielded pools (Sapling + Orchard + Ironwood).
+        // Checked arithmetic: a malformed/adversarial value balance must not panic
+        // the indexer. Zcash value balances are bounded well within i64, so this
+        // is not expected to trigger on well-formed chain data.
+        let total_value_balance = match tx
+            .sapling_value_balance
+            .checked_add(tx.orchard_value_balance)
+            .and_then(|v| v.checked_add(tx.ironwood_value_balance))
+        {
+            Some(total) => total,
+            None => {
+                eprintln!(
+                    "⚠️ Shielded value-balance overflow for tx {} — skipping flow classification",
+                    tx.txid
+                );
+                return flows;
+            }
+        };
 
         // Only create a flow if there's net movement
         if total_value_balance == 0 {
@@ -149,11 +164,24 @@ impl ShieldedFlow {
             Pool::Sapling.to_string()
         };
 
+        // checked_abs guards the i64::MIN edge case (its magnitude does not fit
+        // in i64), which plain `.abs()` would panic on.
+        let amount = match total_value_balance.checked_abs() {
+            Some(amount) => amount,
+            None => {
+                eprintln!(
+                    "⚠️ Shielded value-balance abs() overflow for tx {} — skipping flow classification",
+                    tx.txid
+                );
+                return flows;
+            }
+        };
+
         flows.push(ShieldedFlow {
             txid: tx.txid.clone(),
             flow_type: flow_type.to_string(),
             pool,
-            amount: total_value_balance.abs(),  // Always positive
+            amount, // Always positive
             block_height: tx.block_height,
             transparent_addresses: addresses,
         });

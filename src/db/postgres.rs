@@ -30,6 +30,11 @@ mod integrity_write_tests {
 
 impl PostgresWriter {
     const BLOCK_WRITE_LOCK: i64 = 0x4349_5048_4552;
+    // Namespace for per-address advisory locks taken in update_addresses_for_block.
+    // Serializes concurrent writers (e.g. parallel backfill workers at different
+    // heights) that touch the same address, without affecting writers touching
+    // disjoint addresses. See update_addresses_for_block for the full rationale.
+    const ADDRESS_LOCK_NAMESPACE: i32 = 0x4144_4452; // 'ADDR'
     /// Connect to PostgreSQL
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
@@ -298,6 +303,7 @@ impl PostgresWriter {
                 let is_coinbase = tx.vin.first().map(|v| v.is_coinbase).unwrap_or(false);
 
                 let has_sprout = tx.joinsplit_count > 0;
+                let has_shielded_data = has_sapling || has_orchard || has_ironwood || has_sprout;
 
                 sqlx::query(
                     r#"
@@ -311,13 +317,13 @@ impl PostgresWriter {
                     ironwood_actions, value_balance_ironwood, has_ironwood, value_balance,
                     expiry_height, sapling_spend_count, sapling_output_count,
                     sprout_joinsplit_count, has_sprout,
-                    orchard_anchor, ironwood_anchor
+                    orchard_anchor, ironwood_anchor, has_shielded_data
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
                     $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
                     $20, $21, $22, $23,
                     $24, $25, $26, $27, $28,
-                    $29, $30
+                    $29, $30, $31
                 )
                 ON CONFLICT (txid) DO UPDATE SET
                     block_height = EXCLUDED.block_height,
@@ -338,7 +344,8 @@ impl PostgresWriter {
                     sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count,
                     has_sprout = EXCLUDED.has_sprout,
                     orchard_anchor = EXCLUDED.orchard_anchor,
-                    ironwood_anchor = EXCLUDED.ironwood_anchor
+                    ironwood_anchor = EXCLUDED.ironwood_anchor,
+                    has_shielded_data = EXCLUDED.has_shielded_data
                 "#,
                 )
                 .bind(&tx.txid) // $1
@@ -373,6 +380,7 @@ impl PostgresWriter {
                 .bind(has_sprout) // $28
                 .bind(&tx.orchard_anchor) // $29
                 .bind(&tx.ironwood_anchor) // $30
+                .bind(has_shielded_data) // $31
                 .execute(&mut *db_tx)
                 .await?;
 
@@ -496,17 +504,17 @@ impl PostgresWriter {
         self.mark_spent_outputs(&mut db_tx, transactions).await?;
         let flow_count = self.insert_flows_tx(&mut db_tx, flows, timestamp).await?;
 
-        if is_replay {
-            // Replay or corrective reprocessing: derive exact summaries from
-            // the idempotent activity ledger, including removed owners.
-            self.update_addresses_for_block(&mut db_tx, transactions, &old_activity_addresses)
-                .await?;
-        } else {
-            // New block: apply its delta once. The per-height lock and replay
-            // check prevent duplicate application without rescanning history.
-            self.apply_address_deltas_for_new_block(&mut db_tx, transactions, timestamp)
-                .await?;
-        }
+        // Address summaries are always derived from the address_transactions
+        // ledger — never an incremental `balance += delta` — so a genuinely
+        // new block and a replayed/corrective one converge through the same
+        // idempotent, concurrency-safe recompute. For a new block
+        // `old_activity_addresses` is empty; `update_addresses_for_block`
+        // still derives the correct touched-address set from `transactions`
+        // itself, whose address_transactions rows were already written above
+        // in this same db_tx. See update_addresses_for_block for why a
+        // per-address advisory lock is required in addition to recomputing.
+        self.update_addresses_for_block(&mut db_tx, transactions, &old_activity_addresses)
+            .await?;
 
         db_tx.commit().await?;
         Ok((count, flow_count))
@@ -612,7 +620,7 @@ impl PostgresWriter {
                     ironwood_actions, value_balance_ironwood, has_ironwood, value_balance,
                     expiry_height, sapling_spend_count, sapling_output_count,
                     sprout_joinsplit_count, has_sprout,
-                    orchard_anchor, ironwood_anchor
+                    orchard_anchor, ironwood_anchor, has_shielded_data
                 ) "#,
             );
             query.push_values(chunk.iter().enumerate(), |mut row, (index, tx)| {
@@ -620,6 +628,7 @@ impl PostgresWriter {
                 let has_orchard = tx.orchard_actions > 0;
                 let has_ironwood = tx.ironwood_actions > 0;
                 let has_sprout = tx.joinsplit_count > 0;
+                let has_shielded_data = has_sapling || has_orchard || has_ironwood || has_sprout;
                 let is_coinbase = tx.vin.first().map(|vin| vin.is_coinbase).unwrap_or(false);
                 let value_balance =
                     tx.sapling_value_balance + tx.orchard_value_balance + tx.ironwood_value_balance;
@@ -653,7 +662,8 @@ impl PostgresWriter {
                     .push_bind(tx.joinsplit_count as i32)
                     .push_bind(has_sprout)
                     .push_bind(&tx.orchard_anchor)
-                    .push_bind(&tx.ironwood_anchor);
+                    .push_bind(&tx.ironwood_anchor)
+                    .push_bind(has_shielded_data);
             });
             query.push(
                 r#"
@@ -676,7 +686,8 @@ impl PostgresWriter {
                     sprout_joinsplit_count = EXCLUDED.sprout_joinsplit_count,
                     has_sprout = EXCLUDED.has_sprout,
                     orchard_anchor = EXCLUDED.orchard_anchor,
-                    ironwood_anchor = EXCLUDED.ironwood_anchor
+                    ironwood_anchor = EXCLUDED.ironwood_anchor,
+                    has_shielded_data = EXCLUDED.has_shielded_data
                 "#,
             );
             query.build().execute(&mut **db_tx).await?;
@@ -833,92 +844,29 @@ impl PostgresWriter {
         Ok(())
     }
 
-    async fn apply_address_deltas_for_new_block(
-        &self,
-        db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        transactions: &[Transaction],
-        block_time: u64,
-    ) -> Result<(), sqlx::Error> {
-        struct Delta {
-            received: i64,
-            sent: i64,
-            txids: std::collections::HashSet<String>,
-        }
-
-        let mut deltas: HashMap<String, Delta> = HashMap::new();
-        for tx in transactions {
-            for output in &tx.vout {
-                if let Some(address) = &output.address {
-                    let delta = deltas.entry(address.clone()).or_insert_with(|| Delta {
-                        received: 0,
-                        sent: 0,
-                        txids: std::collections::HashSet::new(),
-                    });
-                    delta.received =
-                        delta.received.checked_add(output.value).ok_or_else(|| {
-                            sqlx::Error::Protocol(format!(
-                                "address receive delta overflow for {}",
-                                tx.txid
-                            ))
-                        })?;
-                    delta.txids.insert(tx.txid.clone());
-                }
-            }
-            for input in &tx.vin {
-                if input.is_coinbase {
-                    continue;
-                }
-                if let (Some(address), Some(value)) = (&input.address, input.value) {
-                    let delta = deltas.entry(address.clone()).or_insert_with(|| Delta {
-                        received: 0,
-                        sent: 0,
-                        txids: std::collections::HashSet::new(),
-                    });
-                    delta.sent = delta.sent.checked_add(value).ok_or_else(|| {
-                        sqlx::Error::Protocol(format!(
-                            "address send delta overflow for {}",
-                            tx.txid
-                        ))
-                    })?;
-                    delta.txids.insert(tx.txid.clone());
-                }
-            }
-        }
-
-        let mut rows: Vec<_> = deltas.iter().collect();
-        rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        const CHUNK_SIZE: usize = 8_000;
-        for chunk in rows.chunks(CHUNK_SIZE) {
-            let mut query = QueryBuilder::<Postgres>::new(
-                "INSERT INTO addresses \
-                 (address,balance,total_received,total_sent,tx_count,first_seen,last_seen,address_type) ",
-            );
-            query.push_values(chunk, |mut row, (address, delta)| {
-                row.push_bind(*address)
-                    .push_bind(delta.received - delta.sent)
-                    .push_bind(delta.received)
-                    .push_bind(delta.sent)
-                    .push_bind(delta.txids.len() as i32)
-                    .push_bind(block_time as i64)
-                    .push_bind(block_time as i64)
-                    .push_bind("transparent");
-            });
-            query.push(
-                " ON CONFLICT(address) DO UPDATE SET \
-                 balance=addresses.balance+EXCLUDED.balance, \
-                 total_received=addresses.total_received+EXCLUDED.total_received, \
-                 total_sent=addresses.total_sent+EXCLUDED.total_sent, \
-                 tx_count=addresses.tx_count+EXCLUDED.tx_count, \
-                 first_seen=LEAST(addresses.first_seen,EXCLUDED.first_seen), \
-                 last_seen=GREATEST(addresses.last_seen,EXCLUDED.last_seen), \
-                 updated_at=NOW()",
-            );
-            query.build().execute(&mut **db_tx).await?;
-        }
-        Ok(())
-    }
-
-    /// Recompute exact summaries for replayed or corrected transactions.
+    /// Recompute exact address summaries for this block's touched addresses.
+    ///
+    /// This is the ONLY path that writes to `addresses` — there is no
+    /// incremental `balance += delta` path. It is used for both a genuinely
+    /// new block (`old_activity_addresses` empty) and a replay/corrective
+    /// reprocess (`old_activity_addresses` = addresses that lost activity on
+    /// reset), so re-indexing any block converges to identical state for a
+    /// single writer.
+    ///
+    /// Concurrency: recomputing an absolute SUM from a stale snapshot is
+    /// itself a lost-update hazard under concurrent writers (e.g. parallel
+    /// backfill at different heights touching the same address) — whichever
+    /// transaction's SELECT ran first can be overwritten by the other's
+    /// absolute result, silently dropping the first writer's contribution.
+    /// To close this, every touched address is locked with a session-scoped,
+    /// xact-held advisory lock BEFORE the recompute SELECT, in the same
+    /// sorted order `addresses` is already in. Concurrent transactions with
+    /// overlapping address sets therefore always acquire in the same
+    /// relative order (no deadlock), and whichever transaction acquires a
+    /// given address's lock second is guaranteed to see the first
+    /// transaction's fully committed address_transactions rows (the lock is
+    /// xact-scoped, so it cannot be acquired until the holder commits or
+    /// rolls back). Disjoint address sets remain fully parallel.
     async fn update_addresses_for_block(
         &self,
         db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -940,6 +888,16 @@ impl PostgresWriter {
         if addresses.is_empty() {
             return Ok(());
         }
+
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock($1, hashtext(addr)) \
+             FROM unnest($2::text[]) AS addr ORDER BY addr",
+        )
+        .bind(Self::ADDRESS_LOCK_NAMESPACE)
+        .bind(&addresses)
+        .execute(&mut **db_tx)
+        .await?;
+
         sqlx::query(
             r#"
             INSERT INTO addresses (
