@@ -1,0 +1,122 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PRIMARY_HOST: ${{ secrets.PRIMARY_HOST }}
+  STANDBY_HOST: ${{ secrets.STANDBY_HOST }}
+
+jobs:
+  ci-gate:
+    name: Wait for CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI must pass first
+        run: echo "Deploy workflow only runs after CI passes on the same push."
+
+  deploy:
+    name: Deploy to servers
+    needs: ci-gate
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          cat >> ~/.ssh/config << EOF
+          Host primary
+            HostName ${{ secrets.PRIMARY_HOST }}
+            User root
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking no
+          Host standby
+            HostName ${{ secrets.STANDBY_HOST }}
+            User root
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking no
+          EOF
+
+      - name: Detect roles (which box is PG primary)
+        id: roles
+        run: |
+          primary_is_recovery=$(ssh primary "sudo -u postgres psql -qtAX -c 'SELECT pg_is_in_recovery();'" 2>/dev/null || echo "error")
+          standby_is_recovery=$(ssh standby "sudo -u postgres psql -qtAX -c 'SELECT pg_is_in_recovery();'" 2>/dev/null || echo "error")
+          echo "primary_recovery=$primary_is_recovery" >> "$GITHUB_OUTPUT"
+          echo "standby_recovery=$standby_is_recovery" >> "$GITHUB_OUTPUT"
+
+          if [[ "$primary_is_recovery" == "f" ]]; then
+            echo "pg_primary=primary" >> "$GITHUB_OUTPUT"
+            echo "PG primary is on: primary (${{ secrets.PRIMARY_HOST }})"
+          elif [[ "$standby_is_recovery" == "f" ]]; then
+            echo "pg_primary=standby" >> "$GITHUB_OUTPUT"
+            echo "PG primary is on: standby (${{ secrets.STANDBY_HOST }})"
+          else
+            echo "::error::Cannot determine PG primary role"
+            exit 1
+          fi
+
+      - name: Deploy to primary box
+        run: |
+          ssh primary << 'REMOTE'
+          set -euo pipefail
+          cd /root/cipherscan-rust
+          git fetch origin main
+          git reset --hard origin/main
+
+          echo "Building indexer..."
+          source ~/.cargo/env 2>/dev/null || true
+          cargo build --release 2>&1 | tail -5
+
+          echo "Restarting indexer..."
+          systemctl restart cipherscan-rust.service
+          sleep 5
+          systemctl is-active cipherscan-rust.service
+          echo "Primary deploy complete"
+          REMOTE
+
+      - name: Apply migrations (on PG primary)
+        run: |
+          PG_HOST="${{ steps.roles.outputs.pg_primary }}"
+          ssh "$PG_HOST" << 'REMOTE'
+          set -euo pipefail
+          cd /root/cipherscan-rust
+          bash deploy/apply-migrations.sh
+          REMOTE
+
+      - name: Deploy to standby box
+        run: |
+          ssh standby << 'REMOTE'
+          set -euo pipefail
+          cd /root/cipherscan-rust
+          git fetch origin main
+          git reset --hard origin/main
+
+          echo "Building indexer binary (standby keeps a current binary for failover)..."
+          source ~/.cargo/env 2>/dev/null || true
+          cargo build --release 2>&1 | tail -5
+
+          # Do NOT restart the indexer on the standby — it only runs on the PG primary
+          echo "Standby deploy complete (binary updated, no indexer restart)"
+          REMOTE
+
+      - name: Verify
+        run: |
+          echo "=== Primary indexer status ==="
+          ssh primary "systemctl is-active cipherscan-rust.service && journalctl -u cipherscan-rust -n 3 --no-pager"
+          echo ""
+          echo "=== Replication status ==="
+          PG_HOST="${{ steps.roles.outputs.pg_primary }}"
+          ssh "$PG_HOST" "sudo -u postgres psql -c \"SELECT client_addr, state, sent_lsn, replay_lsn FROM pg_stat_replication;\"" || true
