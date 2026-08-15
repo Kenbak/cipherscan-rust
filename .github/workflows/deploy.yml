@@ -115,12 +115,15 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
 
-          echo "Building indexer binary (standby keeps a current binary for failover)..."
-          source ~/.cargo/env 2>/dev/null || true
-          cargo build --release 2>&1 | tail -5
+          if command -v cargo &>/dev/null || [ -f ~/.cargo/env ]; then
+            echo "Building indexer binary (standby keeps a current binary for failover)..."
+            source ~/.cargo/env 2>/dev/null || true
+            cargo build --release 2>&1 | tail -5
+          else
+            echo "Rust not installed on standby — skipping build (install before failover)"
+          fi
 
-          # Do NOT restart the indexer on the standby — it only runs on the PG primary
-          echo "Standby deploy complete (binary updated, no indexer restart)"
+          echo "Standby deploy complete"
           REMOTE
 
       - name: Verify
