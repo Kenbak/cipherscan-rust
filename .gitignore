@@ -27,3 +27,10 @@
 # Cursor IDE
 .cursor/
 .agents/
+
+# Host-specific ops configs (live in private wiki, not public repo)
+deploy/postgresql-cipherscan-mainnet.conf
+deploy/pgbackrest.conf
+deploy/mnt-storagebox-pgbackrest.mount
+deploy/restore-drill.sh
+deploy/RESTORE-DRILL-RUNBOOK.md
