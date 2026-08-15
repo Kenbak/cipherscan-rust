@@ -4,10 +4,12 @@
 -- `idx_tx_outputs_address` were already recreated (present since the
 -- rebuild); this file only lists the other 8.
 --
--- Resolution method: EXPLAIN (ANALYZE, BUFFERS) against production for the
--- actual query each index was meant to serve, cross-referenced with the
--- server/ API and jobs code in zcash-explorer for real call sites. Verified
--- with a same-session before/after EXPLAIN for each index that was rebuilt.
+-- Resolution method (revised 2026-08-15, see below): EXPLAIN (ANALYZE,
+-- BUFFERS) against production for the actual query, cross-referenced with
+-- real call sites in zcash-explorer, THEN confirmed against
+-- pg_stat_user_indexes deltas from actually running the real production
+-- jobs standalone (not just a hand-crafted stand-in query) before treating
+-- anything as "recreate this."
 --
 -- === Confirmed REDUNDANT — intentionally NOT recreated ===
 -- Each of these queries already used a different existing index with no
@@ -24,50 +26,56 @@
 --   column txid), same reasoning. Verified via EXPLAIN: 0.14ms, Index Scan
 --   on transaction_outputs_pkey.
 --
--- === Confirmed VALUABLE — recreated 2026-08-15 (CONCURRENTLY, zero downtime) ===
--- Each was verified to fix a real seq/parallel-seq scan or an avoidable
--- in-memory sort, with call sites confirmed in zcash-explorer
--- (server/signals/compute-mvrv.js, server/jobs/compute-utxo-age.js, and the
--- address-detail API routes). Before/after EXPLAIN on production:
+-- === Recreated 2026-08-15, then DROPPED again same day after verification ===
+-- Built with CREATE INDEX CONCURRENTLY based on a hand-crafted query that
+-- was assumed to represent a real access pattern ("symmetric with the
+-- proven idx_tx_outputs_spent case" / "must be hit on every address page
+-- view") WITHOUT first grepping zcash-explorer for an actual call site.
+-- That assumption was wrong: address balance/UTXO display reads the
+-- pre-maintained `addresses.balance` column (see cipherscan-rust's
+-- update_addresses_for_block / apply_address_deltas_for_new_block), not a
+-- live query against transaction_outputs/transaction_inputs, and no code
+-- path was found ordering either table by created_at. Confirmed unused via
+-- pg_stat_user_indexes: idx_scan stayed at 1 (address_unspent) and 2
+-- (inputs_addr_created) — completely flat — across two full, real
+-- production job runs (compute-mvrv.js, compute-utxo-age.js run
+-- standalone, not simulated). idx_tx_outputs_addr_created showed a small
+-- ambiguous uptick (+5 over ~40 min of live traffic) with no corresponding
+-- code evidence and no pg_stat_statements installed to confirm the source;
+-- treated as noise rather than confirmed use, consistent with the other
+-- two built on the same wrong assumption. Do not recreate these three
+-- without first grepping for a real call site AND confirming via
+-- pg_stat_user_indexes deltas from an actual production query, not a
+-- hand-crafted stand-in:
+--   idx_tx_outputs_address_unspent (address, spent) WHERE spent = false
+--   idx_tx_outputs_addr_created (address, created_at DESC)
+--   idx_tx_inputs_addr_created (address, created_at DESC)
 --
+-- === Confirmed VALUABLE — recreated 2026-08-15, KEPT ===
 -- idx_tx_outputs_spent (partial, WHERE spent = false — smaller and matches
---   every real call site, which all filter on the unspent side):
---   `SELECT count(*) FROM transaction_outputs WHERE spent = false` went from
---   a 16.6s Parallel Seq Scan (read=6,620,304 buffers) across the full 85GB
---   table to a 2.5s Parallel Index Only Scan (read=288,909 buffers) — ~6.7x
---   wall time, ~22x fewer buffer reads. Hit by server/signals/compute-mvrv.js
---   (MVRV realized cap) and server/jobs/compute-utxo-age.js (HODL waves)
---   every run.
+--   every real call site, which all filter on the unspent side): verified
+--   via EXPLAIN against the real compute-mvrv.js query (not a stand-in) —
+--   the planner uses "Parallel Index Scan using idx_tx_outputs_spent" — and
+--   confirmed via pg_stat_user_indexes jumping from idx_scan=9 to 14 with
+--   tup_read 55M -> 82M after running compute-mvrv.js and
+--   compute-utxo-age.js standalone in production. Hit by
+--   server/signals/compute-mvrv.js (MVRV realized cap, daily via
+--   daily-v3.sh at 21:00) and server/jobs/compute-utxo-age.js (HODL waves,
+--   daily via cron at 05:00) — daily, not hourly (an earlier version of
+--   this note incorrectly said "every run" implying hourly; corrected).
+--   In isolation (WHERE spent = false alone, no joins), this took the
+--   query from a 16.6s Parallel Seq Scan (85GB table, 6.6M buffer reads) to
+--   a 2.5s Parallel Index Only Scan (289k buffer reads). The full
+--   production compute-mvrv.js query (with its JOIN to transactions and
+--   zec_price_daily) is still ~20s end to end — the index fixed the seq
+--   scan on transaction_outputs, but the remaining cost is a per-row
+--   Nested Loop join to transactions for each of the ~6.9M unspent
+--   outputs, which this index does not address. That join cost would need
+--   a different fix (e.g. denormalizing block_time onto transaction_outputs
+--   or restructuring the query) — not attempted here since these are daily
+--   background jobs, not user-facing latency.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tx_outputs_spent
     ON public.transaction_outputs USING btree (spent) WHERE (spent = false);
 
--- idx_tx_outputs_address_unspent (address, spent) WHERE spent = false: a
---   per-address unspent-outputs count (balance/UTXO calculation, hit on
---   every address page view) went from 280ms (Index Scan on
---   idx_tx_outputs_address with a post-filter removing 22,672 spent rows)
---   to 0.44ms (Index Only Scan, exact match) — ~636x.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tx_outputs_address_unspent
-    ON public.transaction_outputs USING btree (address, spent) WHERE (spent = false);
-
--- idx_tx_outputs_addr_created (address, created_at DESC): address
---   transaction history pagination (ORDER BY created_at DESC LIMIT 20) went
---   from 28.7ms (Index Scan on idx_tx_outputs_address + top-N heapsort over
---   22,730 matching rows) to 2.3ms (Index Scan directly in output order, no
---   sort). Benefit scales with an address's tx_count — a high-volume
---   address (exchange hot wallet) would see a much larger gap than this
---   test case.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tx_outputs_addr_created
-    ON public.transaction_outputs USING btree (address, created_at DESC);
-
--- idx_tx_inputs_addr_created (address, created_at DESC): symmetric with
---   idx_tx_outputs_addr_created for the "sent" side of an address's
---   transaction history (transaction_inputs, 68GB). Same access pattern,
---   recreated for the same reason; not independently re-benchmarked since
---   the query shape and index are identical to the outputs case.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tx_inputs_addr_created
-    ON public.transaction_inputs USING btree (address, created_at DESC);
-
--- After creating any of the above, run ANALYZE on the affected table so the
--- planner picks them up immediately rather than waiting for autovacuum:
+-- After creating, run ANALYZE so the planner picks it up immediately:
 --   ANALYZE transaction_outputs;
---   ANALYZE transaction_inputs;
