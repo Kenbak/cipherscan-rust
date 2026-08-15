@@ -42,6 +42,7 @@ send_telegram() {
     "${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
     --data-urlencode "text=${message}" \
+    --data-urlencode "parse_mode=HTML" \
     --data-urlencode "disable_web_page_preview=true" \
     >/dev/null
 }
@@ -78,12 +79,14 @@ summary="$(printf '%s' "${combined_output}" | tail -n 40 | cut -c1-3500)"
 if [[ "${health_rc}" -eq 0 ]]; then
   if [[ "${previous_status}" == "unhealthy" ]]; then
     send_telegram "$(cat <<EOF
-CipherScan indexer recovered
-Host: ${HOST_LABEL}
-Time: ${timestamp}
-Lag threshold: ${MAX_LAG}
-Failure threshold: ${MAX_CONSECUTIVE_FAILURES}
-Heartbeat threshold seconds: ${MAX_HEARTBEAT_AGE_SECONDS}
+🟢 <b>CipherScan Indexer Recovered</b>
+
+<b>Host:</b> ${HOST_LABEL}
+<b>Time:</b> ${timestamp}
+
+✅ Service active
+✅ Lag ≤ ${MAX_LAG} blocks
+✅ Heartbeat ≤ ${MAX_HEARTBEAT_AGE_SECONDS}s
 EOF
 )"
   fi
@@ -103,15 +106,15 @@ fi
 
 if (( should_alert == 1 )); then
   send_telegram "$(cat <<EOF
-CipherScan indexer unhealthy
-Host: ${HOST_LABEL}
-Time: ${timestamp}
-Lag threshold: ${MAX_LAG}
-Failure threshold: ${MAX_CONSECUTIVE_FAILURES}
-Heartbeat threshold seconds: ${MAX_HEARTBEAT_AGE_SECONDS}
-Cooldown seconds: ${ALERT_COOLDOWN_SECONDS}
+🔴 <b>CipherScan Indexer Alert</b>
 
-${summary}
+<b>Host:</b> ${HOST_LABEL}
+<b>Time:</b> ${timestamp}
+
+❌ Service: ${service_status}
+<b>Thresholds:</b> lag ≤ ${MAX_LAG}, failures ≤ ${MAX_CONSECUTIVE_FAILURES}, heartbeat ≤ ${MAX_HEARTBEAT_AGE_SECONDS}s
+
+<pre>${summary}</pre>
 EOF
 )"
   persist_state "unhealthy" "${fingerprint}" "${now}"
