@@ -31,5 +31,15 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cipherscan-rust
 
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadOnlyPaths=/root/cipherscan-rust
+
 [Install]
 WantedBy=multi-user.target
