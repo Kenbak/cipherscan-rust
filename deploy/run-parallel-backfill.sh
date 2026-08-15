@@ -27,6 +27,17 @@ if systemctl is-active --quiet cipherscan-rust; then
   exit 1
 fi
 
+# Hold the same lock cipherscan-rust.service takes (fd stays open for the
+# rest of this script), so the live unit cannot start mid-backfill even if
+# something else starts it concurrently. The is-active check above only
+# catches the case where it is already running at invocation time.
+readonly INDEXER_LOCK_FILE="${INDEXER_LOCK_FILE:-/run/cipherscan-indexer.lock}"
+exec 9>"$INDEXER_LOCK_FILE"
+if ! flock -n 9; then
+  echo "Could not acquire $INDEXER_LOCK_FILE — cipherscan-rust.service (or another backfill) holds it" >&2
+  exit 1
+fi
+
 set -a
 # shellcheck disable=SC1091
 source "$ROOT/.env"

@@ -1,0 +1,42 @@
+# DISABLED BY DEFAULT. Do not `systemctl enable` this unit.
+#
+# Fenced, supervised alternative to running `run-parallel-backfill.sh` (or a
+# bare `cipherscan-indexer backfill`) by hand. It exists specifically to
+# prevent the class of incident from 2026-07-16, where a stale/edited unit
+# invoked `backfill` at the same time another worker was indexing: this unit
+# takes the SAME flock as cipherscan-rust.service
+# (/run/cipherscan-indexer.lock) and additionally declares Conflicts= against
+# it, so systemd will refuse to run both at once and the flock makes any
+# accidental concurrent invocation (systemd-managed or not) fail fast instead
+# of writing to PostgreSQL concurrently.
+#
+# Usage (manual, one-shot; instance name is "<from>-<to>"):
+#   sudo systemctl start cipherscan-rust-backfill@3000000-3001000.service
+#   journalctl -u cipherscan-rust-backfill@3000000-3001000.service -f
+#
+# Never enable this unit for boot-time start, and never run it while
+# cipherscan-rust.service (live) is active — Conflicts= stops systemd from
+# starting both, but always verify with `systemctl is-active cipherscan-rust`
+# first regardless.
+
+[Unit]
+Description=CipherScan Rust Indexer - Fenced Backfill (%i) - DISABLED, ad-hoc use only
+Conflicts=cipherscan-rust.service
+After=network-online.target postgresql.service zebrad-mainnet.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/cipherscan-rust
+EnvironmentFile=/root/cipherscan-rust/.env
+ExecStart=/usr/bin/flock -n /run/cipherscan-indexer.lock /bin/bash -c 'IFS="-" read -r from to <<< "%i"; exec /root/cipherscan-rust/target/release/cipherscan-indexer backfill --from "$from" --to "$to"'
+Restart=no
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cipherscan-rust-backfill
+
+# Intentionally no [Install] section — this unit must never be `enable`d for
+# boot-time start. Start it manually and only when cipherscan-rust.service is
+# confirmed stopped.

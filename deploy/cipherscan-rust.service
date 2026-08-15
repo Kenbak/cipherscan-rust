@@ -13,7 +13,14 @@ WorkingDirectory=/root/cipherscan-rust
 
 EnvironmentFile=/root/cipherscan-rust/.env
 
-ExecStart=/root/cipherscan-rust/target/release/cipherscan-indexer live
+# The flock holds an exclusive, non-blocking lock on /run/cipherscan-indexer.lock
+# for the lifetime of the indexer process. A second instance of this unit, a
+# manually started `cipherscan-indexer live`/`backfill`, or the disabled
+# cipherscan-rust-backfill@.service template all contend for the same lock
+# file and fail to start instead of writing to PostgreSQL concurrently. This
+# is host-level fencing only (see cipherscan-rust-backfill@.service and the
+# planned DB-level writer lease for cross-host fencing).
+ExecStart=/usr/bin/flock -n /run/cipherscan-indexer.lock /root/cipherscan-rust/target/release/cipherscan-indexer live
 
 Restart=on-failure
 RestartSec=30
