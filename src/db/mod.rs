@@ -4,9 +4,11 @@ pub mod grpc;
 pub mod postgres;
 pub mod rocks;
 pub mod rpc;
+pub mod spool;
 
-pub use grpc::connect_chain_tip_stream;
+pub use grpc::{connect_chain_tip_stream, supervise_block_stream, BlockPayloadCache};
 pub use postgres::PostgresWriter;
 pub use rocks::ParsedBlockHeader;
 pub use rocks::ZebraState;
 pub use rpc::ZebraRpc;
+pub use spool::BlockSpool;

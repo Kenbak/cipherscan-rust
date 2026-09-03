@@ -6,6 +6,7 @@ pub mod inspect;
 pub mod integrity;
 pub mod live;
 pub mod repair;
+pub mod shadow;
 pub mod status;
 pub mod validate;
 pub mod verify;

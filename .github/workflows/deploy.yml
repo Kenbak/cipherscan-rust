@@ -87,14 +87,39 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
 
+          if [ -x target/release/cipherscan-indexer ]; then
+            cp -a target/release/cipherscan-indexer target/release/cipherscan-indexer.previous
+          fi
+
           echo "Building indexer..."
           source ~/.cargo/env 2>/dev/null || true
           cargo build --release 2>&1 | tail -5
 
+          echo "Installing versioned systemd unit..."
+          install -m 0644 deploy/cipherscan-rust.service /etc/systemd/system/cipherscan-rust.service
+          systemctl daemon-reload
+
           echo "Restarting indexer..."
-          systemctl restart cipherscan-rust.service
-          sleep 5
-          systemctl is-active cipherscan-rust.service
+          candidate_ok=false
+          if systemctl restart cipherscan-rust.service; then
+            sleep 5
+            set -a
+            source .env
+            set +a
+            if systemctl is-active --quiet cipherscan-rust.service \
+               && target/release/cipherscan-indexer health --json >/tmp/cipherscan-indexer-health.json; then
+              candidate_ok=true
+            fi
+          fi
+          if [ "$candidate_ok" != "true" ]; then
+            echo "Candidate failed health startup; restoring previous binary"
+            if [ -x target/release/cipherscan-indexer.previous ]; then
+              cp -a target/release/cipherscan-indexer.previous target/release/cipherscan-indexer
+              systemctl restart cipherscan-rust.service
+            fi
+            systemctl status cipherscan-rust.service --no-pager || true
+            exit 1
+          fi
           echo "Primary deploy complete"
           REMOTE
 

@@ -6,11 +6,20 @@ mod transactions;
 pub use transactions::TransactionParser;
 
 use crate::config::Config;
-use crate::db::{PostgresWriter, ZebraState};
+use crate::db::{BlockSpool, PostgresWriter, ZebraState};
 use crate::models::ShieldedFlow;
 use crate::util::unix_timestamp_secs;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+struct LiveSourceBlock {
+    height: u32,
+    hash: String,
+    data: Arc<[u8]>,
+    source: &'static str,
+    source_elapsed_ms: u64,
+}
 
 fn cached_prev_output(
     key: &(String, u32),
@@ -36,6 +45,7 @@ pub struct Indexer {
     config: Config,
     zebra: ZebraState,
     postgres: PostgresWriter,
+    block_spool: BlockSpool,
 }
 
 impl Indexer {
@@ -52,11 +62,14 @@ impl Indexer {
         let postgres = PostgresWriter::connect(&config.database_url)
             .await
             .map_err(|e| format!("PostgreSQL error: {}", e))?;
+        let block_spool =
+            BlockSpool::open(config.block_spool_path.clone(), config.max_reorg_depth)?;
 
         Ok(Self {
             config,
             zebra,
             postgres,
+            block_spool,
         })
     }
 
@@ -232,18 +245,15 @@ impl Indexer {
             reorg_depth, fork_height, last_indexed
         );
 
-        // Best-effort: try to fetch raw hex of orphaned blocks via RPC.
-        // Zebra may NOT serve blocks from orphaned forks — this is a bonus attempt.
-        // The real safety net is the activation-window capture in block_archive,
-        // which stores raw hex as blocks are indexed (before any reorg occurs).
+        // Capture orphan bytes from RPC when still available, otherwise use the
+        // bounded recent-block spool written before the reorg was observed.
         let mut raw_blocks: Vec<(String, String)> = Vec::new();
         for h in fork_height..=last_indexed {
             let hash = self
                 .postgres
                 .get_block_hash_at_height(h)
                 .await
-                .ok()
-                .flatten();
+                .map_err(|e| format!("DB read error at {h}: {e}"))?;
             if let Some(hash) = hash {
                 match rpc.get_raw_block_hex(&hash).await {
                     Ok(hex) => {
@@ -254,9 +264,28 @@ impl Indexer {
                         );
                         raw_blocks.push((hash, hex));
                     }
-                    Err(_) => {
-                        println!("   ℹ️ Orphan block {} not available via RPC (expected)", h);
-                    }
+                    Err(rpc_error) => match self.block_spool.read(h, &hash).await {
+                        Ok(Some(bytes)) => {
+                            println!(
+                                "   📦 Recovered orphan block {} from bounded spool ({} bytes)",
+                                h,
+                                bytes.len()
+                            );
+                            raw_blocks.push((hash, hex::encode(bytes)));
+                        }
+                        Ok(None) => {
+                            println!(
+                                "   ⚠️ Orphan block {} unavailable via RPC or bounded spool: {}",
+                                h, rpc_error
+                            );
+                        }
+                        Err(spool_error) => {
+                            println!(
+                                "   ⚠️ Orphan block {} unavailable via RPC ({}); spool error: {}",
+                                h, rpc_error, spool_error
+                            );
+                        }
+                    },
                 }
             }
         }
@@ -306,18 +335,14 @@ impl Indexer {
         let mut flows = Vec::new();
 
         for (tx_index, raw) in &raw_txs {
-            let mut tx = TransactionParser::parse(raw, height, &block_hash, self.config.network)
+            let tx = TransactionParser::parse(raw, height, &block_hash, self.config.network)
                 .map_err(|e| format!("Failed to parse tx {}:{}: {}", height, tx_index, e))?;
-
-            // Resolve input addresses and values from previous outputs
-            TransactionParser::resolve_inputs(&mut tx, &self.zebra).map_err(|e| {
-                format!("Input resolution failed at {}:{}: {}", height, tx_index, e)
-            })?;
-
-            // Extract shielded flows
-            let tx_flows = ShieldedFlow::from_transaction(&tx);
-            flows.extend(tx_flows);
             transactions.push(tx);
+        }
+        TransactionParser::resolve_block_inputs(&mut transactions, &self.zebra)
+            .map_err(|e| format!("Input resolution failed at {height}: {e}"))?;
+        for transaction in &transactions {
+            flows.extend(ShieldedFlow::from_transaction(transaction));
         }
 
         // Write block, transactions, and flows atomically.
@@ -461,31 +486,63 @@ impl Indexer {
         Ok(())
     }
 
-    /// Index a single block from RPC (for live mode)
-    async fn index_block_from_rpc(
+    fn parse_encoded_block(
         &self,
-        rpc: &crate::db::ZebraRpc,
         height: u32,
-    ) -> Result<(u32, u32), String> {
-        // Get block info from RPC
-        let block_info = rpc.get_block_by_height(height as u64).await?;
-        let block_hash = block_info.hash.clone();
-        let block_time = block_info.time;
+        expected_hash: &str,
+        raw_block: &[u8],
+    ) -> Result<
+        (
+            Vec<crate::models::Transaction>,
+            crate::db::ParsedBlockHeader,
+        ),
+        String,
+    > {
+        use std::sync::Arc;
+        use zebra_chain::block::Block;
+        use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
 
-        let tx_count = block_info.tx.len() as u32;
-        let mut transactions = Vec::with_capacity(block_info.tx.len());
-
-        // Fetch each current transaction once.
-        for (tx_index, txid) in block_info.tx.iter().enumerate() {
-            let raw_hex = rpc.get_raw_transaction_hex(txid).await?;
-            let raw_bytes =
-                hex::decode(&raw_hex).map_err(|e| format!("Hex decode error: {}", e))?;
-
-            let tx = TransactionParser::parse(&raw_bytes, height, &block_hash, self.config.network)
-                .map_err(|e| format!("Failed to parse tx {}:{}: {}", height, tx_index, e))?;
-            transactions.push(tx);
+        let block = Block::zcash_deserialize(&mut std::io::Cursor::new(raw_block))
+            .map_err(|e| format!("Failed to deserialize block {height}: {e:?}"))?;
+        let decoded_hash = block.hash().to_string();
+        if decoded_hash != expected_hash {
+            return Err(format!(
+                "Block {height} hash mismatch: expected {expected_hash}, decoded {decoded_hash}"
+            ));
+        }
+        let decoded_height = block
+            .coinbase_height()
+            .map(|height| height.0)
+            .ok_or_else(|| format!("Block {height} has no coinbase height"))?;
+        if decoded_height != height {
+            return Err(format!(
+                "Block height mismatch: expected {height}, decoded {decoded_height}"
+            ));
         }
 
+        let header = crate::db::ParsedBlockHeader::from_zebra_header(&block.header);
+        let mut transactions = Vec::with_capacity(block.transactions.len());
+        for transaction in block.transactions {
+            let size = transaction.zcash_serialized_size();
+            let transaction =
+                Arc::try_unwrap(transaction).unwrap_or_else(|shared| (*shared).clone());
+            transactions.push(TransactionParser::from_zebra_tx(
+                transaction,
+                height,
+                expected_hash,
+                size,
+                self.config.network,
+            )?);
+        }
+
+        Ok((transactions, header))
+    }
+
+    async fn resolve_live_prevouts(
+        &self,
+        rpc: &crate::db::ZebraRpc,
+        transactions: &mut [crate::models::Transaction],
+    ) -> Result<Vec<ShieldedFlow>, String> {
         let current_outputs: HashMap<(String, u32), (i64, Option<String>)> = transactions
             .iter()
             .flat_map(|tx| {
@@ -519,7 +576,7 @@ impl Indexer {
         let mut raw_fallbacks: HashMap<String, crate::models::Transaction> = HashMap::new();
         let mut flows = Vec::new();
 
-        for tx in &mut transactions {
+        for tx in transactions {
             if !tx.is_coinbase() && !tx.vin.is_empty() {
                 let mut total_input: i64 = 0;
                 for input in &mut tx.vin {
@@ -573,49 +630,85 @@ impl Indexer {
                 let fee = tx
                     .transparent_value_in
                     .checked_sub(tx.transparent_value_out)
-                    .and_then(|v| v.checked_add(tx.sapling_value_balance))
-                    .and_then(|v| v.checked_add(tx.orchard_value_balance))
-                    .and_then(|v| v.checked_add(tx.ironwood_value_balance))
+                    .and_then(|value| value.checked_add(tx.sapling_value_balance))
+                    .and_then(|value| value.checked_add(tx.orchard_value_balance))
+                    .and_then(|value| value.checked_add(tx.ironwood_value_balance))
                     .ok_or_else(|| format!("fee overflow for {}", tx.txid))?;
                 if fee >= 0 {
                     tx.fee = Some(fee);
                 }
             }
 
-            let tx_flows = ShieldedFlow::from_transaction(tx);
-            flows.extend(tx_flows);
+            flows.extend(ShieldedFlow::from_transaction(tx));
         }
 
-        // Create header from RPC block info
-        let header = crate::db::ParsedBlockHeader {
-            version: block_info.version,
-            previous_block_hash: block_info.previousblockhash.clone().unwrap_or_default(),
-            merkle_root: block_info.merkleroot.clone(),
-            final_sapling_root: block_info.finalsaplingroot.clone().unwrap_or_default(),
-            final_orchard_root: block_info.finalorchardroot.clone(),
-            final_ironwood_root: block_info.finalironwoodroot.clone(),
-            time: block_info.time,
-            bits: block_info.bits.clone(),
-            nonce: block_info.nonce.clone(),
-            difficulty: block_info.difficulty,
-            solution: String::new(), // Not returned by RPC, but not critical
-        };
+        Ok(flows)
+    }
 
-        // Write block, transactions, and flows atomically.
+    async fn index_block_from_bytes(
+        &self,
+        rpc: &crate::db::ZebraRpc,
+        height: u32,
+        block_hash: &str,
+        raw_block: &[u8],
+    ) -> Result<(u32, u32), String> {
+        let (mut transactions, mut header) =
+            self.parse_encoded_block(height, block_hash, raw_block)?;
+        let flows = self.resolve_live_prevouts(rpc, &mut transactions).await?;
+
+        // Raw headers do not expose Zebra's interpreted final pool roots.
+        // Preserve the existing API contract with one metadata RPC call while
+        // eliminating the old per-transaction RPC fan-out.
+        let block_info = rpc.get_block(block_hash).await?;
+        if block_info.hash != block_hash {
+            return Err(format!(
+                "RPC metadata hash mismatch at {height}: expected {block_hash}, got {}",
+                block_info.hash
+            ));
+        }
+        header.final_sapling_root = block_info.finalsaplingroot.unwrap_or_default();
+        header.final_orchard_root = block_info.finalorchardroot;
+        header.final_ironwood_root = block_info.finalironwoodroot;
+        header.difficulty = block_info.difficulty;
+
         let (_, flow_count) = self
             .postgres
             .batch_insert_with_header_and_flows(
                 height,
-                &block_hash,
-                block_time,
+                block_hash,
+                header.time,
                 &transactions,
                 &flows,
                 &header,
             )
             .await
-            .map_err(|e| format!("DB insert error: {}", e))?;
+            .map_err(|e| format!("DB insert error: {e}"))?;
 
-        Ok((tx_count, flow_count as u32))
+        if let Err(error) = self.block_spool.store(height, block_hash, raw_block).await {
+            tracing::warn!(
+                height,
+                %error,
+                spool = ?self.block_spool.directory(),
+                "canonical block committed but recent-block spool write failed"
+            );
+        }
+
+        Ok((transactions.len() as u32, flow_count as u32))
+    }
+
+    /// RPC fallback for live mode: one raw-block request and one metadata
+    /// request, rather than one request per transaction.
+    async fn index_block_from_rpc(
+        &self,
+        rpc: &crate::db::ZebraRpc,
+        height: u32,
+        block_hash: &str,
+    ) -> Result<(u32, u32), String> {
+        let raw_hex = rpc.get_raw_block_hex(block_hash).await?;
+        let raw_block =
+            hex::decode(raw_hex).map_err(|e| format!("Invalid raw block hex at {height}: {e}"))?;
+        self.index_block_from_bytes(rpc, height, block_hash, &raw_block)
+            .await
     }
 
     /// Capture authoritative Zebra pool sizes at a 256-block boundary height.
@@ -685,13 +778,72 @@ impl Indexer {
         Ok(())
     }
 
+    async fn produce_live_blocks(
+        rpc: crate::db::ZebraRpc,
+        payload_cache: Option<crate::db::BlockPayloadCache>,
+        start_height: u32,
+        end_height: u32,
+        payload_wait: Duration,
+        sender: tokio::sync::mpsc::Sender<Result<LiveSourceBlock, String>>,
+    ) {
+        for height in start_height..=end_height {
+            let source_started = Instant::now();
+            let result = async {
+                let hash = rpc.get_block_hash(height as u64).await?;
+                let encoded = if let Some(cache) = payload_cache.as_ref() {
+                    if height == end_height {
+                        cache.take_wait(&hash, payload_wait).await
+                    } else {
+                        cache.take(&hash).await
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(encoded) = encoded {
+                    return Ok(LiveSourceBlock {
+                        height,
+                        hash,
+                        data: encoded.data,
+                        source: "grpc",
+                        source_elapsed_ms: source_started.elapsed().as_millis() as u64,
+                    });
+                }
+
+                let raw_hex = rpc.get_raw_block_hex(&hash).await?;
+                let bytes = hex::decode(raw_hex)
+                    .map_err(|e| format!("Invalid raw block hex at {height}: {e}"))?;
+                if bytes.len() as u64 > zebra_chain::block::MAX_BLOCK_BYTES {
+                    return Err(format!(
+                        "Raw block {height} exceeds protocol limit: {} bytes",
+                        bytes.len()
+                    ));
+                }
+                Ok(LiveSourceBlock {
+                    height,
+                    hash,
+                    data: Arc::from(bytes),
+                    source: "rpc",
+                    source_elapsed_ms: source_started.elapsed().as_millis() as u64,
+                })
+            }
+            .await;
+
+            let failed = result.is_err();
+            if sender.send(result).await.is_err() || failed {
+                return;
+            }
+        }
+    }
+
     /// Run live mode (follow chain tip)
     /// Uses gRPC streaming for instant block notifications when available,
     /// falls back to 30s JSON-RPC polling otherwise.
     pub async fn live(&self) -> Result<(), String> {
         use crate::db::grpc::proto::BlockHashAndHeight;
-        use crate::db::{connect_chain_tip_stream, ZebraRpc};
-        use tokio::time::Duration;
+        use crate::db::{
+            connect_chain_tip_stream, supervise_block_stream, BlockPayloadCache, ZebraRpc,
+        };
         use tonic::Streaming;
 
         println!("🔴 Starting live indexer...");
@@ -704,9 +856,17 @@ impl Indexer {
         let grpc_url = self.config.zebra_grpc_url.clone();
         let mut grpc_stream: Option<Streaming<BlockHashAndHeight>> = None;
         let mut failure_state_active = self.has_active_failure_state().await?;
+        let payload_cache = if grpc_url.is_some() && self.config.enable_full_block_grpc {
+            Some(BlockPayloadCache::new(
+                self.config.grpc_payload_cache_blocks,
+                self.config.grpc_payload_cache_bytes,
+            )?)
+        } else {
+            None
+        };
 
         if let Some(ref url) = grpc_url {
-            println!("🔗 Connecting to Zebra gRPC at {}...", url);
+            println!("🔗 Connecting to Zakura gRPC at {}...", url);
             match connect_chain_tip_stream(url).await {
                 Ok(stream) => {
                     grpc_stream = Some(stream);
@@ -715,6 +875,12 @@ impl Indexer {
                 Err(e) => {
                     println!("   ⚠️ gRPC unavailable ({}), using 30s polling", e);
                 }
+            }
+            if let Some(cache) = payload_cache.clone() {
+                tokio::spawn(supervise_block_stream(url.clone(), cache));
+                println!("   ✅ Full-block gRPC supervisor started");
+            } else {
+                println!("   ℹ️ Full-block gRPC disabled pending successful shadow verification");
             }
         } else {
             println!("   ℹ️ ZEBRA_GRPC_URL not set — using 30s polling");
@@ -806,16 +972,82 @@ impl Indexer {
                 );
 
                 let mut last_success = last_indexed;
+                let (source_sender, mut source_receiver) =
+                    tokio::sync::mpsc::channel(self.config.live_pipeline_capacity);
+                tokio::spawn(Self::produce_live_blocks(
+                    rpc.clone(),
+                    payload_cache.clone(),
+                    last_indexed + 1,
+                    rpc_tip,
+                    Duration::from_millis(self.config.grpc_payload_wait_ms),
+                    source_sender,
+                ));
 
-                for height in (last_indexed + 1)..=rpc_tip {
-                    match self.index_block_from_rpc(&rpc, height).await {
+                while let Some(source_result) = source_receiver.recv().await {
+                    let source_block = match source_result {
+                        Ok(block) => block,
+                        Err(error) => {
+                            let height = last_success.saturating_add(1);
+                            self.record_failure("live_source", height, &error).await?;
+                            failure_state_active = true;
+                            println!("   ❌ Block {} source error: {}", height, error);
+                            break;
+                        }
+                    };
+                    let height = source_block.height;
+                    let ingest_started = Instant::now();
+                    let mut source = source_block.source;
+                    let mut result = self
+                        .index_block_from_bytes(
+                            &rpc,
+                            height,
+                            &source_block.hash,
+                            source_block.data.as_ref(),
+                        )
+                        .await;
+                    if result.is_err() && source == "grpc" {
+                        let grpc_error =
+                            result.as_ref().expect_err("checked gRPC indexing failure");
+                        println!(
+                            "   ⚠️ Block {} gRPC payload failed ({}); using RPC fallback",
+                            height, grpc_error
+                        );
+                        source = "rpc_fallback";
+                        result = self
+                            .index_block_from_rpc(&rpc, height, &source_block.hash)
+                            .await;
+                    };
+
+                    match result {
                         Ok((tx_count, flow_count)) => {
+                            let processing_ms = ingest_started.elapsed().as_millis() as u64;
+                            let elapsed_ms =
+                                source_block.source_elapsed_ms.saturating_add(processing_ms);
                             println!(
-                                "   ✅ Block {} | {} txs, {} flows",
-                                height, tx_count, flow_count
+                                "   ✅ Block {} | {} txs, {} flows [{}] | {}ms source + {}ms process",
+                                height,
+                                tx_count,
+                                flow_count,
+                                source,
+                                source_block.source_elapsed_ms,
+                                processing_ms
                             );
                             last_success = height;
-                            self.record_success_heartbeat().await?;
+                            self.postgres
+                                .update_live_progress(
+                                    height,
+                                    rpc_tip,
+                                    source,
+                                    elapsed_ms,
+                                    source_block.source_elapsed_ms,
+                                    processing_ms,
+                                    tx_count,
+                                    flow_count,
+                                    rpc_tip.saturating_sub(height),
+                                    source_receiver.len(),
+                                )
+                                .await
+                                .map_err(|e| format!("Live progress write error: {e}"))?;
                             if failure_state_active {
                                 self.clear_failure_state().await?;
                                 failure_state_active = false;
@@ -824,31 +1056,6 @@ impl Indexer {
                             if height % 256 == 0 {
                                 if let Err(e) = self.capture_boundary_snapshot(&rpc, height).await {
                                     println!("   ⚠️ Boundary snapshot error at {}: {}", height, e);
-                                }
-                            }
-
-                            // Archive raw block hex for every block (forensic safety net)
-                            {
-                                let hash_result = rpc.get_block_hash(height as u64).await;
-                                if let Ok(hash) = hash_result {
-                                    match rpc.get_raw_block_hex(&hash).await {
-                                        Ok(hex) => {
-                                            if let Err(e) = self
-                                                .postgres
-                                                .archive_raw_block(height, &hash, &hex, "live")
-                                                .await
-                                            {
-                                                println!(
-                                                    "   ⚠️ Block archive error at {}: {}",
-                                                    height, e
-                                                );
-                                            }
-                                        }
-                                        Err(e) => println!(
-                                            "   ⚠️ Raw block fetch error at {}: {}",
-                                            height, e
-                                        ),
-                                    }
                                 }
                             }
                         }
@@ -862,10 +1069,6 @@ impl Indexer {
                 }
 
                 if last_success > last_indexed {
-                    self.postgres
-                        .update_checkpoint("last_indexed_height", &last_success.to_string())
-                        .await
-                        .map_err(|e| format!("Checkpoint error: {}", e))?;
                     println!("   ✅ Synced to block {}", last_success);
 
                     // After re-indexing post-reorg, backfill canonical hashes and clean false orphans

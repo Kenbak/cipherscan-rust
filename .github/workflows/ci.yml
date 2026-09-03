@@ -56,30 +56,8 @@ jobs:
         run: |
           PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci \
             -c "CREATE ROLE zcash_user LOGIN SUPERUSER;"
-          # schema/postgres.sql has one known ordering issue: the migration-013
-          # transparent_key_exposures table's inline FK references
-          # transaction_outputs' primary key, which this dump defines later in
-          # the same file (pg_dump-style trailing ALTER TABLE ADD CONSTRAINT).
-          # Applying without -v ON_ERROR_STOP lets every other object create
-          # successfully; the follow-up step creates the one deferred table.
           PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci \
-            -f schema/postgres.sql || true
-          PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci <<'SQL'
-          CREATE TABLE IF NOT EXISTS public.transparent_key_exposures (
-              txid text NOT NULL,
-              vout_index integer NOT NULL,
-              key_index integer NOT NULL,
-              pubkey_hex text NOT NULL,
-              script_type text NOT NULL,
-              derived_address text NOT NULL,
-              created_at timestamp without time zone DEFAULT now() NOT NULL,
-              PRIMARY KEY (txid, vout_index, key_index),
-              FOREIGN KEY (txid, vout_index)
-                  REFERENCES public.transaction_outputs(txid, vout_index) ON DELETE CASCADE
-          );
-          CREATE INDEX IF NOT EXISTS idx_transparent_key_exposures_derived
-              ON public.transparent_key_exposures (derived_address);
-          SQL
+            -v ON_ERROR_STOP=1 -f schema/postgres.sql
 
       - name: cargo build --release
         run: cargo build --release
