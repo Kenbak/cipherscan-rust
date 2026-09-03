@@ -213,6 +213,28 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// NU7 capacity benchmark: replay blocks from RocksDB into an isolated DB
+    Benchmark {
+        /// Database URL for benchmark writes (isolated test DB)
+        #[arg(long, env = "DATABASE_URL")]
+        benchmark_db: Option<String>,
+        /// Start height
+        #[arg(long, default_value = "3200000")]
+        from: u32,
+        /// End height
+        #[arg(long, default_value = "3201000")]
+        to: u32,
+        /// Warm up RocksDB page cache with this many blocks before the measured range
+        #[arg(long, default_value = "100")]
+        warmup: u32,
+        /// Skip SQL writes — measure source+parse+prevout only
+        #[arg(long)]
+        parse_only: bool,
+        /// Emit machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Audit or repair the known transparent address-accounting defects.
     Integrity {
         #[arg(value_enum)]
@@ -262,7 +284,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let suppress_banner = matches!(
         &cli.command,
-        Commands::Status { json: true } | Commands::Health { json: true, .. }
+        Commands::Status { json: true }
+            | Commands::Health { json: true, .. }
+            | Commands::Benchmark { json: true, .. }
     );
 
     if !suppress_banner {
@@ -346,6 +370,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::RepairFees { batch, dry_run } => {
             commands::repair::repair_ironwood_fees(&config, batch, dry_run).await?;
+        }
+        Commands::Benchmark {
+            benchmark_db,
+            from,
+            to,
+            warmup,
+            parse_only,
+            json,
+        } => {
+            let db_url = benchmark_db.unwrap_or_else(|| config.database_url.clone());
+            commands::benchmark::run_benchmark(&config, &db_url, from, to, warmup, parse_only, json)
+                .await?;
         }
         Commands::Integrity {
             phase,
