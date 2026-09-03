@@ -17,6 +17,7 @@ ExecStart=/usr/bin/flock -n /run/cipherscan-indexer-testnet.lock /root/ciphersca
 Restart=on-failure
 RestartSec=10
 Environment=RUST_LOG=info
+StateDirectory=cipherscan-indexer
 
 [Install]
 WantedBy=multi-user.target

@@ -4,6 +4,7 @@
 
 use crate::config::Network;
 use crate::models::{PubkeyExposure, Transaction, TransparentInput, TransparentOutput};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use zebra_chain::serialization::ZcashDeserialize;
 use zebra_chain::transaction::Transaction as ZebraTransaction;
@@ -37,7 +38,7 @@ impl TransactionParser {
     }
 
     /// Convert zebra-chain Transaction to our Transaction model
-    fn from_zebra_tx(
+    pub(crate) fn from_zebra_tx(
         tx: ZebraTransaction,
         block_height: u32,
         block_hash: &str,
@@ -282,7 +283,6 @@ impl TransactionParser {
                 .map(|d| hex::encode(<[u8; 32]>::from(d.data().shared_anchor))),
             _ => None,
         };
-
         // Calculate fee (for non-coinbase)
         let fee = if is_coinbase {
             None
@@ -471,56 +471,89 @@ impl TransactionParser {
         bs58::encode(&data).into_string()
     }
 
-    /// Resolve input addresses and values by looking up previous outputs
-    /// This mutates the transaction in place, and calculates the fee
-    pub fn resolve_inputs(
-        tx: &mut Transaction,
+    /// Resolve all transparent inputs in a block while parsing each referenced
+    /// previous transaction at most once. Same-block outputs always win.
+    pub fn resolve_block_inputs(
+        transactions: &mut [Transaction],
         zebra: &crate::db::ZebraState,
     ) -> Result<(), String> {
-        // Skip coinbase - no inputs to resolve, no fee
-        if tx.vin.iter().any(|v| v.is_coinbase) {
-            tx.fee = None;
-            return Ok(());
-        }
-
-        for input in tx.vin.iter_mut() {
-            // Look up the previous output
-            let (value, address) = zebra
-                .get_prev_output(&input.txid, input.vout)
-                .map_err(|e| {
-                    format!(
-                        "unresolved prevout {}:{} for {}: {}",
-                        input.txid, input.vout, tx.txid, e
+        let current_outputs: HashMap<(String, u32), (i64, Option<String>)> = transactions
+            .iter()
+            .flat_map(|tx| {
+                tx.vout.iter().map(move |output| {
+                    (
+                        (tx.txid.clone(), output.n),
+                        (output.value, output.address.clone()),
                     )
-                })?;
-            input.value = Some(value);
-            input.address = address;
+                })
+            })
+            .collect();
+
+        let mut external_references: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+        for tx in transactions.iter() {
+            for input in tx.vin.iter().filter(|input| !input.is_coinbase) {
+                let key = (input.txid.clone(), input.vout);
+                if !current_outputs.contains_key(&key) {
+                    external_references
+                        .entry(input.txid.clone())
+                        .or_default()
+                        .insert(input.vout);
+                }
+            }
         }
 
-        // Recalculate transparent_value_in
-        tx.transparent_value_in = tx.vin.iter().try_fold(0i64, |total, input| {
-            total
-                .checked_add(input.value.unwrap_or(0))
-                .ok_or_else(|| format!("transparent input overflow for {}", tx.txid))
-        })?;
+        let mut resolved_outputs = current_outputs;
+        for (txid, output_indexes) in external_references {
+            let output_indexes: Vec<u32> = output_indexes.into_iter().collect();
+            let outputs = zebra
+                .get_outputs_by_txid(&txid, &output_indexes)
+                .map_err(|error| format!("failed to resolve outputs for {txid}: {error}"))?;
+            resolved_outputs.extend(
+                outputs
+                    .into_iter()
+                    .map(|(output_index, output)| ((txid.clone(), output_index), output)),
+            );
+        }
 
-        // Calculate fee:
-        // fee = transparent_in + shielded_value_balance - transparent_out
-        // where shielded_value_balance = sapling + orchard + ironwood
-        // (positive value_balance means ZEC leaving shielded pool = more inputs)
-        let shielded_value_balance = tx
-            .sapling_value_balance
-            .checked_add(tx.orchard_value_balance)
-            .and_then(|v| v.checked_add(tx.ironwood_value_balance))
-            .ok_or_else(|| format!("shielded value balance overflow for {}", tx.txid))?;
-        let fee = tx
-            .transparent_value_in
-            .checked_add(shielded_value_balance)
-            .and_then(|v| v.checked_sub(tx.transparent_value_out))
-            .ok_or_else(|| format!("fee overflow for {}", tx.txid))?;
+        for tx in transactions {
+            if tx.vin.iter().any(|input| input.is_coinbase) {
+                tx.fee = None;
+                continue;
+            }
 
-        // Fee should always be positive (or zero for edge cases)
-        tx.fee = if fee >= 0 { Some(fee) } else { None };
+            for input in &mut tx.vin {
+                let (value, address) = resolved_outputs
+                    .get(&(input.txid.clone(), input.vout))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "unresolved prevout {}:{} for {}",
+                            input.txid, input.vout, tx.txid
+                        )
+                    })?;
+                input.value = Some(value);
+                input.address = address;
+            }
+
+            tx.transparent_value_in = tx.vin.iter().try_fold(0i64, |total, input| {
+                total
+                    .checked_add(input.value.unwrap_or(0))
+                    .ok_or_else(|| format!("transparent input overflow for {}", tx.txid))
+            })?;
+
+            let shielded_value_balance = tx
+                .sapling_value_balance
+                .checked_add(tx.orchard_value_balance)
+                .and_then(|value| value.checked_add(tx.ironwood_value_balance))
+                .ok_or_else(|| format!("shielded value balance overflow for {}", tx.txid))?;
+            let fee = tx
+                .transparent_value_in
+                .checked_add(shielded_value_balance)
+                .and_then(|value| value.checked_sub(tx.transparent_value_out))
+                .ok_or_else(|| format!("fee overflow for {}", tx.txid))?;
+
+            tx.fee = if fee >= 0 { Some(fee) } else { None };
+        }
         Ok(())
     }
 }

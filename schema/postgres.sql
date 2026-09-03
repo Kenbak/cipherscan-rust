@@ -1359,23 +1359,6 @@ CREATE TABLE public.transaction_outputs (
 
 ALTER TABLE public.transaction_outputs OWNER TO zcash_user;
 
--- Reviewed migration 013 state: disclosed keys are analytics, never ownership.
-CREATE TABLE public.transparent_key_exposures (
-    txid text NOT NULL,
-    vout_index integer NOT NULL,
-    key_index integer NOT NULL,
-    pubkey_hex text NOT NULL,
-    script_type text NOT NULL,
-    derived_address text NOT NULL,
-    created_at timestamp without time zone DEFAULT now() NOT NULL,
-    PRIMARY KEY (txid, vout_index, key_index),
-    FOREIGN KEY (txid, vout_index)
-        REFERENCES public.transaction_outputs(txid, vout_index) ON DELETE CASCADE
-);
-
-CREATE INDEX idx_transparent_key_exposures_derived
-    ON public.transparent_key_exposures (derived_address);
-
 CREATE TABLE public.addresses_integrity_rebuild (
     address text PRIMARY KEY,
     balance bigint NOT NULL,
@@ -1840,6 +1823,27 @@ ALTER TABLE ONLY public.transaction_inputs
 
 ALTER TABLE ONLY public.transaction_outputs
     ADD CONSTRAINT transaction_outputs_pkey PRIMARY KEY (txid, vout_index);
+
+-- Reviewed migration 013 state: disclosed keys are analytics, never ownership.
+-- This table must be created after transaction_outputs_pkey because its
+-- composite foreign key references that unique constraint.
+CREATE TABLE public.transparent_key_exposures (
+    txid text NOT NULL,
+    vout_index integer NOT NULL,
+    key_index integer NOT NULL CHECK (key_index >= 0),
+    pubkey_hex text NOT NULL CHECK (length(pubkey_hex) IN (66, 130)),
+    script_type text NOT NULL,
+    derived_address text NOT NULL,
+    created_at timestamp without time zone DEFAULT now() NOT NULL,
+    PRIMARY KEY (txid, vout_index, key_index),
+    FOREIGN KEY (txid, vout_index)
+        REFERENCES public.transaction_outputs(txid, vout_index) ON DELETE CASCADE
+);
+
+ALTER TABLE public.transparent_key_exposures OWNER TO zcash_user;
+
+CREATE INDEX idx_transparent_key_exposures_derived
+    ON public.transparent_key_exposures (derived_address);
 
 
 --

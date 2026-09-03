@@ -1,6 +1,20 @@
 use crate::config::Config;
 use crate::util::{parse_optional_u32, parse_optional_u64, unix_timestamp_secs};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LiveMetrics {
+    height: u32,
+    rpc_tip: u32,
+    source: String,
+    elapsed_ms: u64,
+    source_ms: u64,
+    processing_ms: u64,
+    transaction_count: u32,
+    flow_count: u32,
+    backlog_blocks: u32,
+    queue_depth: usize,
+}
 
 /// Show indexer status
 #[derive(Debug, Serialize)]
@@ -24,6 +38,7 @@ pub(crate) struct IndexerStatus {
     last_seen_rpc_tip: Option<u32>,
     last_tip_check_at: Option<u64>,
     last_success_at: Option<u64>,
+    live_metrics: Option<LiveMetrics>,
     failure: FailureState,
 }
 
@@ -38,6 +53,7 @@ fn assess_health(
     max_lag: u32,
     max_consecutive_failures: u32,
     max_heartbeat_age: u64,
+    max_ingest_ms: u64,
     now: u64,
 ) -> HealthAssessment {
     let mut reasons = Vec::new();
@@ -98,6 +114,14 @@ fn assess_health(
             status.failure.consecutive_failures, max_consecutive_failures
         ));
     }
+    if let Some(metrics) = status.live_metrics.as_ref() {
+        if metrics.elapsed_ms > max_ingest_ms {
+            reasons.push(format!(
+                "last ingest latency {}ms exceeds threshold {}ms",
+                metrics.elapsed_ms, max_ingest_ms
+            ));
+        }
+    }
 
     HealthAssessment {
         healthy: reasons.is_empty(),
@@ -111,6 +135,7 @@ async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
     let mut last_seen_rpc_tip = None;
     let mut last_tip_check_at = None;
     let mut last_success_at = None;
+    let mut live_metrics = None;
     let mut failure = FailureState {
         height: None,
         mode: None,
@@ -154,6 +179,15 @@ async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
                 .await
                 .map_err(|e| format!("Status read error: {}", e))?,
         );
+        live_metrics = postgres
+            .get_state("last_live_metrics")
+            .await
+            .map_err(|e| format!("Status read error: {}", e))?
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|e| format!("Invalid live metrics in indexer_state: {e}"))
+            })
+            .transpose()?;
 
         failure.height = parse_optional_u32(
             postgres
@@ -217,6 +251,7 @@ async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
         last_seen_rpc_tip,
         last_tip_check_at,
         last_success_at,
+        live_metrics,
         failure,
     })
 }
@@ -281,6 +316,16 @@ pub(crate) async fn show_status(config: &Config, json: bool) -> Result<(), Strin
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string())
     );
+    if let Some(metrics) = status.live_metrics.as_ref() {
+        println!(
+            "   Last ingest:       {}ms via {} (source {}ms, process {}ms, queue {})",
+            metrics.elapsed_ms,
+            metrics.source,
+            metrics.source_ms,
+            metrics.processing_ms,
+            metrics.queue_depth
+        );
+    }
     println!();
 
     if status.failure.consecutive_failures > 0 {
@@ -334,6 +379,7 @@ pub(crate) async fn check_health(
     max_lag: u32,
     max_consecutive_failures: u32,
     max_heartbeat_age: u64,
+    max_ingest_ms: u64,
     json: bool,
 ) -> Result<(), String> {
     let status = collect_status(config).await?;
@@ -342,6 +388,7 @@ pub(crate) async fn check_health(
         max_lag,
         max_consecutive_failures,
         max_heartbeat_age,
+        max_ingest_ms,
         unix_timestamp_secs(),
     );
 
@@ -387,7 +434,7 @@ pub(crate) async fn check_health(
 
 #[cfg(test)]
 mod health_tests {
-    use super::{assess_health, FailureState, IndexerStatus};
+    use super::{assess_health, FailureState, IndexerStatus, LiveMetrics};
 
     const NOW: u64 = 1_710_000_300;
 
@@ -403,6 +450,18 @@ mod health_tests {
             last_seen_rpc_tip: Some(100),
             last_tip_check_at: Some(NOW - 60),
             last_success_at: Some(NOW - 30),
+            live_metrics: Some(LiveMetrics {
+                height: 100,
+                rpc_tip: 100,
+                source: "rpc".to_string(),
+                elapsed_ms: 100,
+                source_ms: 40,
+                processing_ms: 60,
+                transaction_count: 2,
+                flow_count: 1,
+                backlog_blocks: 0,
+                queue_depth: 0,
+            }),
             failure: FailureState {
                 height: None,
                 mode: None,
@@ -415,14 +474,14 @@ mod health_tests {
 
     #[test]
     fn health_passes_when_lag_and_failures_are_within_threshold() {
-        let assessment = assess_health(&sample_status(Some(2), 0), 3, 0, 600, NOW);
+        let assessment = assess_health(&sample_status(Some(2), 0), 3, 0, 600, 5_000, NOW);
         assert!(assessment.healthy);
         assert!(assessment.reasons.is_empty());
     }
 
     #[test]
     fn health_fails_when_lag_exceeds_threshold() {
-        let assessment = assess_health(&sample_status(Some(5), 0), 3, 0, 600, NOW);
+        let assessment = assess_health(&sample_status(Some(5), 0), 3, 0, 600, 5_000, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
@@ -432,7 +491,7 @@ mod health_tests {
 
     #[test]
     fn health_fails_when_failure_count_exceeds_threshold() {
-        let assessment = assess_health(&sample_status(Some(1), 2), 3, 0, 600, NOW);
+        let assessment = assess_health(&sample_status(Some(1), 2), 3, 0, 600, 5_000, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
@@ -447,7 +506,7 @@ mod health_tests {
         status.last_indexed_height = Some(100);
         status.lag_blocks = Some(0);
 
-        let assessment = assess_health(&status, 3, 0, 600, NOW);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
@@ -460,7 +519,7 @@ mod health_tests {
         let mut status = sample_status(Some(0), 0);
         status.chain_tip_source = "state".to_string();
 
-        let assessment = assess_health(&status, 3, 0, 600, NOW);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
@@ -473,7 +532,7 @@ mod health_tests {
         let mut status = sample_status(Some(0), 0);
         status.last_tip_check_at = Some(NOW - 601);
 
-        let assessment = assess_health(&status, 3, 0, 600, NOW);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
@@ -486,11 +545,28 @@ mod health_tests {
         let mut status = sample_status(Some(0), 0);
         status.last_success_at = Some(NOW - 601);
 
-        let assessment = assess_health(&status, 3, 0, 600, NOW);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
             .iter()
             .any(|reason| reason.contains("success heartbeat age")));
+    }
+
+    #[test]
+    fn health_fails_when_last_ingest_exceeds_latency_budget() {
+        let mut status = sample_status(Some(0), 0);
+        status
+            .live_metrics
+            .as_mut()
+            .expect("sample metrics")
+            .elapsed_ms = 5_001;
+
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
+        assert!(!assessment.healthy);
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("ingest latency")));
     }
 }

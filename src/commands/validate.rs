@@ -25,14 +25,8 @@ pub(crate) async fn validate_full(
         "   Blocks: {} → {} ({} blocks)",
         from_height, to_height, block_count
     );
-    println!(
-        "   Prod DB: {}...",
-        &prod_db_url[..40.min(prod_db_url.len())]
-    );
-    println!(
-        "   Test DB: {}...",
-        &test_db_url[..40.min(test_db_url.len())]
-    );
+    println!("   Prod DB: configured reference database");
+    println!("   Test DB: configured disposable database");
     println!();
 
     // ========================================================================
@@ -64,23 +58,17 @@ pub(crate) async fn validate_full(
         let mut all_flows = Vec::new();
 
         for (tx_index, raw) in &raw_txs {
-            match TransactionParser::parse(raw, height, &block_hash, config.network) {
-                Ok(mut tx) => {
-                    // Resolve input addresses and values from previous outputs
-                    TransactionParser::resolve_inputs(&mut tx, &zebra).map_err(|e| {
-                        format!("Input resolution failed at {}:{}: {}", height, tx_index, e)
-                    })?;
-
-                    let flows = ShieldedFlow::from_transaction(&tx);
-                    rust_flow_count += flows.len() as u64;
-                    all_flows.extend(flows);
-                    transactions.push(tx);
-                    rust_tx_count += 1;
-                }
-                Err(e) => {
-                    tracing::warn!("Parse error at {}:{}: {}", height, tx_index, e);
-                }
-            }
+            let tx = TransactionParser::parse(raw, height, &block_hash, config.network)
+                .map_err(|e| format!("Parse error at {height}:{tx_index}: {e}"))?;
+            transactions.push(tx);
+            rust_tx_count += 1;
+        }
+        TransactionParser::resolve_block_inputs(&mut transactions, &zebra)
+            .map_err(|e| format!("Input resolution failed at {height}: {e}"))?;
+        for transaction in &transactions {
+            let flows = ShieldedFlow::from_transaction(transaction);
+            rust_flow_count += flows.len() as u64;
+            all_flows.extend(flows);
         }
 
         // Get block header for timestamp and other fields
@@ -730,5 +718,9 @@ pub(crate) async fn validate_full(
 
     println!("════════════════════════════════════════════════════════════");
 
-    Ok(())
+    if all_ok {
+        Ok(())
+    } else {
+        Err("Validation failed: indexed rows differ from production".to_string())
+    }
 }

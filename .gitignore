@@ -28,6 +28,9 @@
 .cursor/
 .agents/
 
+# Benchmark results (live in private wiki, not public repo)
+benchmarks/
+
 # Host-specific ops configs (live in private wiki, not public repo)
 deploy/postgresql-cipherscan-mainnet.conf
 deploy/pgbackrest.conf

@@ -3,8 +3,8 @@
 
 [Unit]
 Description=CipherScan Rust Indexer (Mainnet)
-After=network-online.target postgresql.service zebrad-mainnet.service
-Wants=network-online.target zebrad-mainnet.service
+After=network-online.target postgresql.service zakurad-mainnet.service
+Wants=network-online.target zakurad-mainnet.service
 
 [Service]
 Type=simple
@@ -12,6 +12,7 @@ User=root
 WorkingDirectory=/root/cipherscan-rust
 
 EnvironmentFile=/root/cipherscan-rust/.env
+StateDirectory=cipherscan-indexer
 
 # The flock holds an exclusive, non-blocking lock on /run/cipherscan-indexer.lock
 # for the lifetime of the indexer process. A second instance of this unit, a

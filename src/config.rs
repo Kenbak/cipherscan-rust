@@ -29,6 +29,24 @@ pub struct Config {
     /// Reorgs deeper than this require manual intervention (mainnet safety).
     /// Testnet should use a higher value since deep reorgs are routine.
     pub max_reorg_depth: u32,
+
+    /// Maximum encoded blocks retained in the in-memory gRPC payload cache.
+    pub grpc_payload_cache_blocks: usize,
+
+    /// Maximum bytes retained in the in-memory gRPC payload cache.
+    pub grpc_payload_cache_bytes: usize,
+
+    /// Time to wait for a matching full-block payload after a tip event.
+    pub grpc_payload_wait_ms: u64,
+
+    /// Opt-in for NonFinalizedStateChange after shadow verification succeeds.
+    pub enable_full_block_grpc: bool,
+
+    /// Directory for the bounded recent-block reorg spool.
+    pub block_spool_path: PathBuf,
+
+    /// Encoded blocks that may be prefetched while ordered writes commit.
+    pub live_pipeline_capacity: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +65,12 @@ impl Default for Config {
             max_open_files: 256,
             zebra_grpc_url: None,
             max_reorg_depth: 100,
+            grpc_payload_cache_blocks: 32,
+            grpc_payload_cache_bytes: 64 * 1024 * 1024,
+            grpc_payload_wait_ms: 1_500,
+            enable_full_block_grpc: false,
+            block_spool_path: PathBuf::from("/var/lib/cipherscan-indexer/block-spool"),
+            live_pipeline_capacity: 4,
         }
     }
 }
@@ -101,6 +125,41 @@ impl Config {
         if let Ok(val) = env::var("MAX_REORG_DEPTH") {
             if let Ok(n) = val.parse::<u32>() {
                 config.max_reorg_depth = n;
+            }
+        }
+        if let Ok(val) = env::var("GRPC_PAYLOAD_CACHE_BLOCKS") {
+            if let Ok(n) = val.parse::<usize>() {
+                if n > 0 {
+                    config.grpc_payload_cache_blocks = n;
+                }
+            }
+        }
+        if let Ok(val) = env::var("GRPC_PAYLOAD_CACHE_BYTES") {
+            if let Ok(n) = val.parse::<usize>() {
+                if n > 0 {
+                    config.grpc_payload_cache_bytes = n;
+                }
+            }
+        }
+        if let Ok(val) = env::var("GRPC_PAYLOAD_WAIT_MS") {
+            if let Ok(n) = val.parse::<u64>() {
+                config.grpc_payload_wait_ms = n;
+            }
+        }
+        if let Ok(value) = env::var("ENABLE_FULL_BLOCK_GRPC") {
+            config.enable_full_block_grpc =
+                matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(path) = env::var("BLOCK_SPOOL_PATH") {
+            if !path.trim().is_empty() {
+                config.block_spool_path = PathBuf::from(path);
+            }
+        }
+        if let Ok(value) = env::var("LIVE_PIPELINE_CAPACITY") {
+            if let Ok(capacity) = value.parse::<usize>() {
+                if (1..=64).contains(&capacity) {
+                    config.live_pipeline_capacity = capacity;
+                }
             }
         }
 

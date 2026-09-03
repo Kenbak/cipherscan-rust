@@ -1,11 +1,13 @@
 name: Deploy
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
 
 concurrency:
-  group: deploy-${{ github.ref }}
+  group: deploy-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 permissions:
@@ -16,21 +18,13 @@ env:
   STANDBY_HOST: ${{ secrets.STANDBY_HOST }}
 
 jobs:
-  ci-gate:
-    name: Wait for CI
-    runs-on: ubuntu-latest
-    steps:
-      - name: CI must pass first
-        run: echo "Deploy workflow only runs after CI passes on the same push."
-
   deploy:
     name: Deploy to servers
-    needs: ci-gate
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
     steps:
-      - uses: actions/checkout@v4
-
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
@@ -84,17 +78,42 @@ jobs:
           ssh primary << 'REMOTE'
           set -euo pipefail
           cd /root/cipherscan-rust
-          git fetch origin main
-          git reset --hard origin/main
+          git fetch origin "${{ github.event.workflow_run.head_sha }}"
+          git reset --hard "${{ github.event.workflow_run.head_sha }}"
+
+          if [ -x target/release/cipherscan-indexer ]; then
+            cp -a target/release/cipherscan-indexer target/release/cipherscan-indexer.previous
+          fi
 
           echo "Building indexer..."
           source ~/.cargo/env 2>/dev/null || true
           cargo build --release 2>&1 | tail -5
 
+          echo "Installing versioned systemd unit..."
+          install -m 0644 deploy/cipherscan-rust.service /etc/systemd/system/cipherscan-rust.service
+          systemctl daemon-reload
+
           echo "Restarting indexer..."
-          systemctl restart cipherscan-rust.service
-          sleep 5
-          systemctl is-active cipherscan-rust.service
+          candidate_ok=false
+          if systemctl restart cipherscan-rust.service; then
+            sleep 5
+            set -a
+            source .env
+            set +a
+            if systemctl is-active --quiet cipherscan-rust.service \
+               && target/release/cipherscan-indexer health --json >/tmp/cipherscan-indexer-health.json; then
+              candidate_ok=true
+            fi
+          fi
+          if [ "$candidate_ok" != "true" ]; then
+            echo "Candidate failed health startup; restoring previous binary"
+            if [ -x target/release/cipherscan-indexer.previous ]; then
+              cp -a target/release/cipherscan-indexer.previous target/release/cipherscan-indexer
+              systemctl restart cipherscan-rust.service
+            fi
+            systemctl status cipherscan-rust.service --no-pager || true
+            exit 1
+          fi
           echo "Primary deploy complete"
           REMOTE
 
@@ -112,8 +131,8 @@ jobs:
           ssh standby << 'REMOTE'
           set -euo pipefail
           cd /root/cipherscan-rust
-          git fetch origin main
-          git reset --hard origin/main
+          git fetch origin "${{ github.event.workflow_run.head_sha }}"
+          git reset --hard "${{ github.event.workflow_run.head_sha }}"
 
           if command -v cargo &>/dev/null || [ -f ~/.cargo/env ]; then
             echo "Building indexer binary (standby keeps a current binary for failover)..."

@@ -10,13 +10,10 @@
 //!   cargo run --release -- status       # Show indexer status
 
 mod commands;
-mod config;
-mod db;
-mod indexer;
-mod models;
 #[cfg(test)]
 mod postgres_integration_tests;
-mod util;
+
+pub use cipherscan_indexer::{config, db, indexer, models, util};
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -64,6 +61,16 @@ enum Commands {
     /// Run live indexer (follow chain tip)
     Live,
 
+    /// Verify full-block gRPC delivery without database writes
+    Shadow {
+        /// Number of canonical tip events to verify
+        #[arg(long, default_value = "1")]
+        events: u32,
+        /// Overall timeout in seconds
+        #[arg(long, default_value = "180")]
+        timeout: u64,
+    },
+
     /// Show indexer status
     Status {
         /// Emit machine-readable JSON
@@ -84,6 +91,10 @@ enum Commands {
         /// Maximum acceptable age for live heartbeat state in seconds
         #[arg(long, env = "INDEXER_MAX_HEARTBEAT_AGE_SECONDS", default_value = "600")]
         max_heartbeat_age: u64,
+
+        /// Maximum acceptable latency for the last committed live block
+        #[arg(long, env = "INDEXER_MAX_INGEST_MS", default_value = "5000")]
+        max_ingest_ms: u64,
 
         /// Emit machine-readable JSON
         #[arg(long)]
@@ -213,6 +224,28 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// NU7 capacity benchmark: replay blocks from RocksDB into an isolated DB
+    Benchmark {
+        /// Database URL for benchmark writes (isolated test DB)
+        #[arg(long, env = "DATABASE_URL")]
+        benchmark_db: Option<String>,
+        /// Start height
+        #[arg(long, default_value = "3200000")]
+        from: u32,
+        /// End height
+        #[arg(long, default_value = "3201000")]
+        to: u32,
+        /// Warm up RocksDB page cache with this many blocks before the measured range
+        #[arg(long, default_value = "100")]
+        warmup: u32,
+        /// Skip SQL writes — measure source+parse+prevout only
+        #[arg(long)]
+        parse_only: bool,
+        /// Emit machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Audit or repair the known transparent address-accounting defects.
     Integrity {
         #[arg(value_enum)]
@@ -262,7 +295,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let suppress_banner = matches!(
         &cli.command,
-        Commands::Status { json: true } | Commands::Health { json: true, .. }
+        Commands::Status { json: true }
+            | Commands::Health { json: true, .. }
+            | Commands::Benchmark { json: true, .. }
     );
 
     if !suppress_banner {
@@ -284,6 +319,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Live => {
             commands::live::run_live(&config).await?;
         }
+        Commands::Shadow { events, timeout } => {
+            commands::shadow::verify_full_block_stream(&config, events, timeout).await?;
+        }
         Commands::Status { json } => {
             commands::status::show_status(&config, json).await?;
         }
@@ -291,6 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_lag,
             max_consecutive_failures,
             max_heartbeat_age,
+            max_ingest_ms,
             json,
         } => {
             commands::status::check_health(
@@ -298,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_lag,
                 max_consecutive_failures,
                 max_heartbeat_age,
+                max_ingest_ms,
                 json,
             )
             .await?;
@@ -346,6 +386,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::RepairFees { batch, dry_run } => {
             commands::repair::repair_ironwood_fees(&config, batch, dry_run).await?;
+        }
+        Commands::Benchmark {
+            benchmark_db,
+            from,
+            to,
+            warmup,
+            parse_only,
+            json,
+        } => {
+            let db_url = benchmark_db.unwrap_or_else(|| config.database_url.clone());
+            commands::benchmark::run_benchmark(
+                &config, &db_url, from, to, warmup, parse_only, json,
+            )
+            .await?;
         }
         Commands::Integrity {
             phase,

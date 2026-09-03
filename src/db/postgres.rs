@@ -6,6 +6,27 @@
 use crate::models::{ShieldedFlow, Transaction};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 use std::collections::HashMap;
+use std::time::Instant;
+
+#[derive(Debug, Clone, Default)]
+pub struct BlockWriteMetrics {
+    pub metadata_us: u64,
+    pub transaction_data_us: u64,
+    pub pubkey_exposures_us: u64,
+    pub spent_marking_us: u64,
+    pub flows_us: u64,
+    pub address_summaries_us: u64,
+    pub commit_us: u64,
+    pub total_us: u64,
+    pub replay: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockWriteResult {
+    pub transaction_count: u64,
+    pub flow_count: u64,
+    pub metrics: BlockWriteMetrics,
+}
 
 /// PostgreSQL connection and writer
 pub struct PostgresWriter {
@@ -113,6 +134,60 @@ impl PostgresWriter {
         }
     }
 
+    /// Persist the committed live height, heartbeat, and privacy-safe ingest
+    /// metrics in one round trip.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_live_progress(
+        &self,
+        height: u32,
+        rpc_tip: u32,
+        source: &str,
+        elapsed_ms: u64,
+        source_ms: u64,
+        processing_ms: u64,
+        transaction_count: u32,
+        flow_count: u32,
+        backlog_blocks: u32,
+        queue_depth: usize,
+    ) -> Result<(), sqlx::Error> {
+        let now = crate::util::unix_timestamp_secs().to_string();
+        let metrics = serde_json::json!({
+            "height": height,
+            "rpc_tip": rpc_tip,
+            "source": source,
+            "elapsed_ms": elapsed_ms,
+            "source_ms": source_ms,
+            "processing_ms": processing_ms,
+            "transaction_count": transaction_count,
+            "flow_count": flow_count,
+            "backlog_blocks": backlog_blocks,
+            "queue_depth": queue_depth,
+        })
+        .to_string();
+        let keys = [
+            "last_indexed_height",
+            "last_success_at",
+            "last_live_metrics",
+        ];
+        let values = [height.to_string(), now, metrics];
+
+        sqlx::query(
+            r#"
+            INSERT INTO indexer_state (key, value, updated_at)
+            SELECT key, value, NOW()
+            FROM UNNEST($1::text[], $2::text[]) AS progress(key, value)
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(keys)
+        .bind(values)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Get checkpoint by specific key
     pub async fn get_checkpoint_key(&self, key: &str) -> Result<Option<u32>, sqlx::Error> {
         match self.get_state(key).await? {
@@ -131,6 +206,30 @@ impl PostgresWriter {
         flows: &[ShieldedFlow],
         header: &crate::db::ParsedBlockHeader,
     ) -> Result<(u64, u64), sqlx::Error> {
+        let result = self
+            .batch_insert_with_header_and_flows_measured(
+                height,
+                hash,
+                timestamp,
+                transactions,
+                flows,
+                header,
+            )
+            .await?;
+        Ok((result.transaction_count, result.flow_count))
+    }
+
+    pub async fn batch_insert_with_header_and_flows_measured(
+        &self,
+        height: u32,
+        hash: &str,
+        timestamp: u64,
+        transactions: &[Transaction],
+        flows: &[ShieldedFlow],
+        header: &crate::db::ParsedBlockHeader,
+    ) -> Result<BlockWriteResult, sqlx::Error> {
+        let total_start = Instant::now();
+        let mut metrics = BlockWriteMetrics::default();
         for tx in transactions {
             if !tx.is_coinbase() && tx.vin.iter().any(|input| input.value.is_none()) {
                 return Err(sqlx::Error::Protocol(format!(
@@ -258,7 +357,10 @@ impl PostgresWriter {
         .bind(&header.final_ironwood_root)
         .execute(&mut *db_tx)
         .await?;
+        metrics.metadata_us = total_start.elapsed().as_micros() as u64;
+        metrics.replay = is_replay;
 
+        let transaction_data_start = Instant::now();
         let old_activity_addresses = if is_replay {
             self.reset_address_activity(&mut db_tx, transactions)
                 .await?
@@ -482,12 +584,22 @@ impl PostgresWriter {
                 count += 1;
             }
         }
+        metrics.transaction_data_us = transaction_data_start.elapsed().as_micros() as u64;
 
+        let pubkey_start = Instant::now();
         self.insert_pubkey_exposures(&mut db_tx, transactions)
             .await?;
-        self.mark_spent_outputs(&mut db_tx, transactions).await?;
-        let flow_count = self.insert_flows_tx(&mut db_tx, flows, timestamp).await?;
+        metrics.pubkey_exposures_us = pubkey_start.elapsed().as_micros() as u64;
 
+        let spent_start = Instant::now();
+        self.mark_spent_outputs(&mut db_tx, transactions).await?;
+        metrics.spent_marking_us = spent_start.elapsed().as_micros() as u64;
+
+        let flows_start = Instant::now();
+        let flow_count = self.insert_flows_tx(&mut db_tx, flows, timestamp).await?;
+        metrics.flows_us = flows_start.elapsed().as_micros() as u64;
+
+        let addresses_start = Instant::now();
         if is_replay {
             // Replay or corrective reprocessing: derive exact summaries from
             // the idempotent activity ledger, including removed owners. Full
@@ -511,9 +623,34 @@ impl PostgresWriter {
             self.apply_address_deltas_for_new_block(&mut db_tx, transactions, timestamp)
                 .await?;
         }
+        metrics.address_summaries_us = addresses_start.elapsed().as_micros() as u64;
 
+        let commit_start = Instant::now();
         db_tx.commit().await?;
-        Ok((count, flow_count))
+        metrics.commit_us = commit_start.elapsed().as_micros() as u64;
+        metrics.total_us = total_start.elapsed().as_micros() as u64;
+
+        tracing::debug!(
+            height,
+            transactions = count,
+            flows = flow_count,
+            replay = metrics.replay,
+            metadata_us = metrics.metadata_us,
+            transaction_data_us = metrics.transaction_data_us,
+            pubkey_exposures_us = metrics.pubkey_exposures_us,
+            spent_marking_us = metrics.spent_marking_us,
+            flows_us = metrics.flows_us,
+            address_summaries_us = metrics.address_summaries_us,
+            commit_us = metrics.commit_us,
+            total_us = metrics.total_us,
+            "committed indexed block"
+        );
+
+        Ok(BlockWriteResult {
+            transaction_count: count,
+            flow_count,
+            metrics,
+        })
     }
 
     async fn reset_address_activity(
@@ -570,27 +707,46 @@ impl PostgresWriter {
         db_tx: &mut sqlx::Transaction<'_, Postgres>,
         transactions: &[Transaction],
     ) -> Result<(), sqlx::Error> {
-        for tx in transactions {
-            for output in &tx.vout {
-                for exposure in &output.pubkey_exposures {
-                    sqlx::query(
-                        "INSERT INTO transparent_key_exposures \
-                         (txid, vout_index, key_index, pubkey_hex, script_type, derived_address) \
-                         VALUES ($1, $2, $3, $4, $5, $6) \
-                         ON CONFLICT (txid, vout_index, key_index) DO UPDATE SET \
-                         pubkey_hex = EXCLUDED.pubkey_hex, script_type = EXCLUDED.script_type, \
-                         derived_address = EXCLUDED.derived_address",
-                    )
-                    .bind(&tx.txid)
-                    .bind(output.n as i32)
-                    .bind(exposure.pubkey_index as i32)
-                    .bind(&exposure.pubkey_hex)
-                    .bind(&output.script_type)
-                    .bind(&exposure.derived_p2pkh)
-                    .execute(&mut **db_tx)
-                    .await?;
-                }
-            }
+        let rows: Vec<_> = transactions
+            .iter()
+            .flat_map(|transaction| {
+                transaction.vout.iter().flat_map(move |output| {
+                    output.pubkey_exposures.iter().map(move |exposure| {
+                        (
+                            transaction.txid.as_str(),
+                            output.n,
+                            output.script_type.as_str(),
+                            exposure,
+                        )
+                    })
+                })
+            })
+            .collect();
+
+        const EXPOSURE_CHUNK_SIZE: usize = 8_000;
+        for chunk in rows.chunks(EXPOSURE_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO transparent_key_exposures \
+                 (txid, vout_index, key_index, pubkey_hex, script_type, derived_address) ",
+            );
+            query.push_values(
+                chunk,
+                |mut row, (txid, output_index, script_type, exposure)| {
+                    row.push_bind(*txid)
+                        .push_bind(*output_index as i32)
+                        .push_bind(exposure.pubkey_index as i32)
+                        .push_bind(&exposure.pubkey_hex)
+                        .push_bind(*script_type)
+                        .push_bind(&exposure.derived_p2pkh);
+                },
+            );
+            query.push(
+                " ON CONFLICT (txid, vout_index, key_index) DO UPDATE SET \
+                  pubkey_hex = EXCLUDED.pubkey_hex, \
+                  script_type = EXCLUDED.script_type, \
+                  derived_address = EXCLUDED.derived_address",
+            );
+            query.build().execute(&mut **db_tx).await?;
         }
         Ok(())
     }
@@ -1429,29 +1585,6 @@ impl PostgresWriter {
             .bind(block_hash)
             .execute(&self.pool)
             .await?;
-        Ok(())
-    }
-
-    /// Archive a raw block hex during the activation window.
-    /// Uses the existing `block_archive` table for persistent forensic storage.
-    pub async fn archive_raw_block(
-        &self,
-        height: u32,
-        hash: &str,
-        raw_hex: &str,
-        reason: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"INSERT INTO block_archive (height, hash, raw_hex, reason, captured_at)
-               VALUES ($1, $2, $3, $4, NOW())
-               ON CONFLICT (height, hash) DO NOTHING"#,
-        )
-        .bind(height as i64)
-        .bind(hash)
-        .bind(raw_hex)
-        .bind(reason)
-        .execute(&self.pool)
-        .await?;
         Ok(())
     }
 
