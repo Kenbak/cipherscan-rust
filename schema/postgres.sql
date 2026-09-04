@@ -441,7 +441,8 @@ CREATE TABLE public.fork_monitor_nodes (
     peers integer,
     mining boolean,
     ttl text DEFAULT '24h'::text NOT NULL,
-    reported_at bigint NOT NULL
+    reported_at bigint NOT NULL,
+    owner_token_hash text
 );
 
 
@@ -1876,6 +1877,12 @@ ALTER TABLE ONLY public.zec_price_daily
 
 CREATE INDEX idx_addr_tx_by_txid ON public.address_transactions USING btree (txid);
 
+--
+-- Name: idx_addresses_positive_balance_desc; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_addresses_positive_balance_desc ON public.addresses USING btree (balance DESC) WHERE (balance > 0);
+
 
 --
 -- Name: idx_address_labels_category; Type: INDEX; Schema: public; Owner: zcash_user
@@ -2746,5 +2753,3 @@ ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON TABLES 
 --
 -- PostgreSQL database dump complete
 --
-
-
