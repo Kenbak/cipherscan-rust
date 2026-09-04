@@ -2340,6 +2340,13 @@ CREATE INDEX idx_transactions_ironwood_accounting ON public.transactions USING b
 
 
 --
+-- Name: idx_transactions_ironwood_migration_query; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_transactions_ironwood_migration_query ON public.transactions USING btree (block_height, txid) INCLUDE (block_time, value_balance_ironwood, value_balance_orchard, ironwood_actions, orchard_actions, orchard_anchor, fee, expiry_height, locktime, is_coinbase) WHERE ((version = 6) AND (has_ironwood = true) AND (value_balance_orchard > 0) AND (value_balance_ironwood < 0) AND (vin_count = 0) AND (vout_count = 0));
+
+
+--
 -- Name: idx_transactions_shielded_height_all; Type: INDEX; Schema: public; Owner: postgres
 --
 
