@@ -61,7 +61,7 @@ if ! run_sql "SELECT 1 FROM schema_migrations LIMIT 1" >/dev/null 2>&1; then
         echo "[DRY RUN] Would create schema_migrations table"
     else
         psql_cmd -v ON_ERROR_STOP=1 -X \
-            -f "$MIGRATIONS_DIR/014_schema_migrations_tracking.sql"
+            < "$MIGRATIONS_DIR/014_schema_migrations_tracking.sql"
     fi
 fi
 
@@ -162,7 +162,10 @@ for filepath in "${pending[@]}"; do
 
     echo -n "  Applying $filename ... "
 
-    if psql_cmd -v ON_ERROR_STOP=1 -X -f "$filepath"; then
+    # Let the invoking (deployment) user open the repository file, then send
+    # SQL over stdin. The postgres OS account intentionally cannot traverse
+    # /root, but still owns only the database process executing the DDL.
+    if psql_cmd -v ON_ERROR_STOP=1 -X < "$filepath"; then
         run_sql "INSERT INTO schema_migrations (version, description) VALUES ('$version', '$description') ON CONFLICT (version) DO NOTHING;"
         echo "OK"
     else
