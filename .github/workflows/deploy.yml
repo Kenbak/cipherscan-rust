@@ -133,7 +133,7 @@ jobs:
           fi
           # Application credentials intentionally do not own schema objects.
           # Run versioned DDL through local peer auth as the PostgreSQL owner.
-          sudo -u postgres env DATABASE_URL="dbname=$DB_NAME" bash deploy/apply-migrations.sh
+          DATABASE_URL="dbname=$DB_NAME" MIGRATIONS_AS_POSTGRES=true bash deploy/apply-migrations.sh
           REMOTE
 
       - name: Deploy to standby box

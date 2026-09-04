@@ -40,8 +40,16 @@ fi
 
 export PGCONNSTRING="$DATABASE_URL"
 
+psql_cmd() {
+    if [[ "${MIGRATIONS_AS_POSTGRES:-false}" == "true" ]]; then
+        sudo -u postgres psql "$PGCONNSTRING" "$@"
+    else
+        psql "$PGCONNSTRING" "$@"
+    fi
+}
+
 run_sql() {
-    psql "$PGCONNSTRING" -v ON_ERROR_STOP=1 -qtAX -c "$1" 2>/dev/null
+    psql_cmd -v ON_ERROR_STOP=1 -qtAX -c "$1" 2>/dev/null
 }
 
 echo "=== CipherScan Migration Runner ==="
@@ -52,7 +60,7 @@ if ! run_sql "SELECT 1 FROM schema_migrations LIMIT 1" >/dev/null 2>&1; then
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "[DRY RUN] Would create schema_migrations table"
     else
-        psql "$PGCONNSTRING" -v ON_ERROR_STOP=1 -X \
+        psql_cmd -v ON_ERROR_STOP=1 -X \
             -f "$MIGRATIONS_DIR/014_schema_migrations_tracking.sql"
     fi
 fi
@@ -154,7 +162,7 @@ for filepath in "${pending[@]}"; do
 
     echo -n "  Applying $filename ... "
 
-    if psql "$PGCONNSTRING" -v ON_ERROR_STOP=1 -X -f "$filepath"; then
+    if psql_cmd -v ON_ERROR_STOP=1 -X -f "$filepath"; then
         run_sql "INSERT INTO schema_migrations (version, description) VALUES ('$version', '$description') ON CONFLICT (version) DO NOTHING;"
         echo "OK"
     else
