@@ -154,7 +154,7 @@ for filepath in "${pending[@]}"; do
 
     echo -n "  Applying $filename ... "
 
-    if psql "$PGCONNSTRING" -v ON_ERROR_STOP=1 -X -f "$filepath" > /dev/null 2>&1; then
+    if psql "$PGCONNSTRING" -v ON_ERROR_STOP=1 -X -f "$filepath"; then
         run_sql "INSERT INTO schema_migrations (version, description) VALUES ('$version', '$description') ON CONFLICT (version) DO NOTHING;"
         echo "OK"
     else

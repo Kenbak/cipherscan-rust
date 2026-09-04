@@ -123,7 +123,17 @@ jobs:
           ssh "$PG_HOST" << 'REMOTE'
           set -euo pipefail
           cd /root/cipherscan-rust
-          bash deploy/apply-migrations.sh
+          set -a
+          source .env
+          set +a
+          DB_NAME=$(psql "$DATABASE_URL" -qtAX -v ON_ERROR_STOP=1 -c 'SELECT current_database();')
+          if [[ ! "$DB_NAME" =~ ^[A-Za-z0-9_]+$ ]]; then
+            echo "ERROR: Refusing unexpected database name" >&2
+            exit 1
+          fi
+          # Application credentials intentionally do not own schema objects.
+          # Run versioned DDL through local peer auth as the PostgreSQL owner.
+          sudo -u postgres env DATABASE_URL="dbname=$DB_NAME" bash deploy/apply-migrations.sh
           REMOTE
 
       - name: Deploy to standby box
