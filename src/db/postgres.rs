@@ -8,6 +8,11 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 use std::collections::HashMap;
 use std::time::Instant;
 
+// ZIP-214's transparent Testnet FPF/ZCG recipient. It is a consensus funding
+// stream, not a miner identity. The actual miner payout can be shielded, in
+// which case the recipient is intentionally unknown to this indexer.
+const TESTNET_FPF_ZCG_ADDRESS: &str = "t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu";
+
 #[derive(Debug, Clone, Default)]
 pub struct BlockWriteMetrics {
     pub metadata_us: u64,
@@ -287,10 +292,17 @@ impl PostgresWriter {
             .checked_add(HEADER_SIZE)
             .ok_or_else(|| sqlx::Error::Protocol("block size overflow".to_string()))?;
 
-        // Miner address = first output of coinbase transaction
+        // Miner address = first transparent coinbase output, except the known
+        // testnet ZIP-214 funding-stream recipient. A shielded miner payout
+        // cannot be attributed without separate recipient extraction, so keep
+        // miner_address NULL rather than misattributing the funding stream.
         let miner_address: Option<String> = transactions.first().and_then(|coinbase| {
             if coinbase.vin.first().map(|v| v.is_coinbase).unwrap_or(false) {
-                coinbase.vout.first().and_then(|out| out.address.clone())
+                coinbase
+                    .vout
+                    .first()
+                    .and_then(|out| out.address.clone())
+                    .filter(|address| address != TESTNET_FPF_ZCG_ADDRESS)
             } else {
                 None
             }
