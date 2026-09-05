@@ -12,6 +12,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   PRIMARY_HOST: ${{ secrets.PRIMARY_HOST }}
@@ -25,30 +26,59 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main'
     steps:
+      - name: Download the exact binary tested by CI
+        uses: actions/download-artifact@v5
+        with:
+          name: cipherscan-indexer-linux-x86_64-${{ github.event.workflow_run.head_sha }}
+          path: artifact
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Validate deployment artifact
+        run: |
+          test -f artifact/cipherscan-indexer
+          chmod 0755 artifact/cipherscan-indexer
+          file artifact/cipherscan-indexer | tee /tmp/cipherscan-artifact-type
+          grep -Eq 'ELF 64-bit.*x86-64' /tmp/cipherscan-artifact-type
+
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/known_hosts
+          test -s ~/.ssh/known_hosts || { echo "::error::DEPLOY_KNOWN_HOSTS is empty"; exit 1; }
+          ssh-keygen -F "${{ secrets.PRIMARY_HOST }}" -f ~/.ssh/known_hosts >/dev/null || {
+            echo "::error::PRIMARY_HOST is missing from DEPLOY_KNOWN_HOSTS"; exit 1;
+          }
+          ssh-keygen -F "${{ secrets.STANDBY_HOST }}" -f ~/.ssh/known_hosts >/dev/null || {
+            echo "::error::STANDBY_HOST is missing from DEPLOY_KNOWN_HOSTS"; exit 1;
+          }
           cat > ~/.ssh/config << 'SSHEOF'
           Host primary
             HostName ${{ secrets.PRIMARY_HOST }}
             User root
             IdentityFile ~/.ssh/deploy_key
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
             LogLevel ERROR
           Host standby
             HostName ${{ secrets.STANDBY_HOST }}
             User root
             IdentityFile ~/.ssh/deploy_key
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
             LogLevel ERROR
           SSHEOF
           sed -i 's/^          //' ~/.ssh/config
           echo "SSH config written:"
           cat ~/.ssh/config
+
+      - name: Stage tested binary on both servers
+        run: |
+          scp artifact/cipherscan-indexer primary:/tmp/cipherscan-indexer-candidate
+          scp artifact/cipherscan-indexer standby:/tmp/cipherscan-indexer-candidate
 
       - name: Detect roles (which box is PG primary)
         id: roles
@@ -73,7 +103,7 @@ jobs:
             fi
           fi
 
-      - name: Deploy to primary box
+      - name: Prepare candidate on primary box
         run: |
           ssh primary << 'REMOTE'
           set -euo pipefail
@@ -81,19 +111,74 @@ jobs:
           git fetch origin "${{ github.event.workflow_run.head_sha }}"
           git reset --hard "${{ github.event.workflow_run.head_sha }}"
 
+          install -d -m 0755 target/release
+          if [ -x target/release/cipherscan-indexer ]; then
+            cp -a target/release/cipherscan-indexer target/release/cipherscan-indexer.previous
+          fi
+          install -m 0755 /tmp/cipherscan-indexer-candidate target/release/cipherscan-indexer
+          rm -f /tmp/cipherscan-indexer-candidate
+
+          if [ -f /etc/systemd/system/cipherscan-rust.service ]; then
+            cp -a /etc/systemd/system/cipherscan-rust.service /etc/systemd/system/cipherscan-rust.service.previous
+          fi
+          echo "Primary candidate prepared; current service is still running"
+          REMOTE
+
+      - name: Prepare candidate on standby box
+        run: |
+          ssh standby << 'REMOTE'
+          set -euo pipefail
+          cd /root/cipherscan-rust
+          git fetch origin "${{ github.event.workflow_run.head_sha }}"
+          git reset --hard "${{ github.event.workflow_run.head_sha }}"
+
+          install -d -m 0755 target/release
           if [ -x target/release/cipherscan-indexer ]; then
             cp -a target/release/cipherscan-indexer target/release/cipherscan-indexer.previous
           fi
 
-          echo "Building indexer..."
-          source ~/.cargo/env 2>/dev/null || true
-          cargo build --release 2>&1 | tail -5
+          install -m 0755 /tmp/cipherscan-indexer-candidate target/release/cipherscan-indexer
+          rm -f /tmp/cipherscan-indexer-candidate
+
+          install -m 0644 deploy/cipherscan-rust.service /etc/systemd/system/cipherscan-rust.service
+          systemctl daemon-reload
+
+          echo "Standby candidate prepared"
+          REMOTE
+
+      - name: Apply additive migrations on PG primary
+        run: |
+          PG_HOST="${{ steps.roles.outputs.pg_primary }}"
+          ssh "$PG_HOST" << 'REMOTE'
+          set -euo pipefail
+          cd /root/cipherscan-rust
+          set -a
+          source .env
+          set +a
+          DB_NAME=$(psql "$DATABASE_URL" -qtAX -v ON_ERROR_STOP=1 -c 'SELECT current_database();')
+          if [[ ! "$DB_NAME" =~ ^[A-Za-z0-9_]+$ ]]; then
+            echo "ERROR: Refusing unexpected database name" >&2
+            exit 1
+          fi
+          # Application credentials intentionally do not own schema objects.
+          # Apply backward-compatible schema expansion before activating code
+          # that may depend on it. Destructive contract migrations belong in a
+          # later release, after every old binary has stopped using the object.
+          DATABASE_URL="dbname=$DB_NAME" MIGRATIONS_AS_POSTGRES=true bash deploy/apply-migrations.sh
+          REMOTE
+
+      - name: Activate candidate on primary box
+        id: activate
+        run: |
+          ssh primary << 'REMOTE'
+          set -euo pipefail
+          cd /root/cipherscan-rust
 
           echo "Installing versioned systemd unit..."
           install -m 0644 deploy/cipherscan-rust.service /etc/systemd/system/cipherscan-rust.service
           systemctl daemon-reload
 
-          echo "Restarting indexer..."
+          echo "Restarting indexer after successful schema expansion..."
           candidate_ok=false
           if systemctl restart cipherscan-rust.service; then
             sleep 5
@@ -109,51 +194,30 @@ jobs:
             echo "Candidate failed health startup; restoring previous binary"
             if [ -x target/release/cipherscan-indexer.previous ]; then
               cp -a target/release/cipherscan-indexer.previous target/release/cipherscan-indexer
-              systemctl restart cipherscan-rust.service
             fi
+            if [ -f /etc/systemd/system/cipherscan-rust.service.previous ]; then
+              cp -a /etc/systemd/system/cipherscan-rust.service.previous /etc/systemd/system/cipherscan-rust.service
+              systemctl daemon-reload
+            fi
+            systemctl restart cipherscan-rust.service || true
             systemctl status cipherscan-rust.service --no-pager || true
             exit 1
           fi
+
           echo "Primary deploy complete"
           REMOTE
 
-      - name: Apply migrations (on PG primary)
+      - name: Restore staged binaries if deployment failed before activation
+        if: failure() && steps.activate.outcome != 'success'
         run: |
-          PG_HOST="${{ steps.roles.outputs.pg_primary }}"
-          ssh "$PG_HOST" << 'REMOTE'
-          set -euo pipefail
-          cd /root/cipherscan-rust
-          set -a
-          source .env
-          set +a
-          DB_NAME=$(psql "$DATABASE_URL" -qtAX -v ON_ERROR_STOP=1 -c 'SELECT current_database();')
-          if [[ ! "$DB_NAME" =~ ^[A-Za-z0-9_]+$ ]]; then
-            echo "ERROR: Refusing unexpected database name" >&2
-            exit 1
-          fi
-          # Application credentials intentionally do not own schema objects.
-          # Run versioned DDL through local peer auth as the PostgreSQL owner.
-          DATABASE_URL="dbname=$DB_NAME" MIGRATIONS_AS_POSTGRES=true bash deploy/apply-migrations.sh
-          REMOTE
-
-      - name: Deploy to standby box
-        run: |
-          ssh standby << 'REMOTE'
-          set -euo pipefail
-          cd /root/cipherscan-rust
-          git fetch origin "${{ github.event.workflow_run.head_sha }}"
-          git reset --hard "${{ github.event.workflow_run.head_sha }}"
-
-          if command -v cargo &>/dev/null || [ -f ~/.cargo/env ]; then
-            echo "Building indexer binary (standby keeps a current binary for failover)..."
-            source ~/.cargo/env 2>/dev/null || true
-            cargo build --release 2>&1 | tail -5
-          else
-            echo "Rust not installed on standby — skipping build (install before failover)"
-          fi
-
-          echo "Standby deploy complete"
-          REMOTE
+          for host in primary standby; do
+            ssh "$host" '
+              if [ -x /root/cipherscan-rust/target/release/cipherscan-indexer.previous ]; then
+                cp -a /root/cipherscan-rust/target/release/cipherscan-indexer.previous /root/cipherscan-rust/target/release/cipherscan-indexer
+              fi
+              rm -f /tmp/cipherscan-indexer-candidate
+            ' || true
+          done
 
       - name: Verify
         run: |

@@ -72,6 +72,30 @@ while IFS= read -r f; do
     sql_files+=("$f")
 done < <(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | sort)
 
+# Versions 001-013 predate this runner and intentionally include a handful of
+# historical same-number files that migration 014 backfilled as one audited
+# baseline. Every runner-managed version must map to exactly one SQL file.
+managed_version_numbers=()
+managed_version_files=()
+for filepath in "${sql_files[@]}"; do
+    filename=$(basename "$filepath")
+    version=$(echo "$filename" | sed -n 's/^\([0-9]*\).*/\1/p')
+    [[ -n "$version" ]] || continue
+    version_number=$((10#$version))
+    if (( version_number >= 14 )); then
+        for i in "${!managed_version_numbers[@]}"; do
+            if [[ "${managed_version_numbers[$i]}" == "$version_number" ]]; then
+                echo "ERROR: duplicate managed migration version $version_number:" >&2
+                echo "  ${managed_version_files[$i]}" >&2
+                echo "  $filename" >&2
+                exit 1
+            fi
+        done
+        managed_version_numbers+=("$version_number")
+        managed_version_files+=("$filename")
+    fi
+done
+
 pending=()
 for filepath in "${sql_files[@]}"; do
     filename=$(basename "$filepath")
@@ -80,7 +104,7 @@ for filepath in "${sql_files[@]}"; do
         echo "SKIP: $filename (no version prefix)"
         continue
     fi
-    version_clean=$(echo "$version" | sed 's/^0*//')
+    version_clean="$((10#$version))"
     if echo "$applied" | grep -qx "$version_clean" 2>/dev/null; then
         continue
     fi
@@ -107,28 +131,32 @@ lint_migration() {
     local filepath="$1"
     local filename
     filename=$(basename "$filepath")
+    local version
+    version=$(echo "$filename" | sed -n 's/^\([0-9]*\).*/\1/p')
     local errors=0
 
-    while IFS= read -r line; do
-        if echo "$line" | grep -iq 'CREATE.*INDEX' && \
-           ! echo "$line" | grep -iq 'CONCURRENTLY' && \
-           ! echo "$line" | grep -iq 'IF NOT EXISTS'; then
+    # 001-015 are immutable historical migrations. They predate the enforced
+    # online-DDL contract and must remain replayable for clean environments.
+    if [[ -n "$version" ]] && (( 10#$version <= 15 )); then
+        return 0
+    fi
+
+    while IFS= read -r statement; do
+        if ! echo "$statement" | grep -iq 'CONCURRENTLY'; then
             echo "ERROR: $filename: blocking CREATE INDEX (missing CONCURRENTLY):" >&2
-            echo "  $line" >&2
+            echo "  $statement" >&2
             errors=1
         fi
-    done < "$filepath"
+    done < <(perl -0777 -ne 'while (/CREATE\s+(?:UNIQUE\s+)?INDEX\b.*?;/sig) { $s=$&; $s =~ s/\s+/ /g; print "$s\n" }' "$filepath")
 
-    if grep -iq 'BEGIN\|START TRANSACTION' "$filepath" && \
+    if grep -Eiq '^[[:space:]]*(BEGIN|START TRANSACTION)[[:space:]]*;' "$filepath" && \
        grep -iq 'CONCURRENTLY' "$filepath"; then
         echo "ERROR: $filename: CONCURRENTLY cannot run inside a transaction block" >&2
         errors=1
     fi
 
-    if grep -iq 'ADD COLUMN.*DEFAULT' "$filepath"; then
-        if ! grep -iq 'ADD COLUMN.*DEFAULT NULL' "$filepath"; then
-            echo "WARNING: $filename: ADD COLUMN with DEFAULT detected — verify it's not volatile"
-        fi
+    if perl -0777 -ne 'exit(/ADD\s+COLUMN\b[^;]*DEFAULT\s+(?:now\s*\(|current_(?:date|time|timestamp)\b|random\s*\(|gen_random_uuid\s*\(|uuid_generate_v\d\s*\()/is ? 0 : 1)' "$filepath"; then
+        echo "WARNING: $filename: ADD COLUMN with a volatile or time-dependent DEFAULT detected"
     fi
 
     return $errors
@@ -157,7 +185,9 @@ echo ""
 
 for filepath in "${pending[@]}"; do
     filename=$(basename "$filepath")
-    version=$(echo "$filename" | sed -n 's/^\([0-9]*\).*/\1/p' | sed 's/^0*//')
+    # Persist the zero-padded filename prefix as the canonical identifier.
+    # Lookup above remains compatible with older rows recorded as 15/17/etc.
+    version=$(echo "$filename" | sed -n 's/^\([0-9]*\).*/\1/p')
     description=$(echo "$filename" | sed 's/^[0-9]*_//' | sed 's/\.sql$//' | tr '_' ' ' | sed "s/'/''/g")
 
     echo -n "  Applying $filename ... "

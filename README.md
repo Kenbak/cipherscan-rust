@@ -15,7 +15,7 @@ High-performance Zcash blockchain indexer written in Rust. Reads directly from Z
 
 ## Requirements
 
-- Rust 1.75+ (for async traits)
+- Rust 1.97.1 (pinned by `rust-toolchain.toml`)
 - Running Zebra node with synced state
 - PostgreSQL 14+
 - ~50GB disk space for the indexed database
@@ -329,8 +329,12 @@ sudo journalctl -u cipherscan-rust-health.service -n 50 --no-pager
 ## Development
 
 ```bash
-# Run tests
-cargo test
+# Fast compiler/lint parity with CI
+make verify-fast
+
+# Full CI-equivalent check, including an isolated disposable PostgreSQL cluster
+# (requires local PostgreSQL server tools: initdb, pg_ctl, psql, createdb)
+make verify-full
 
 # Check for errors without building
 cargo check

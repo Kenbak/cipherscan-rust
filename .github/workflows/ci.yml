@@ -17,9 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install protoc (required to build the gRPC .proto files)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -43,24 +41,41 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/cipherscan_ci
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc and postgresql-client
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
 
       - name: Apply schema to the disposable CI database
         run: |
           PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci \
-            -c "CREATE ROLE zcash_user LOGIN SUPERUSER;"
+            -c "CREATE ROLE zcash_user LOGIN PASSWORD 'zcash_test' NOSUPERUSER NOCREATEDB NOCREATEROLE;"
           PGPASSWORD=postgres psql -h localhost -U postgres -d cipherscan_ci \
             -v ON_ERROR_STOP=1 -f schema/postgres.sql
+
+      - name: Apply and verify versioned migrations
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/cipherscan_ci
+        run: |
+          bash deploy/apply-migrations.sh
+          output="$(bash deploy/apply-migrations.sh)"
+          printf '%s\n' "$output"
+          grep -q 'All migrations already applied' <<< "$output"
 
       - name: cargo build --release
         run: cargo build --release
 
       - name: cargo test --release
+        env:
+          DATABASE_URL: postgres://zcash_user:zcash_test@localhost:5432/cipherscan_ci
         run: cargo test --release -- --test-threads=4
+
+      - name: Publish the tested indexer binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cipherscan-indexer-linux-x86_64-${{ github.sha }}
+          path: target/release/cipherscan-indexer
+          if-no-files-found: error
+          retention-days: 7
