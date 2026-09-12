@@ -2866,3 +2866,24 @@ CREATE INDEX IF NOT EXISTS block_software_category_height_idx ON public.block_so
 CREATE INDEX IF NOT EXISTS block_software_category_time_idx ON public.block_software(software, timestamp);
 CREATE INDEX IF NOT EXISTS block_software_time_idx ON public.block_software(timestamp, height);
 CREATE INDEX IF NOT EXISTS blocks_miner_height_idx ON public.blocks(miner_address, height);
+
+-- Migration 024: protect miner attribution from funding-stream payouts.
+CREATE OR REPLACE FUNCTION public.exclude_funding_stream_miner()
+RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+BEGIN
+  IF NEW.miner_address IN ('t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow', 't2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu') THEN
+    NEW.miner_address := NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS exclude_funding_stream_miner ON public.blocks;
+CREATE TRIGGER exclude_funding_stream_miner
+BEFORE INSERT OR UPDATE OF miner_address ON public.blocks
+FOR EACH ROW EXECUTE FUNCTION public.exclude_funding_stream_miner();
+DROP TRIGGER IF EXISTS exclude_funding_stream_miner ON public.orphaned_blocks;
+CREATE TRIGGER exclude_funding_stream_miner
+BEFORE INSERT OR UPDATE OF miner_address ON public.orphaned_blocks
+FOR EACH ROW EXECUTE FUNCTION public.exclude_funding_stream_miner();
+

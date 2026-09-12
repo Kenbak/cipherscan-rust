@@ -8,10 +8,18 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 use std::collections::HashMap;
 use std::time::Instant;
 
-// ZIP-214's transparent Testnet FPF/ZCG recipient. It is a consensus funding
-// stream, not a miner identity. The actual miner payout can be shielded, in
-// which case the recipient is intentionally unknown to this indexer.
-const TESTNET_FPF_ZCG_ADDRESS: &str = "t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu";
+// ZIP-214 FPF/ZCG recipients are funding streams, not miner identities.
+// Exclude both networks; shielded miner recipients remain unknown.
+fn miner_address_candidate(address: Option<&str>) -> Option<String> {
+    address
+        .filter(|address| {
+            !matches!(
+                *address,
+                "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow" | "t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu"
+            )
+        })
+        .map(str::to_owned)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct BlockWriteMetrics {
@@ -293,7 +301,7 @@ impl PostgresWriter {
             .ok_or_else(|| sqlx::Error::Protocol("block size overflow".to_string()))?;
 
         // Miner address = first transparent coinbase output, except the known
-        // testnet ZIP-214 funding-stream recipient. A shielded miner payout
+        // ZIP-214 FPF/ZCG funding-stream recipients. A shielded miner payout
         // cannot be attributed without separate recipient extraction, so keep
         // miner_address NULL rather than misattributing the funding stream.
         let miner_address: Option<String> = transactions.first().and_then(|coinbase| {
@@ -301,8 +309,7 @@ impl PostgresWriter {
                 coinbase
                     .vout
                     .first()
-                    .and_then(|out| out.address.clone())
-                    .filter(|address| address != TESTNET_FPF_ZCG_ADDRESS)
+                    .and_then(|out| miner_address_candidate(out.address.as_deref()))
             } else {
                 None
             }
@@ -1682,6 +1689,20 @@ impl PostgresWriter {
 
 #[cfg(test)]
 mod integrity_write_tests {
+    #[test]
+    fn funding_recipients_are_never_miner_candidates() {
+        use super::miner_address_candidate;
+        for address in [
+            "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow",
+            "t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu",
+        ] {
+            assert_eq!(miner_address_candidate(Some(address)), None);
+        }
+        assert_eq!(miner_address_candidate(None), None);
+        let miner = "t1MKn34KBa8Xh4g8qU8psibBXvURafphVn7";
+        assert_eq!(miner_address_candidate(Some(miner)), Some(miner.to_owned()));
+    }
+
     #[test]
     fn spent_metadata_uses_spending_block_time() {
         let source = include_str!("postgres.rs");
