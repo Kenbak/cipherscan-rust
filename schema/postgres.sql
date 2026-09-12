@@ -2791,7 +2791,8 @@ CREATE OR REPLACE FUNCTION public.classify_mining_software_v1(h text) RETURNS te
 LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
 DECLARE b bytea; t text; z boolean; k boolean; d boolean;
 BEGIN
-  IF h IS NULL OR h = '' OR length(h) % 2 <> 0 OR h !~ '^[0-9a-fA-F]+$' THEN RETURN 'missing'; END IF;
+  IF h = '' THEN RETURN 'unknown'; END IF;
+  IF h IS NULL OR length(h) % 2 <> 0 OR h !~ '^[0-9a-fA-F]+$' THEN RETURN 'missing'; END IF;
   b := decode(h, 'hex'); t := lower(encode(b, 'escape'));
   z := position(decode('f09fa693','hex') in b) > 0 OR t ~ '/zebra[: ]?v?[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-z0-9.]+)?/';
   k := position(decode('f09f8cb8','hex') in b) > 0 OR t ~ '/zakura[: ]?v?[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-z0-9.]+)?/';
