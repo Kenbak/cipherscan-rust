@@ -1,4 +1,6 @@
-use cipherscan_indexer::db::grpc::{connect_block_stream, proto};
+use cipherscan_indexer::db::grpc::{
+    connect_block_stream_after_forks as connect_block_stream, proto,
+};
 use proto::indexer_server::{Indexer, IndexerServer};
 use std::{
     pin::Pin,
@@ -83,12 +85,15 @@ async fn server(hash_len: Option<usize>) -> (String, Node, tokio::task::JoinHand
 async fn reconnect_seeds_each_subscription_with_a_fresh_display_order_tip() {
     let (url, node, handle) = server(Some(32)).await;
     for _ in 0..2 {
-        let mut stream = connect_block_stream(&url).await.unwrap();
+        let mut stream = connect_block_stream(&url, vec![vec![7; 32]]).await.unwrap();
         assert_eq!(stream.message().await.unwrap().unwrap().data, vec![42]);
     }
     assert_eq!(
         *node.requests.lock().unwrap(),
-        vec![vec![vec![1; 32]], vec![vec![2; 32]]]
+        vec![
+            vec![vec![7; 32], vec![1; 32]],
+            vec![vec![7; 32], vec![2; 32]]
+        ]
     );
     handle.abort();
 }
@@ -96,7 +101,10 @@ async fn reconnect_seeds_each_subscription_with_a_fresh_display_order_tip() {
 #[tokio::test]
 async fn malformed_tip_does_not_start_an_unbounded_subscription() {
     let (url, node, handle) = server(Some(31)).await;
-    let error = connect_block_stream(&url).await.err().unwrap();
+    let error = connect_block_stream(&url, vec![vec![7; 32]])
+        .await
+        .err()
+        .unwrap();
     assert!(error.contains("31 bytes"), "{error}");
     assert!(node.requests.lock().unwrap().is_empty());
     handle.abort();
@@ -105,7 +113,10 @@ async fn malformed_tip_does_not_start_an_unbounded_subscription() {
 #[tokio::test]
 async fn closed_tip_stream_does_not_start_an_unbounded_subscription() {
     let (url, node, handle) = server(None).await;
-    let error = connect_block_stream(&url).await.err().unwrap();
+    let error = connect_block_stream(&url, vec![vec![7; 32]])
+        .await
+        .err()
+        .unwrap();
     assert!(error.contains("snapshot ended"), "{error}");
     assert!(node.requests.lock().unwrap().is_empty());
     handle.abort();
