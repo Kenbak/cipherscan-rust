@@ -10,8 +10,8 @@ use rocksdb::{IteratorMode, Options, DB};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::time::Instant;
-use zebra_chain::block::Header as ZebraHeader;
-use zebra_chain::serialization::ZcashDeserialize;
+use zakura_chain::block::Header as ZebraHeader;
+use zakura_chain::serialization::ZcashDeserialize;
 
 /// Wrapper around Zebra's RocksDB state
 pub struct ZebraState {
@@ -125,11 +125,11 @@ impl ZebraState {
 
         match self.db.get_cf(cf, key) {
             Ok(Some(value)) => {
-                // Parse header using zebra-chain
+                // Parse header using zakura-chain
                 let mut cursor = Cursor::new(&value[..]);
                 let header = ZebraHeader::zcash_deserialize(&mut cursor)
                     .map_err(|e| format!("Failed to parse header: {:?}", e))?;
-                Ok(ParsedBlockHeader::from_zebra_header(&header))
+                Ok(ParsedBlockHeader::from_chain_header(&header))
             }
             Ok(None) => Err(format!("Block header not found at height {}", height)),
             Err(e) => Err(format!("Error reading block header: {}", e)),
@@ -310,7 +310,7 @@ pub struct ParsedBlockHeader {
 }
 
 impl ParsedBlockHeader {
-    pub fn from_zebra_header(header: &ZebraHeader) -> Self {
+    pub fn from_chain_header(header: &ZebraHeader) -> Self {
         let version = format!("{:?}", header.version)
             .trim_start_matches("Version(")
             .trim_end_matches(')')

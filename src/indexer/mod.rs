@@ -499,8 +499,8 @@ impl Indexer {
         String,
     > {
         use std::sync::Arc;
-        use zebra_chain::block::Block;
-        use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
+        use zakura_chain::block::Block;
+        use zakura_chain::serialization::{ZcashDeserialize, ZcashSerialize};
 
         let block = Block::zcash_deserialize(&mut std::io::Cursor::new(raw_block))
             .map_err(|e| format!("Failed to deserialize block {height}: {e:?}"))?;
@@ -520,13 +520,13 @@ impl Indexer {
             ));
         }
 
-        let header = crate::db::ParsedBlockHeader::from_zebra_header(&block.header);
+        let header = crate::db::ParsedBlockHeader::from_chain_header(&block.header);
         let mut transactions = Vec::with_capacity(block.transactions.len());
         for transaction in block.transactions {
             let size = transaction.zcash_serialized_size();
             let transaction =
                 Arc::try_unwrap(transaction).unwrap_or_else(|shared| (*shared).clone());
-            transactions.push(TransactionParser::from_zebra_tx(
+            transactions.push(TransactionParser::from_chain_tx(
                 transaction,
                 height,
                 expected_hash,
@@ -813,7 +813,7 @@ impl Indexer {
                 let raw_hex = rpc.get_raw_block_hex(&hash).await?;
                 let bytes = hex::decode(raw_hex)
                     .map_err(|e| format!("Invalid raw block hex at {height}: {e}"))?;
-                if bytes.len() as u64 > zebra_chain::block::MAX_BLOCK_BYTES {
+                if bytes.len() as u64 > zakura_chain::block::MAX_BLOCK_BYTES {
                     return Err(format!(
                         "Raw block {height} exceeds protocol limit: {} bytes",
                         bytes.len()

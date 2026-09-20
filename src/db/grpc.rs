@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Streaming;
-use zebra_chain::block::Header;
-use zebra_chain::serialization::ZcashDeserialize;
+use zakura_chain::block::Header;
+use zakura_chain::serialization::ZcashDeserialize;
 
 async fn connect_channel(url: &str) -> Result<Channel, String> {
     Endpoint::from_shared(url.to_string())

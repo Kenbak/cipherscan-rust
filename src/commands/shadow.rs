@@ -3,8 +3,8 @@
 use crate::config::Config;
 use crate::db::{connect_chain_tip_stream, supervise_block_stream, BlockPayloadCache};
 use std::time::{Duration, Instant};
-use zebra_chain::block::Block;
-use zebra_chain::serialization::ZcashDeserialize;
+use zakura_chain::block::Block;
+use zakura_chain::serialization::ZcashDeserialize;
 
 pub(crate) async fn verify_full_block_stream(
     config: &Config,

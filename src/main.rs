@@ -172,7 +172,7 @@ enum Commands {
     },
 
     /// Backfill anchor roots (orchard_anchor, ironwood_anchor) for existing
-    /// transactions. Fetches raw tx bytes via RPC, parses with zebra-chain,
+    /// transactions. Fetches raw tx bytes via RPC, parses with zakura-chain,
     /// and UPDATEs the transactions table.
     BackfillAnchors {
         /// Only process v6 transactions (Ironwood era). Faster but skips v5 Orchard anchors.

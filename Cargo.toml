@@ -18,10 +18,9 @@ rocksdb = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Zcash parsing (from Zebra)
-# NU6.3 / Ironwood: Zebra 6.0.0 stable — first release with finalized Ironwood
-# crates and v6 transaction format support on mainnet.
-zebra-chain = { git = "https://github.com/ZcashFoundation/zebra", tag = "v6.0.0" }
+# Zcash parsing, aligned with Zakura node v1.4.0 (zakura-chain 7.0.0).
+# This release does not certify NU7 compatibility; keep activation fixtures current.
+zakura-chain = { git = "https://github.com/zakura-core/zakura", tag = "v1.4.0" }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
