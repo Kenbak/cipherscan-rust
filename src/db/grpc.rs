@@ -51,8 +51,30 @@ pub async fn connect_chain_tip_stream(
 /// Connect to the encoded non-finalized block stream.
 pub async fn connect_block_stream(url: &str) -> Result<Streaming<proto::BlockAndHash>, String> {
     let mut client = IndexerClient::new(connect_channel(url).await?);
+    // Empty subscriptions replay the entire non-finalized window, which can
+    // fill Zakura's listener buffer before it starts draining. Begin after a
+    // fresh canonical tip on every reconnect. Live indexing catches any gap
+    // through RPC, so this bounded cache need not replay historical blocks.
+    let mut tips = client
+        .chain_tip_change(Empty {})
+        .await
+        .map_err(|e| format!("Block stream tip subscribe failed: {e}"))?
+        .into_inner();
+    let tip = tokio::time::timeout(Duration::from_secs(15), tips.message())
+        .await
+        .map_err(|_| "Block stream tip snapshot timed out".to_string())?
+        .map_err(|e| format!("Block stream tip snapshot failed: {e}"))?
+        .ok_or_else(|| "Block stream tip snapshot ended".to_string())?;
+    if tip.hash.len() != 32 {
+        return Err(format!(
+            "Block stream tip hash has {} bytes",
+            tip.hash.len()
+        ));
+    }
     client
-        .non_finalized_state_change(Empty {})
+        .non_finalized_state_change(proto::NonFinalizedStateChangeRequest {
+            chain_tip_hashes: vec![tip.hash],
+        })
         .await
         .map(|response| response.into_inner())
         .map_err(|e| format!("NonFinalizedStateChange subscribe failed: {e}"))
