@@ -37,3 +37,7 @@ deploy/pgbackrest.conf
 deploy/mnt-storagebox-pgbackrest.mount
 deploy/restore-drill.sh
 deploy/RESTORE-DRILL-RUNBOOK.md
+
+# Local operational metadata and Python check caches
+deployed-zakura-release.json
+__pycache__/

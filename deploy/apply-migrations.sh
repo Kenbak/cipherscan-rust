@@ -128,38 +128,7 @@ done
 echo ""
 
 lint_migration() {
-    local filepath="$1"
-    local filename
-    filename=$(basename "$filepath")
-    local version
-    version=$(echo "$filename" | sed -n 's/^\([0-9]*\).*/\1/p')
-    local errors=0
-
-    # 001-015 are immutable historical migrations. They predate the enforced
-    # online-DDL contract and must remain replayable for clean environments.
-    if [[ -n "$version" ]] && (( 10#$version <= 15 )); then
-        return 0
-    fi
-
-    while IFS= read -r statement; do
-        if ! echo "$statement" | grep -iq 'CONCURRENTLY'; then
-            echo "ERROR: $filename: blocking CREATE INDEX (missing CONCURRENTLY):" >&2
-            echo "  $statement" >&2
-            errors=1
-        fi
-    done < <(perl -0777 -ne 'while (/CREATE\s+(?:UNIQUE\s+)?INDEX\b.*?;/sig) { $s=$&; $s =~ s/\s+/ /g; print "$s\n" }' "$filepath")
-
-    if grep -Eiq '^[[:space:]]*(BEGIN|START TRANSACTION)[[:space:]]*;' "$filepath" && \
-       grep -iq 'CONCURRENTLY' "$filepath"; then
-        echo "ERROR: $filename: CONCURRENTLY cannot run inside a transaction block" >&2
-        errors=1
-    fi
-
-    if perl -0777 -ne 'exit(/ADD\s+COLUMN\b[^;]*DEFAULT\s+(?:now\s*\(|current_(?:date|time|timestamp)\b|random\s*\(|gen_random_uuid\s*\(|uuid_generate_v\d\s*\()/is ? 0 : 1)' "$filepath"; then
-        echo "WARNING: $filename: ADD COLUMN with a volatile or time-dependent DEFAULT detected"
-    fi
-
-    return $errors
+    python3 "$SCRIPT_DIR/lint-migration.py" "$1"
 }
 
 all_ok=true

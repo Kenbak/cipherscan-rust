@@ -15,8 +15,6 @@ CREATE TABLE IF NOT EXISTS public.search_interest_snapshots (
   window_start date NOT NULL,
   window_end date NOT NULL CHECK (window_end >= window_start)
 );
-CREATE INDEX IF NOT EXISTS search_interest_latest_idx
-  ON public.search_interest_snapshots (window_end DESC, captured_at DESC);
 CREATE TABLE IF NOT EXISTS public.search_interest_points (
   snapshot_id text NOT NULL REFERENCES public.search_interest_snapshots(id) ON DELETE CASCADE,
   date date NOT NULL,
@@ -27,3 +25,6 @@ CREATE TABLE IF NOT EXISTS public.search_interest_points (
   CHECK ((below_one AND value IS NULL) OR (NOT below_one AND value IS NOT NULL))
 );
 COMMIT;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS search_interest_latest_idx
+  ON public.search_interest_snapshots (window_end DESC, captured_at DESC);
