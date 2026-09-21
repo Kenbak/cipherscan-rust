@@ -12,7 +12,8 @@ env:
 jobs:
   fmt-and-clippy:
     name: fmt + clippy
-    runs-on: ubuntu-latest
+    # Match the Ubuntu 24.04 mainnet hosts; newer build images may require newer glibc.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc (required to build the gRPC .proto files)
@@ -28,7 +29,8 @@ jobs:
 
   build-and-test:
     name: build + test (with Postgres)
-    runs-on: ubuntu-latest
+    # Match the Ubuntu 24.04 mainnet hosts; newer build images may require newer glibc.
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
