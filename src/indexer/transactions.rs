@@ -1,15 +1,15 @@
-//! Transaction parsing logic using zebra-chain
+//! Transaction parsing logic using zakura-chain
 //!
-//! Uses zebra-chain's native deserialization for proper parsing of all tx versions.
+//! Uses zakura-chain's native deserialization for proper parsing of all tx versions.
 
 use crate::config::Network;
 use crate::models::{PubkeyExposure, Transaction, TransparentInput, TransparentOutput};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
-use zebra_chain::serialization::ZcashDeserialize;
-use zebra_chain::transaction::Transaction as ZebraTransaction;
+use zakura_chain::serialization::ZcashDeserialize;
+use zakura_chain::transaction::Transaction as ChainTransaction;
 
-/// Transaction parser using zebra-chain
+/// Transaction parser using zakura-chain
 pub struct TransactionParser;
 
 impl TransactionParser {
@@ -21,31 +21,31 @@ impl TransactionParser {
         }
     }
 
-    /// Parse a raw transaction from bytes using zebra-chain
+    /// Parse a raw transaction from bytes using zakura-chain
     pub fn parse(
         raw: &[u8],
         block_height: u32,
         block_hash: &str,
         network: Network,
     ) -> Result<Transaction, String> {
-        // Use zebra-chain to deserialize
+        // Use zakura-chain to deserialize
         let mut cursor = Cursor::new(raw);
-        let zebra_tx = ZebraTransaction::zcash_deserialize(&mut cursor)
+        let zebra_tx = ChainTransaction::zcash_deserialize(&mut cursor)
             .map_err(|e| format!("Failed to deserialize transaction: {:?}", e))?;
 
         // Convert to our Transaction type
-        Self::from_zebra_tx(zebra_tx, block_height, block_hash, raw.len(), network)
+        Self::from_chain_tx(zebra_tx, block_height, block_hash, raw.len(), network)
     }
 
-    /// Convert zebra-chain Transaction to our Transaction model
-    pub(crate) fn from_zebra_tx(
-        tx: ZebraTransaction,
+    /// Convert zakura-chain Transaction to our Transaction model
+    pub(crate) fn from_chain_tx(
+        tx: ChainTransaction,
         block_height: u32,
         block_hash: &str,
         size: usize,
         network: Network,
     ) -> Result<Transaction, String> {
-        use zebra_chain::transaction::Transaction::*;
+        use zakura_chain::transaction::Transaction::*;
 
         // Get txid
         let txid = tx.hash().to_string();
@@ -71,7 +71,7 @@ impl TransactionParser {
         let mut is_coinbase = false;
 
         for input in inputs.iter() {
-            use zebra_chain::transparent::Input;
+            use zakura_chain::transparent::Input;
             match input {
                 Input::Coinbase { data, .. } => {
                     is_coinbase = true;
@@ -165,9 +165,8 @@ impl TransactionParser {
                     .unwrap_or(0);
                 (0, spends as u16, outputs as u16, actions as u16)
             }
-            // NU6.3 v6: Sapling is V5-shaped; the v6 Orchard bundle is ShieldedDataV6,
-            // which exposes the underlying Orchard ShieldedData via .data(). Ironwood
-            // is counted separately below.
+            // NU6.3 v6: Zakura exposes Orchard bundle fields directly.
+            // Ironwood is counted separately below.
             V6 {
                 sapling_shielded_data,
                 orchard_shielded_data,
@@ -179,21 +178,21 @@ impl TransactionParser {
                     .unwrap_or((0, 0));
                 let actions = orchard_shielded_data
                     .as_ref()
-                    .map(|d| d.data().actions.len())
+                    .map(|d| d.actions.len())
                     .unwrap_or(0);
                 (0, spends as u16, outputs as u16, actions as u16)
             }
         };
 
-        // NU6.3 Ironwood actions (v6 only). ironwood::ShieldedData wraps an Orchard
-        // v6 bundle; reach the Orchard actions through .data().
+        // NU6.3 Ironwood actions (v6 only). Zakura shares the Orchard
+        // bundle representation; the pools remain separate in our model.
         let ironwood_actions: u16 = match &tx {
             V6 {
                 ironwood_shielded_data,
                 ..
             } => ironwood_shielded_data
                 .as_ref()
-                .map(|d| d.data().actions.len())
+                .map(|d| d.actions.len())
                 .unwrap_or(0) as u16,
             _ => 0,
         };
@@ -237,7 +236,7 @@ impl TransactionParser {
                 ..
             } => orchard_shielded_data
                 .as_ref()
-                .map(|d| i64::from(d.data().value_balance))
+                .map(|d| i64::from(d.value_balance))
                 .unwrap_or(0),
             _ => 0,
         };
@@ -250,7 +249,7 @@ impl TransactionParser {
                 ..
             } => ironwood_shielded_data
                 .as_ref()
-                .map(|d| i64::from(d.data().value_balance))
+                .map(|d| i64::from(d.value_balance))
                 .unwrap_or(0),
             _ => 0,
         };
@@ -270,7 +269,7 @@ impl TransactionParser {
                 ..
             } => orchard_shielded_data
                 .as_ref()
-                .map(|d| hex::encode(<[u8; 32]>::from(d.data().shared_anchor))),
+                .map(|d| hex::encode(<[u8; 32]>::from(d.shared_anchor))),
             _ => None,
         };
 
@@ -280,7 +279,7 @@ impl TransactionParser {
                 ..
             } => ironwood_shielded_data
                 .as_ref()
-                .map(|d| hex::encode(<[u8; 32]>::from(d.data().shared_anchor))),
+                .map(|d| hex::encode(<[u8; 32]>::from(d.shared_anchor))),
             _ => None,
         };
         // Calculate fee (for non-coinbase)
@@ -322,7 +321,7 @@ impl TransactionParser {
 
     /// Parse output script to get address and type
     fn parse_output_script(
-        script: &zebra_chain::transparent::Script,
+        script: &zakura_chain::transparent::Script,
         network: Network,
     ) -> (Option<String>, String, Vec<PubkeyExposure>) {
         let bytes = script.as_raw_bytes();
@@ -561,9 +560,9 @@ impl TransactionParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zebra_chain::block::Height;
-    use zebra_chain::serialization::ZcashSerialize;
-    use zebra_chain::transaction::LockTime;
+    use zakura_chain::block::Height;
+    use zakura_chain::serialization::ZcashSerialize;
+    use zakura_chain::transaction::LockTime;
 
     #[test]
     fn test_address_encoding_mainnet() {
@@ -612,8 +611,8 @@ mod tests {
     }
 
     /// Helper to create a Script from raw bytes for testing parse_output_script
-    fn make_script(bytes: &[u8]) -> zebra_chain::transparent::Script {
-        zebra_chain::transparent::Script::new(bytes)
+    fn make_script(bytes: &[u8]) -> zakura_chain::transparent::Script {
+        zakura_chain::transparent::Script::new(bytes)
     }
 
     #[test]

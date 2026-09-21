@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Streaming;
-use zebra_chain::block::Header;
-use zebra_chain::serialization::ZcashDeserialize;
+use zakura_chain::block::Header;
+use zakura_chain::serialization::ZcashDeserialize;
 
 async fn connect_channel(url: &str) -> Result<Channel, String> {
     Endpoint::from_shared(url.to_string())
@@ -50,9 +50,49 @@ pub async fn connect_chain_tip_stream(
 
 /// Connect to the encoded non-finalized block stream.
 pub async fn connect_block_stream(url: &str) -> Result<Streaming<proto::BlockAndHash>, String> {
+    let fork_tips = super::ZebraRpc::from_env()?.get_fork_tip_hashes().await?;
+    connect_block_stream_after_forks(url, fork_tips).await
+}
+
+/// Subscribe after known valid forks plus a fresh canonical tip. RPC catch-up
+/// remains authoritative; the block stream is only a bounded live payload cache.
+pub async fn connect_block_stream_after_forks(
+    url: &str,
+    mut fork_tips: Vec<Vec<u8>>,
+) -> Result<Streaming<proto::BlockAndHash>, String> {
+    if fork_tips.len() >= zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS
+        || fork_tips.iter().any(|hash| hash.len() != 32)
+    {
+        return Err("Invalid block stream fork tips".to_string());
+    }
     let mut client = IndexerClient::new(connect_channel(url).await?);
+    // Empty subscriptions replay the entire non-finalized window, which can
+    // fill Zakura's listener buffer before it starts draining. Begin after a
+    // fresh canonical tip on every reconnect. Live indexing catches any gap
+    // through RPC, so this bounded cache need not replay historical blocks.
+    let mut tips = client
+        .chain_tip_change(Empty {})
+        .await
+        .map_err(|e| format!("Block stream tip subscribe failed: {e}"))?
+        .into_inner();
+    let tip = tokio::time::timeout(Duration::from_secs(15), tips.message())
+        .await
+        .map_err(|_| "Block stream tip snapshot timed out".to_string())?
+        .map_err(|e| format!("Block stream tip snapshot failed: {e}"))?
+        .ok_or_else(|| "Block stream tip snapshot ended".to_string())?;
+    if tip.hash.len() != 32 {
+        return Err(format!(
+            "Block stream tip hash has {} bytes",
+            tip.hash.len()
+        ));
+    }
+    if !fork_tips.contains(&tip.hash) {
+        fork_tips.push(tip.hash);
+    }
     client
-        .non_finalized_state_change(Empty {})
+        .non_finalized_state_change(proto::NonFinalizedStateChangeRequest {
+            chain_tip_hashes: fork_tips,
+        })
         .await
         .map(|response| response.into_inner())
         .map_err(|e| format!("NonFinalizedStateChange subscribe failed: {e}"))

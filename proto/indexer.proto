@@ -22,6 +22,12 @@ message BlockAndHash {
   bytes data = 2;
 };
 
+// Zakura v1.4.0: resume after tips already covered by the RPC catch-up path.
+// Hashes use display order, matching ChainTipChange.
+message NonFinalizedStateChangeRequest {
+  repeated bytes chain_tip_hashes = 1;
+};
+
 // Represents a change in the mempool.
 message MempoolChangeMessage {
   // The type of change that occurred.
@@ -50,7 +56,7 @@ service Indexer {
   rpc ChainTipChange(Empty) returns (stream BlockHashAndHeight);
 
   // Notifies listeners of new blocks in the non-finalized state.
-  rpc NonFinalizedStateChange(Empty) returns (stream BlockAndHash);
+  rpc NonFinalizedStateChange(NonFinalizedStateChangeRequest) returns (stream BlockAndHash);
 
   // Notifies listeners of mempool changes
   rpc MempoolChange(Empty) returns (stream MempoolChangeMessage);

@@ -174,8 +174,71 @@ impl ZebraRpc {
         .await
     }
 
+    /// Valid fork tips let the optional block stream skip historical branches.
+    pub async fn get_fork_tip_hashes(&self) -> Result<Vec<Vec<u8>>, String> {
+        let tips: Vec<ChainTip> = self.call("getchaintips", vec![]).await?;
+        fork_tip_hashes(tips)
+    }
+
     /// Get blockchain info (includes valuePools with authoritative pool balances)
     pub async fn get_blockchain_info(&self) -> Result<serde_json::Value, String> {
         self.call("getblockchaininfo", vec![]).await
+    }
+}
+
+#[derive(Deserialize)]
+struct ChainTip {
+    hash: String,
+    status: String,
+}
+
+fn fork_tip_hashes(tips: Vec<ChainTip>) -> Result<Vec<Vec<u8>>, String> {
+    let mut hashes = Vec::new();
+    for tip in tips.into_iter().filter(|tip| tip.status == "valid-fork") {
+        let hash = hex::decode(tip.hash).map_err(|e| format!("Invalid fork tip hash: {e}"))?;
+        if hash.len() != 32 {
+            return Err("Invalid fork tip hash length".to_string());
+        }
+        if !hashes.contains(&hash) {
+            hashes.push(hash);
+        }
+    }
+    // Reserve one slot for the fresh canonical tip obtained through gRPC.
+    if hashes.len() >= zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS {
+        return Err("Too many fork tips for the block stream".to_string());
+    }
+    Ok(hashes)
+}
+
+#[cfg(test)]
+mod fork_tip_tests {
+    use super::*;
+
+    #[test]
+    fn seeds_valid_forks_without_stale_active_or_invalid_tips() {
+        let tips = serde_json::from_value(serde_json::json!([
+            {"status":"active", "hash":"01".repeat(32)},
+            {"status":"valid-fork", "hash":"02".repeat(32)},
+            {"status":"valid-fork", "hash":"02".repeat(32)},
+            {"status":"invalid", "hash":"03".repeat(32)}
+        ]))
+        .unwrap();
+        assert_eq!(fork_tip_hashes(tips).unwrap(), vec![vec![2; 32]]);
+    }
+
+    #[test]
+    fn refuses_malformed_or_excessive_fork_tips() {
+        assert!(fork_tip_hashes(vec![ChainTip {
+            hash: "00".repeat(31),
+            status: "valid-fork".into()
+        }])
+        .is_err());
+        let tips = (0..zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS)
+            .map(|i| ChainTip {
+                hash: hex::encode([i as u8; 32]),
+                status: "valid-fork".into(),
+            })
+            .collect();
+        assert!(fork_tip_hashes(tips).is_err());
     }
 }

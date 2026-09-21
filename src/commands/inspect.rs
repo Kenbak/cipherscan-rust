@@ -94,7 +94,7 @@ pub(crate) fn show_transaction(config: &Config, height: u32, index: u16) -> Resu
     println!("   Raw size: {} bytes", raw.len());
     println!();
 
-    // Parse using zebra-chain
+    // Parse using zakura-chain
     match TransactionParser::parse(&raw, height, &block_hash, config.network) {
         Ok(tx) => {
             println!("   ✅ Parsed successfully!");
