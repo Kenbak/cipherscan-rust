@@ -504,3 +504,74 @@ async fn has_shielded_data_reflects_actual_shielded_activity() {
 
     cleanup(&pool, from, to, &[miner]).await;
 }
+
+/// Collector timestamps remain immutable across polls, replay and archival.
+#[tokio::test]
+async fn first_observation_and_raw_orphan_evidence_survive_rollback() {
+    let pool = test_pool().await;
+    let w = writer().await;
+    let height = 90_001_000u32;
+    let hash = "ed".repeat(32);
+    let miner = "tTESTobservationminer0000000000000";
+    cleanup(&pool, height, height, &[miner]).await;
+    sqlx::query("DELETE FROM block_observations WHERE hash=$1")
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let first_ms = 1_790_152_000_123i64;
+    crate::db::observations::record_observation(&pool, &hash, height as i64, first_ms)
+        .await
+        .unwrap();
+    crate::db::observations::record_observation(&pool, &hash, height as i64, first_ms + 1000)
+        .await
+        .unwrap();
+    let tx = coinbase_tx(&"ee".repeat(32), height, &hash, miner, 50_000_000);
+    w.batch_insert_with_header_and_flows(
+        height,
+        &hash,
+        1_790_151_999,
+        &[tx],
+        &[],
+        &header(1_790_151_999),
+    )
+    .await
+    .unwrap();
+    // An earlier lightweight external report must be enriched, not block archival.
+    sqlx::query("INSERT INTO orphaned_blocks(height, hash, source) VALUES ($1,$2,'external')")
+        .bind(height as i64)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    w.rollback_from_height_with_raw(
+        height,
+        "observation archive regression",
+        &[(hash.clone(), "aabbccdd".into())],
+    )
+    .await
+    .unwrap();
+    let observed: i64 = sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM first_seen_at)*1000)::bigint FROM block_observations WHERE hash=$1")
+        .bind(&hash).fetch_one(&pool).await.unwrap();
+    assert_eq!(observed, first_ms);
+    let archive: (String, i32, String, String) = sqlx::query_as(
+        "SELECT raw_hex, transaction_count, block_metadata->>'hash', source FROM orphaned_blocks WHERE hash=$1")
+        .bind(&hash).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        archive,
+        ("aabbccdd".into(), 1, hash.clone(), "indexer".into())
+    );
+    let tx_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM orphaned_transactions WHERE block_hash=$1")
+            .bind(&hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(tx_count, 1);
+    cleanup(&pool, height, height, &[miner]).await;
+    sqlx::query("DELETE FROM block_observations WHERE hash=$1")
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

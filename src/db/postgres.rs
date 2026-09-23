@@ -1334,6 +1334,17 @@ impl PostgresWriter {
         fork_height: u32,
         description: &str,
     ) -> Result<u32, sqlx::Error> {
+        self.rollback_from_height_with_raw(fork_height, description, &[])
+            .await
+    }
+
+    /// Raw evidence and structured metadata commit atomically with rollback.
+    pub async fn rollback_from_height_with_raw(
+        &self,
+        fork_height: u32,
+        description: &str,
+        raw_blocks: &[(String, String)],
+    ) -> Result<u32, sqlx::Error> {
         let mut db_tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(Self::BLOCK_WRITE_LOCK)
@@ -1367,15 +1378,38 @@ impl PostgresWriter {
 
         // Archive orphaned blocks (include roots for anchor debugging + coinbase for miner fingerprinting)
         sqlx::query(
-            r#"INSERT INTO orphaned_blocks (height, hash, timestamp, transaction_count, size, difficulty, miner_address, previous_block_hash, final_sapling_root, final_orchard_root, coinbase_hex, fork_event_id, source, first_indexed_at)
-               SELECT b.height, b.hash, b.timestamp, b.transaction_count, b.size, b.difficulty::text, b.miner_address, b.previous_block_hash, b.final_sapling_root, b.final_orchard_root, b.coinbase_hex, $1, 'indexer', b.created_at
+            r#"INSERT INTO orphaned_blocks (height, hash, timestamp, transaction_count, size, difficulty, miner_address, previous_block_hash, final_sapling_root, final_orchard_root, final_ironwood_root, coinbase_hex, fork_event_id, source, first_indexed_at, block_metadata)
+               SELECT b.height, b.hash, b.timestamp, b.transaction_count, b.size, b.difficulty::text, b.miner_address, b.previous_block_hash, b.final_sapling_root, b.final_orchard_root, b.final_ironwood_root, b.coinbase_hex, $1, 'indexer', b.created_at, to_jsonb(b)
                FROM blocks b WHERE b.height >= $2
-               ON CONFLICT (hash) DO NOTHING"#
+               ON CONFLICT (hash) DO UPDATE SET
+                   timestamp = EXCLUDED.timestamp,
+                   transaction_count = EXCLUDED.transaction_count,
+                   size = EXCLUDED.size,
+                   difficulty = EXCLUDED.difficulty,
+                   miner_address = EXCLUDED.miner_address,
+                   previous_block_hash = EXCLUDED.previous_block_hash,
+                   final_sapling_root = EXCLUDED.final_sapling_root,
+                   final_orchard_root = EXCLUDED.final_orchard_root,
+                   final_ironwood_root = EXCLUDED.final_ironwood_root,
+                   coinbase_hex = EXCLUDED.coinbase_hex,
+                   source = EXCLUDED.source,
+                   block_metadata = EXCLUDED.block_metadata,
+                   first_indexed_at = COALESCE(orphaned_blocks.first_indexed_at, EXCLUDED.first_indexed_at),
+                   fork_event_id = EXCLUDED.fork_event_id"#
         )
         .bind(fork_event_id.0)
         .bind(fork_height as i64)
         .execute(&mut *db_tx)
         .await?;
+
+        // Never leave a committed rollback with captured bytes still only in memory.
+        for (hash, raw_hex) in raw_blocks {
+            sqlx::query("UPDATE orphaned_blocks SET raw_hex = $1 WHERE hash = $2")
+                .bind(raw_hex)
+                .bind(hash)
+                .execute(&mut *db_tx)
+                .await?;
+        }
 
         // Archive orphaned transactions before deletion
         sqlx::query(

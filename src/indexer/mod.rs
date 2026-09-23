@@ -297,16 +297,9 @@ impl Indexer {
 
         let rolled_back = self
             .postgres
-            .rollback_from_height(fork_height, &description)
+            .rollback_from_height_with_raw(fork_height, &description, &raw_blocks)
             .await
             .map_err(|e| format!("Rollback error: {}", e))?;
-
-        // Store captured raw hex on the archived orphaned_blocks rows
-        for (hash, hex) in &raw_blocks {
-            if let Err(e) = self.postgres.store_orphan_raw_hex(hash, hex).await {
-                println!("   ⚠️ Failed to store raw hex for {}: {}", &hash[..16], e);
-            }
-        }
 
         println!(
             "   ✅ Rolled back {} blocks, archived to orphaned_blocks ({} with raw hex)",
@@ -852,6 +845,10 @@ impl Indexer {
 
         let rpc = ZebraRpc::from_env()?;
         println!("   ✅ JSON-RPC client initialized");
+        tokio::spawn(crate::db::observations::observe_local_tip(
+            rpc.clone(),
+            self.postgres.pool().clone(),
+        ));
 
         let grpc_url = self.config.zebra_grpc_url.clone();
         let mut grpc_stream: Option<Streaming<BlockHashAndHeight>> = None;

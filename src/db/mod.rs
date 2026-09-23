@@ -1,6 +1,7 @@
 //! Database module - RocksDB reading, PostgreSQL writing, and gRPC streaming
 
 pub mod grpc;
+pub mod observations;
 pub mod postgres;
 pub mod rocks;
 pub mod rpc;
