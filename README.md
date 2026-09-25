@@ -39,7 +39,7 @@ Create a `.env` file or set environment variables:
 
 ```bash
 # Required: Path to Zebra/Zakura's RocksDB state
-ZEBRA_STATE_PATH=~/.cache/zebra/state/v28/mainnet
+ZEBRA_STATE_PATH=~/.cache/zakura/state/v29/mainnet
 
 # Required: PostgreSQL connection URL
 DATABASE_URL=postgres://user:password@localhost/zcash_explorer
@@ -259,7 +259,7 @@ Benchmarks on AMD EPYC (8 cores, 32GB RAM, NVMe SSD):
 Zebra is still running. Stop Zebra or wait for it to release the lock.
 
 ### "column family not found"
-The Zebra state version may be different. Check `ZEBRA_STATE_PATH` points to the correct version (e.g., `v28`).
+The Zebra state version may be different. Check `ZEBRA_STATE_PATH` points to the correct version (e.g., `v29` for Zakura 1.5.0).
 
 ### Slow performance
 - Ensure NVMe SSD for both RocksDB and PostgreSQL
@@ -354,3 +354,20 @@ MIT — see [LICENSE](LICENSE) file.
 
 - [Zebra](https://github.com/ZcashFoundation/zebra) - Zcash node implementation
 - [CipherScan Explorer](https://github.com/Kenbak/zcash-explorer) - Frontend and API
+
+
+### Zakura 1.5.0 / NU7 preparation
+
+The indexer pins `zakura-chain` 8.0.0 to Zakura tag `v1.5.0`; Cargo.lock
+records the exact source. Preserve a stopped-node state snapshot before upgrading
+Zakura: state format 29 cannot be safely reopened by the previous node binary.
+Update `ZEBRA_STATE_PATH` to the migrated v29 directory on each host.
+
+Live gRPC tip notifications remain preferred. `LIVE_POLL_INTERVAL_SECONDS`
+controls fallback polling (default 5 seconds, clamped to 1–60), independently of
+the consensus block target. Full-block gRPC remains separately opt-in.
+
+Regression tests retain real historical v4/v5/v6 blocks and exercise the NU7
+branch ID structurally. Synthetic branch-ID transactions are not signed NU7
+activation fixtures. This maintenance release does not certify sustained-load
+or official testnet activation compatibility.
