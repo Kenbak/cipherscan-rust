@@ -831,7 +831,7 @@ impl Indexer {
 
     /// Run live mode (follow chain tip)
     /// Uses gRPC streaming for instant block notifications when available,
-    /// falls back to 30s JSON-RPC polling otherwise.
+    /// falls back to bounded JSON-RPC polling otherwise.
     pub async fn live(&self) -> Result<(), String> {
         use crate::db::grpc::proto::BlockHashAndHeight;
         use crate::db::{
@@ -870,7 +870,10 @@ impl Indexer {
                     println!("   ✅ gRPC connected — instant block notifications enabled");
                 }
                 Err(e) => {
-                    println!("   ⚠️ gRPC unavailable ({}), using 30s polling", e);
+                    println!(
+                        "   ⚠️ gRPC unavailable ({}), using configured fallback polling",
+                        e
+                    );
                 }
             }
             if let Some(cache) = payload_cache.clone() {
@@ -880,11 +883,11 @@ impl Indexer {
                 println!("   ℹ️ Full-block gRPC disabled pending successful shadow verification");
             }
         } else {
-            println!("   ℹ️ ZEBRA_GRPC_URL not set — using 30s polling");
+            println!("   ℹ️ ZEBRA_GRPC_URL not set — using configured fallback polling");
         }
 
         loop {
-            // Wait for trigger: gRPC tip notification OR 30s polling timeout
+            // Wait for trigger: gRPC tip notification OR configured polling timeout
             if let Some(ref mut stream) = grpc_stream {
                 tokio::select! {
                     msg = stream.message() => {
@@ -903,12 +906,12 @@ impl Indexer {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(self.config.live_poll_interval_secs)) => {
                         // Periodic poll even with gRPC, as a safety net
                     }
                 }
             } else {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::time::sleep(Duration::from_secs(self.config.live_poll_interval_secs)).await;
 
                 // Periodically try to reconnect gRPC
                 if let Some(ref url) = grpc_url {
@@ -953,7 +956,10 @@ impl Indexer {
                     Ok(None) => {} // no reorg
                     Err(e) => {
                         println!("   ⚠️ Reorg detection error: {}", e);
-                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        tokio::time::sleep(Duration::from_secs(
+                            self.config.live_poll_interval_secs,
+                        ))
+                        .await;
                         continue;
                     }
                 }

@@ -22,8 +22,11 @@ pub struct Config {
     pub max_open_files: i32,
 
     /// Zebra gRPC indexer URL (e.g. "http://127.0.0.1:8230")
-    /// When set, enables instant block notifications instead of 30s polling
+    /// When set, enables instant block notifications with polling as a fallback
     pub zebra_grpc_url: Option<String>,
+
+    /// Fallback live-tip polling interval; independent of consensus block spacing.
+    pub live_poll_interval_secs: u64,
 
     /// Maximum reorg depth the indexer will handle automatically.
     /// Reorgs deeper than this require manual intervention (mainnet safety).
@@ -58,12 +61,13 @@ pub enum Network {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            zebra_state_path: PathBuf::from("/root/.cache/zebra/state/v28/mainnet"),
+            zebra_state_path: PathBuf::from("/root/.cache/zakura/state/v29/mainnet"),
             database_url: String::from("postgres://localhost/zcash_explorer_mainnet"),
             batch_size: 1000,
             network: Network::Mainnet,
             max_open_files: 256,
             zebra_grpc_url: None,
+            live_poll_interval_secs: 5,
             max_reorg_depth: 100,
             grpc_payload_cache_blocks: 32,
             grpc_payload_cache_bytes: 64 * 1024 * 1024,
@@ -79,6 +83,12 @@ impl Config {
     /// Load configuration from environment variables
     pub fn from_env() -> Self {
         let mut config = Self::default();
+
+        if let Ok(value) = env::var("LIVE_POLL_INTERVAL_SECONDS") {
+            if let Ok(seconds) = value.parse::<u64>() {
+                config.live_poll_interval_secs = seconds.clamp(1, 60);
+            }
+        }
 
         // Zebra state path
         if let Ok(path) = env::var("ZEBRA_STATE_PATH") {

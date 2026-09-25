@@ -47,3 +47,43 @@ fn assert_json_equal(actual: &serde_json::Value, expected: &serde_json::Value, p
         _ => assert_eq!(actual, expected, "parser mismatch at {path}"),
     }
 }
+
+/// Structural branch-ID fixtures, not consensus-valid NU7 activation blocks:
+/// signatures/proofs are intentionally not regenerated when the ID is changed.
+#[test]
+fn nu7_branch_id_decodes_v5_and_v6_while_historical_v4_remains_covered() {
+    use cipherscan_indexer::{config::Network, indexer::TransactionParser};
+    use zakura_chain::{
+        block::Block,
+        serialization::{ZcashDeserialize, ZcashSerialize},
+    };
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/parser-blocks.json")).unwrap();
+    let mut covered = std::collections::BTreeSet::new();
+    for fixture in fixtures.as_array().unwrap() {
+        let block = Block::zcash_deserialize(std::io::Cursor::new(
+            hex::decode(fixture["hex"].as_str().unwrap()).unwrap(),
+        ))
+        .unwrap();
+        for tx in &block.transactions {
+            let mut bytes = Vec::new();
+            tx.zcash_serialize(&mut bytes).unwrap();
+            let version = u32::from_le_bytes(bytes[..4].try_into().unwrap()) & 0x7fff_ffff;
+            if ![5, 6].contains(&version) || covered.contains(&version) {
+                continue;
+            }
+            bytes[8..12].copy_from_slice(&0x7719_0ad9u32.to_le_bytes());
+            let parsed =
+                TransactionParser::parse(&bytes, 6_000_000, &"0".repeat(64), Network::Mainnet)
+                    .unwrap();
+            assert_eq!(parsed.version as u32, version);
+            bytes[8..12].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+            assert!(
+                TransactionParser::parse(&bytes, 6_000_000, &"0".repeat(64), Network::Mainnet)
+                    .is_err()
+            );
+            covered.insert(version);
+        }
+    }
+    assert_eq!(covered, [5, 6].into_iter().collect());
+}
