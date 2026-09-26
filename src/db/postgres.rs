@@ -1479,6 +1479,12 @@ impl PostgresWriter {
         .bind(fork_height as i32)
         .execute(&mut *db_tx)
         .await?;
+        // Temporary tables are not analyzed by autovacuum. Without statistics,
+        // PostgreSQL assumes 1,360 touched addresses and can scan the entire
+        // movement ledger even for a one-block reorg affecting two addresses.
+        sqlx::query("ANALYZE integrity_reorg_addresses")
+            .execute(&mut *db_tx)
+            .await?;
         // Outputs on the surviving chain must no longer point at orphan spends.
         sqlx::query(
             r#"UPDATE transaction_outputs
