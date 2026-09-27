@@ -1,6 +1,7 @@
 //! Indexer module - main indexing logic
 
 mod flows;
+mod reorg;
 mod transactions;
 
 pub use transactions::TransactionParser;
@@ -169,6 +170,7 @@ impl Indexer {
         &self,
         rpc: &crate::db::ZebraRpc,
         last_indexed: u32,
+        node_tip: u32,
     ) -> Result<Option<u32>, String> {
         let db_hash = self
             .postgres
@@ -181,63 +183,33 @@ impl Indexer {
             None => return Ok(None), // no block at this height yet
         };
 
-        let canonical_hash = rpc
-            .get_block_hash(last_indexed as u64)
-            .await
-            .map_err(|e| format!("RPC error checking hash at {}: {}", last_indexed, e))?;
-
-        if db_hash == canonical_hash {
-            return Ok(None); // chain is consistent
-        }
-
-        println!(
-            "🔄 REORG DETECTED at height {} — DB hash {} != canonical {}",
-            last_indexed,
-            &db_hash[..16.min(db_hash.len())],
-            &canonical_hash[..16.min(canonical_hash.len())]
-        );
-
-        // Walk backward to find the fork point (common ancestor)
-        let max_depth = self.config.max_reorg_depth;
-        let mut fork_height = last_indexed;
-        for depth in 1..=max_depth {
-            let check_height = last_indexed.saturating_sub(depth);
-            if check_height == 0 {
-                break;
-            }
-
-            let stored = self
-                .postgres
-                .get_block_hash_at_height(check_height)
-                .await
-                .map_err(|e| format!("DB read error at {}: {}", check_height, e))?;
-
-            let stored = match stored {
-                Some(h) => h,
-                None => break,
-            };
-
+        let mut ancestor = None;
+        for check_height in
+            reorg::ancestor_heights(last_indexed, node_tip, self.config.max_reorg_depth)?
+        {
+            let stored = self.postgres.get_block_hash_at_height(check_height).await
+                .map_err(|e| format!("DB read error at {check_height}: {e}"))?
+                .ok_or_else(|| format!("Missing indexed block at {check_height}; cannot establish a common ancestor"))?;
             let canonical = rpc
                 .get_block_hash(check_height as u64)
                 .await
-                .map_err(|e| format!("RPC error at {}: {}", check_height, e))?;
-
+                .map_err(|e| format!("RPC error checking hash at {check_height}: {e}"))?;
             if stored == canonical {
-                fork_height = check_height + 1;
-                println!(
-                    "   📍 Fork point: height {} (common ancestor: {})",
-                    fork_height, check_height
-                );
+                if check_height == last_indexed {
+                    return Ok(None);
+                }
+                ancestor = Some((check_height, stored));
                 break;
             }
-
-            if depth == max_depth {
-                return Err(format!(
-                    "Reorg deeper than {} blocks — manual intervention required",
-                    max_depth
-                ));
-            }
         }
+        let (ancestor_height, ancestor_hash) = ancestor.ok_or_else(|| {
+            format!(
+                "No common ancestor within {} blocks — manual intervention required",
+                self.config.max_reorg_depth
+            )
+        })?;
+        let fork_height = ancestor_height + 1;
+        println!("🔄 REORG DETECTED: common ancestor {ancestor_height}, indexed tip {last_indexed}, node tip {node_tip}");
 
         let reorg_depth = last_indexed - fork_height + 1;
         let description = format!(
@@ -288,6 +260,18 @@ impl Indexer {
                     },
                 }
             }
+        }
+
+        // The node can change again while orphan bytes are captured. Never roll
+        // back using an ancestor that is no longer canonical, or after the old
+        // indexed branch has already been restored.
+        if rpc.get_block_hash(ancestor_height as u64).await? != ancestor_hash {
+            return Err("Node changed during reorg planning; retrying".into());
+        }
+        if rpc.get_block_count().await? >= last_indexed as u64
+            && rpc.get_block_hash(last_indexed as u64).await? == db_hash
+        {
+            return Ok(None);
         }
 
         println!(
@@ -944,7 +928,10 @@ impl Indexer {
             // Check for reorgs before indexing new blocks
             let mut reorg_fork_height: Option<u32> = None;
             if last_indexed > 0 {
-                match self.detect_and_handle_reorg(&rpc, last_indexed).await {
+                match self
+                    .detect_and_handle_reorg(&rpc, last_indexed, rpc_tip)
+                    .await
+                {
                     Ok(Some(new_checkpoint)) => {
                         reorg_fork_height = Some(new_checkpoint + 1);
                         println!(

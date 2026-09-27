@@ -14,6 +14,7 @@ pub struct ZebraRpc {
     client: Client,
     url: String,
     auth: Option<(String, String)>,
+    cookie_path: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -50,37 +51,35 @@ pub struct BlockInfo {
     pub finalironwoodroot: Option<String>,
 }
 
+async fn read_cookie_auth(path: &std::path::Path) -> Result<(String, String), String> {
+    let cookie = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|_| "RPC cookie is temporarily unavailable".to_string())?;
+    let (user, password) = cookie
+        .trim()
+        .split_once(':')
+        .filter(|(u, p)| !u.is_empty() && !p.is_empty())
+        .ok_or_else(|| "RPC cookie has an invalid format".to_string())?;
+    Ok((user.to_owned(), password.to_owned()))
+}
+
 impl ZebraRpc {
     /// Create new RPC client from environment
     pub fn from_env() -> Result<Self, String> {
         let url =
             std::env::var("ZEBRA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8232".to_string());
 
-        // Try cookie file first
-        let auth = if let Ok(cookie_path) = std::env::var("ZEBRA_RPC_COOKIE_FILE") {
-            let path = PathBuf::from(&cookie_path);
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(cookie) => {
-                        let parts: Vec<&str> = cookie.trim().split(':').collect();
-                        if parts.len() == 2 {
-                            Some((parts[0].to_string(), parts[1].to_string()))
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            }
-        } else if let (Ok(user), Ok(pass)) = (
+        // Cookie files rotate when the node restarts. Resolve them per request,
+        // including when the file did not exist during indexer startup.
+        let cookie_path = std::env::var("ZEBRA_RPC_COOKIE_FILE")
+            .ok()
+            .map(PathBuf::from);
+        let auth = match (
             std::env::var("ZEBRA_RPC_USER"),
             std::env::var("ZEBRA_RPC_PASS"),
         ) {
-            Some((user, pass))
-        } else {
-            None
+            (Ok(user), Ok(pass)) => Some((user, pass)),
+            _ => None,
         };
 
         let client = Client::builder()
@@ -89,7 +88,12 @@ impl ZebraRpc {
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-        Ok(Self { client, url, auth })
+        Ok(Self {
+            client,
+            url,
+            auth,
+            cookie_path,
+        })
     }
 
     /// Make an RPC call
@@ -107,7 +111,12 @@ impl ZebraRpc {
 
         let mut req = self.client.post(&self.url).json(&request);
 
-        if let Some((user, pass)) = &self.auth {
+        let auth = if let Some(path) = &self.cookie_path {
+            Some(read_cookie_auth(path).await?)
+        } else {
+            self.auth.clone()
+        };
+        if let Some((user, pass)) = auth {
             req = req.basic_auth(user, Some(pass));
         }
 
@@ -128,6 +137,12 @@ impl ZebraRpc {
         rpc_response
             .result
             .ok_or_else(|| "RPC returned no result".to_string())
+    }
+
+    /// Height-pinned node allocations; absent fields remain absent.
+    pub async fn get_block_subsidy(&self, height: u64) -> Result<serde_json::Value, String> {
+        self.call("getblocksubsidy", vec![serde_json::json!(height)])
+            .await
     }
 
     /// Get current blockchain height
@@ -240,5 +255,33 @@ mod fork_tip_tests {
             })
             .collect();
         assert!(fork_tip_hashes(tips).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cookie_rotation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn reads_replacement_cookie_and_recovers_after_missing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "cipherscan-cookie-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(read_cookie_auth(&path).await.is_err());
+        tokio::fs::write(&path, "__cookie__:first").await.unwrap();
+        assert_eq!(read_cookie_auth(&path).await.unwrap().1, "first");
+        tokio::fs::write(&path, "__cookie__:second:with-colon")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_cookie_auth(&path).await.unwrap().1,
+            "second:with-colon"
+        );
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(read_cookie_auth(&path).await.is_err());
     }
 }

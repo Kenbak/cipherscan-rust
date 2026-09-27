@@ -526,6 +526,23 @@ async fn first_observation_and_raw_orphan_evidence_survive_rollback() {
     crate::db::observations::record_observation(&pool, &hash, height as i64, first_ms + 1000)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM node_accounting_observations WHERE hash=$1")
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let info = serde_json::json!({"blocks":height, "bestblockhash":hash,
+        "chain":"test", "nsmValueBalanceZat":-9_007_199_254_740_993_i64,
+        "chainSupply":{"chainValueZat":123,"monitored":true},
+        "valuePools":[{"id":"ironwood", "chainValueZat":100,"monitored":true}, {"id":"sapling","chainValueZat":0,"monitored":false}]});
+    crate::db::observations::record_accounting(&pool, &info, None, first_ms)
+        .await
+        .unwrap();
+    let mut changed = info.clone();
+    changed["nsmValueBalanceZat"] = serde_json::json!(0);
+    crate::db::observations::record_accounting(&pool, &changed, None, first_ms + 1000)
+        .await
+        .unwrap();
     let tx = coinbase_tx(&"ee".repeat(32), height, &hash, miner, 50_000_000);
     w.batch_insert_with_header_and_flows(
         height,
@@ -554,6 +571,37 @@ async fn first_observation_and_raw_orphan_evidence_survive_rollback() {
     let observed: i64 = sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM first_seen_at)*1000)::bigint FROM block_observations WHERE hash=$1")
         .bind(&hash).fetch_one(&pool).await.unwrap();
     assert_eq!(observed, first_ms);
+    let balance: i64 = sqlx::query_scalar(
+        "SELECT nsm_balance_zat FROM node_accounting_observations WHERE hash=$1",
+    )
+    .bind(&hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(balance, -9_007_199_254_740_993_i64);
+    let pools: serde_json::Value = sqlx::query_scalar(
+        "SELECT pool_balances_zat FROM node_accounting_observations WHERE hash=$1",
+    )
+    .bind(&hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pools["ironwood"], "100");
+    assert!(
+        pools["sapling"].is_null(),
+        "unmonitored balances must remain unavailable"
+    );
+    let canonical: i64 = sqlx::query_scalar("SELECT count(*) FROM node_accounting_observations a JOIN blocks b ON b.hash=a.hash AND b.height=a.height WHERE a.hash=$1")
+        .bind(&hash).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        canonical, 0,
+        "orphan reserve observations must not enter canonical charts"
+    );
+    sqlx::query("DELETE FROM node_accounting_observations WHERE hash=$1")
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
     let archive: (String, i32, String, String) = sqlx::query_as(
         "SELECT raw_hex, transaction_count, block_metadata->>'hash', source FROM orphaned_blocks WHERE hash=$1")
         .bind(&hash).fetch_one(&pool).await.unwrap();
