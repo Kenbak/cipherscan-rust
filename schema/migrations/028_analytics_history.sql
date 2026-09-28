@@ -13,8 +13,10 @@ CREATE TABLE IF NOT EXISTS analytics_history_daily (
  spent_creation_value_usd numeric NOT NULL CHECK (spent_creation_value_usd >= 0),
  sopr numeric,
  fees jsonb NOT NULL,
+ mining_pool_blocks jsonb NOT NULL DEFAULT '{}'::jsonb,
  computed_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE analytics_history_daily ADD COLUMN IF NOT EXISTS mining_pool_blocks jsonb NOT NULL DEFAULT '{}'::jsonb;
 COMMENT ON TABLE analytics_history_daily IS 'Completed UTC-day transparent output replay; USD daily-price model, not owner purchase prices. SOPR excludes shielded notes. Cohorts contain only public aggregate values/counts.';
 DO $$ BEGIN
  EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON analytics_history_daily TO %I',
