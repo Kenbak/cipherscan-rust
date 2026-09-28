@@ -33,5 +33,17 @@ test pass. Establish an independently reviewed baseline and investigate each cha
 
 These fixtures do not resolve historical prevouts or prove database/fee accounting,
 stream recovery, or sustained capacity. Those require separate integration and
-isolated replay checks. NU7 is not represented: add authoritative activation fixtures
-when the supporting release and chain data are available. Keep historical v4 coverage.
+isolated replay checks. The original corpus predates NU7; the staging supplement below adds real activation coverage. Keep historical v4 coverage.
+
+## Real NU7 staging activation (2026-09-28 JST)
+
+`nu7-staging-blocks.json` contains pre/activation/post blocks 4,398,755–4,398,757
+from **Nu7StagingV2**, activation 4,398,756 / branch 77190ad9.
+Captured using getblock verbosity 0/2 on an isolated locally validating node
+built at manifest revision 738d175061e23d1ad65ec99b2d2a6b5d004bb10f.
+Authority: https://api.nu7.valargroup.dev/v1/network and https://zakura.com/nu7/.
+Seed height 4,398,752; SHA256 4a347a643eee9a33f0b56a0f28e365c63ffbc0d5cc4ee46cd5d7cd1929117595.
+Also includes the fee-bearing block 4,400,478 (two transactions).
+These are blocks from the staging fork, not official testnet/mainnet
+activation certification. The test compares node block hashes, all txids and exact
+serialization roundtrips through the release v1.5.0/parser 8 dependency.

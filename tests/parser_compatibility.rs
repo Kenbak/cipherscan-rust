@@ -87,3 +87,17 @@ fn nu7_branch_id_decodes_v5_and_v6_while_historical_v4_remains_covered() {
     }
     assert_eq!(covered, [5, 6].into_iter().collect());
 }
+
+/// Real private-staging activation blocks. This does not certify official testnet
+/// or mainnet consensus; historical v4 decoding remains covered above.
+#[test]
+fn nu7_staging_activation_matches_node_hashes_and_roundtrips() {
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/nu7-staging-blocks.json")).unwrap();
+    let report = parser_report::report(&fixtures).unwrap();
+    assert_eq!(report.as_array().unwrap().len(), 4);
+    for (i, expected_height) in [4_398_755, 4_398_756, 4_398_757].iter().enumerate() {
+        assert_eq!(report[i]["height"], *expected_height);
+        assert_eq!(report[i]["transactions"][0]["version"], 6);
+    }
+}
