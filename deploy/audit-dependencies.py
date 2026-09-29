@@ -10,5 +10,4 @@ if any(line.startswith("rsa v") for line in graph.splitlines()):
 # Cargo locks SQLx's disabled optional MySQL dependencies, including RSA.
 # This PostgreSQL-only binary disables SQLx default features. Never silently
 # carry this exception into a build that enables RSA; the graph check above fails.
-subprocess.run(["cargo", "audit", "--ignore", "RUSTSEC-2023-0071"], check=True)
-
+subprocess.run(["cargo", "audit", "--deny", "unsound", "--ignore", "RUSTSEC-2023-0071"], check=True)
